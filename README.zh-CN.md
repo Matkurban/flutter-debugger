@@ -1,0 +1,85 @@
+# Flutter Debugger for Zed
+
+[English](README.md)
+
+为 [Zed](https://zed.dev) 编辑器打造的 Flutter 调试、热重载、目标设备切换、测试运行与 Pub 依赖管理扩展。专为与 Zed 官方 **Dart** 扩展和平共处而设计，不破坏原有的 Dart 语法高亮、诊断、补全与格式化能力。
+
+## 核心功能
+
+- **Flutter 与 Dart 调试（DAP）**：完整支持 `.zed/debug.json` 配置补全与校验（`deviceId`、`flutterMode`、`flavor`、`dartDefineFromFile`、`toolArgs`、`env`），并支持将 `flutter run`、`flutter test`、`dart run`、`dart test` 任务一键转为调试会话。
+- **保存自动 Hot Reload**：在 Debug 调试会话运行期间，保存 `.dart` 文件自动触发热重载（Profile/Release 模式自动禁用）；同时在 `main()` 上方通过 CodeLens 和 Code Actions（`Cmd+.` / `Ctrl+.`）提供 **Hot Reload**、**Hot Restart** 与 **Open DevTools** 快捷入口。
+- **目标设备发现与切换**：`flutter devices --machine` 扫描结果自动落盘缓存，首开文件不重复扫描、不闪烁进度条。点击 `◎ Device` CodeLens 可切换目标设备并按项目持久化，启动调试时自动注入 `deviceId`；随时可通过 `↻ Refresh Devices` 手动刷新。
+- **测试一键运行**：自动识别 `*_test.dart` 中的 `test()`、`testWidgets()` 与 `group()`，提供单色矢量符号 CodeLens（`▷ Run Test` / `▷ Run Group`），并按项目类型自动调用 `flutter test` 或 `dart test`。
+- **Pub 依赖工作流**：
+  - 在 `pubspec.yaml` 或 `pubspec_overrides.yaml` 中按住 `Cmd+Click`（macOS）/ `Ctrl+Click`（Windows/Linux）点击包名直接打开 `pub.dev` 详情页。
+  - 缓存版依赖更新提示（`↑ x.y.z`）与一键升级 Code Action。
+  - 文件顶部提供 `pub get`、`pub upgrade`、`pub outdated`、`build_runner`、`flutter doctor` 快捷入口；耗时操作在 Zed 底部状态栏显示实时进度，失败或报表命令会自动去除 ANSI 颜色码并在 Zed 新标签页打开完整日志。
+- **FVM 与 Monorepo 兼容**：优先识别项目内 `.fvm/flutter_sdk`，按当前文件逐级向上定位最近的 `pubspec.yaml`（编辑 `pubspec_overrides.yaml` 自动参考同级 `pubspec.yaml`），精准区分 Flutter 应用/插件与纯 Dart 包。
+
+## 环境要求
+
+- 系统 `PATH` 已安装 [Flutter SDK](https://docs.flutter.dev/get-started/install) 和/或 [Dart SDK](https://dart.dev/get-dart)（或使用 FVM / 在 `settings.json` 中指定路径）。
+- 已安装 Zed 官方 **Dart** 扩展以获得 Dart 语法高亮与 Dart Analysis Server LSP 能力。
+
+## 安装方式
+
+1. 打开 Zed 扩展商店（macOS 按 `Cmd+Shift+X`，Linux/Windows 按 `Ctrl+Shift+X`）。
+2. 搜索 **Flutter Debugger** 并点击 **Install**。
+
+首次激活时，若系统 `PATH` 中未找到 `flutter-debugger-server`，扩展会自动按当前操作系统与 CPU 架构从 GitHub Releases 下载并缓存对应二进制文件。
+
+## 推荐配置
+
+在 Zed 的 `settings.json`（`Cmd+,` / `Ctrl+,`）中添加以下配置，以确保与官方 Dart 扩展协同工作并开启 Inlay Hints：
+
+```json
+{
+  "inlay_hints": {
+    "enabled": true
+  },
+  "languages": {
+    "Dart": {
+      "format_on_save": "on",
+      "language_servers": ["dart", "flutter-debugger"]
+    },
+    "YAML": {
+      "language_servers": ["flutter-debugger", "..."]
+    }
+  },
+  "lsp": {
+    "flutter-debugger": {
+      "settings": {
+        "autoHotReloadOnSave": true,
+        "flutterSdkPath": null,
+        "deviceCacheTtlSecs": 3600,
+        "pubCacheTtlSecs": 43200
+      }
+    }
+  }
+}
+```
+
+### `.zed/debug.json` 示例
+
+```json
+[
+  {
+    "adapter": "Flutter",
+    "label": "Flutter Debug (Staging)",
+    "request": "launch",
+    "program": "lib/main.dart",
+    "flutterMode": "debug",
+    "flavor": "staging",
+    "dartDefineFromFile": "env/staging.json"
+  },
+  {
+    "adapter": "Flutter",
+    "label": "Flutter Attach",
+    "request": "attach"
+  }
+]
+```
+
+## 开源协议
+
+MIT — 详见 [LICENSE](LICENSE)。

@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "title": "Flutter Debug Adapter Configuration",
+  "type": "object",
+  "properties": {
+    "request": {
+      "type": "string",
+      "enum": ["launch", "attach"],
+      "default": "launch",
+      "description": "Whether to launch a new Flutter/Dart application or attach to a running VM Service."
+    },
+    "program": {
+      "type": "string",
+      "default": "lib/main.dart",
+      "description": "Path to the Dart entry point or test file (e.g. lib/main.dart or test/widget_test.dart)."
+    },
+    "cwd": {
+      "type": "string",
+      "description": "Working directory of the Flutter or Dart project containing pubspec.yaml."
+    },
+    "deviceId": {
+      "type": "string",
+      "description": "Target Flutter device ID (e.g. macos, chrome, emulator-5554). If omitted, uses the device selected via Flutter Debugger."
+    },
+    "flutterMode": {
+      "type": "string",
+      "enum": ["debug", "profile", "release"],
+      "default": "debug",
+      "description": "Flutter build mode. Hot Reload is available in debug mode."
+    },
+    "flavor": {
+      "type": "string",
+      "description": "Build flavor name passed to Flutter via --flavor."
+    },
+    "dartDefineFromFile": {
+      "type": "string",
+      "description": "Path to a JSON or .env file passed via --dart-define-from-file."
+    },
+    "args": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Runtime arguments passed to the application."
+    },
+    "toolArgs": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Additional arguments passed to the flutter or dart CLI tool (e.g. --dart-define=ENV=dev)."
+    },
+    "vmServiceUri": {
+      "type": "string",
+      "description": "VM Service URI when attaching to an already running Flutter/Dart application."
+    },
+    "env": {
+      "type": "object",
+      "additionalProperties": { "type": "string" },
+      "description": "Environment variables applied when launching the Flutter/Dart process."
+    },
+    "debugExternalPackageLibraries": {
+      "type": "boolean",
+      "default": false,
+      "description": "Whether to allow stepping into external pub package libraries."
+    },
+    "debugSdkLibraries": {
+      "type": "boolean",
+      "default": false,
+      "description": "Whether to allow stepping into Dart/Flutter SDK libraries."
+    },
+    "evaluateGettersInDebugViews": {
+      "type": "boolean",
+      "default": true,
+      "description": "Whether to evaluate getters in debug variable views."
+    },
+    "evaluateToStringInDebugViews": {
+      "type": "boolean",
+      "default": true,
+      "description": "Whether to invoke toString() on objects in debug variable views."
+    },
+    "noDebug": {
+      "type": "boolean",
+      "default": false,
+      "description": "Run without attaching breakpoints."
+    }
+  },
+  "required": ["request"]
+}

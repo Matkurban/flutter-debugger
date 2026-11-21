@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - extension.toml
+      - Cargo.toml
+      - server/Cargo.toml
+
+permissions:
+  contents: read
+
+jobs:
+  check-version:
+    runs-on: ubuntu-24.04
+    outputs:
+      should_run: ${{ steps.version.outputs.should_run }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Check whether version changed
+        id: version
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if git rev-parse HEAD~1 >/dev/null 2>&1; then
+            if git diff HEAD~1 HEAD -- extension.toml Cargo.toml server/Cargo.toml | grep -Eq '^\+version\s*='; then
+              echo "should_run=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          else
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "should_run=false" >> "$GITHUB_OUTPUT"
+
+  verify-wasm:
+    needs: check-version
+    if: needs.check-version.outputs.should_run == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+          components: clippy
+
+      - name: Clippy WASM extension
+        run: cargo clippy --target wasm32-wasip2 --all-targets -- -D warnings
+
+      - name: Build WASM extension
+        run: cargo build --release --target wasm32-wasip2
+
+  verify-server:
+    needs: check-version
+    if: needs.check-version.outputs.should_run == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-14, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cmake on Linux
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y cmake
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Clippy server
+        working-directory: server
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test server
+        working-directory: server
+        run: cargo test --all-targets

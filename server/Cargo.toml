@@ -1,0 +1,27 @@
+[package]
+name = "flutter-debugger-server"
+version = "0.0.1"
+edition = "2024"
+license = "MIT"
+description = "Native LSP and DAP proxy server for the Flutter Debugger Zed extension"
+
+[[bin]]
+name = "flutter-debugger-server"
+path = "src/main.rs"
+
+[dependencies]
+dashmap = "6.1"
+dirs = "6.0"
+regex = "1.11"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tokio = { version = "1.44", features = ["rt-multi-thread", "macros", "io-std", "io-util", "net", "process", "sync", "time", "fs"] }
+tower-lsp-server = "0.23.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2.5"
+
+[dev-dependencies]
+tempfile = "3.19"

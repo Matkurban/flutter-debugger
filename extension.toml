@@ -1,0 +1,16 @@
+id = "flutter-debugger"
+name = "Flutter Debugger"
+version = "0.0.1"
+schema_version = 1
+authors = ["Matkurban <https://github.com/Matkurban>"]
+description = "Flutter debugging, Hot Reload, device switching, test runner, and Pub dependency workflow for Zed"
+repository = "https://github.com/Matkurban/flutter-debugger"
+
+[language_servers.flutter-debugger]
+name = "Flutter Debugger"
+languages = ["Dart", "YAML"]
+
+[debug_adapters.Flutter]
+schema_path = "debug_adapter_schemas/Flutter.json"
+
+[debug_locators.flutter]

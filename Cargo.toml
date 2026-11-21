@@ -1,0 +1,18 @@
+[package]
+name = "flutter-debugger"
+version = "0.0.1"
+edition = "2024"
+publish = false
+license = "MIT"
+description = "Flutter debugging, Hot Reload, device switching, test runner, and Pub dependency workflow for Zed"
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["cdylib"]
+
+[workspace]
+exclude = ["server"]
+
+[dependencies]
+zed_extension_api = "0.7.0"
+serde_json = "1.0"
