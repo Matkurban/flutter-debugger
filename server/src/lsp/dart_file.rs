@@ -133,19 +133,19 @@ pub fn build_dart_code_lenses(
         } else if project_kind == ProjectKind::Flutter {
             lenses.push(make_lens(
                 range,
-                "▷ Debug",
+                "Debug",
                 "flutterDebugger.runMode",
                 vec![json!(uri_str), json!(FlutterRunMode::Debug.as_str())],
             ));
             lenses.push(make_lens(
                 range,
-                "◈ Profile",
+                "Profile",
                 "flutterDebugger.runMode",
                 vec![json!(uri_str), json!(FlutterRunMode::Profile.as_str())],
             ));
             lenses.push(make_lens(
                 range,
-                "▸ Release",
+                "Release",
                 "flutterDebugger.runMode",
                 vec![json!(uri_str), json!(FlutterRunMode::Release.as_str())],
             ));
@@ -238,8 +238,8 @@ Future<void> main() async {
             .iter()
             .filter_map(|l| l.command.as_ref().map(|c| c.title.as_str()))
             .collect();
-        assert!(titles.contains(&"▷ Debug"));
-        assert!(titles.contains(&"◈ Profile"));
-        assert!(titles.contains(&"▸ Release"));
+        assert!(titles.contains(&"Debug"));
+        assert!(titles.contains(&"Profile"));
+        assert!(titles.contains(&"Release"));
     }
 }
