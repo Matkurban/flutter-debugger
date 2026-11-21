@@ -2,7 +2,7 @@
 name = "flutter-debugger-server"
 version = "0.0.1"
 edition = "2024"
-license = "MIT"
+license = "Apache-2.0"
 description = "Native LSP and DAP proxy server for the Flutter Debugger Zed extension"
 
 [[bin]]

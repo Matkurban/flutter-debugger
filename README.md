@@ -98,4 +98,4 @@ Add the following to your Zed `settings.json` (`Cmd+,` / `Ctrl+,`) to enable Inl
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+Apache 2.0 — see [LICENSE](LICENSE).

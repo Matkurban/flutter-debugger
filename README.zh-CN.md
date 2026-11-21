@@ -98,4 +98,4 @@
 
 ## 开源协议
 
-MIT — 详见 [LICENSE](LICENSE)。
+Apache 2.0 — 详见 [LICENSE](LICENSE)。
