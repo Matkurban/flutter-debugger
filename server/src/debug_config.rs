@@ -103,7 +103,6 @@ mod tests {
             root: dir.path().to_path_buf(),
             pubspec_path: dir.path().join("pubspec.yaml"),
             kind: ProjectKind::Flutter,
-            has_build_runner: false,
         };
 
         let (path, created) =

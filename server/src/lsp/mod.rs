@@ -64,7 +64,6 @@ const SUPPORTED_COMMANDS: &[&str] = &[
     "flutterDebugger.pubOutdated",
     "flutterDebugger.clean",
     "flutterDebugger.doctor",
-    "flutterDebugger.buildRunner",
     "flutterDebugger.runTest",
     "flutterDebugger.runMode",
     "flutterDebugger.stopApp",
@@ -72,7 +71,6 @@ const SUPPORTED_COMMANDS: &[&str] = &[
     "flutterDebugger.goToCounterpart",
     "flutterDebugger.refreshDevices",
     "flutterDebugger.cycleDevice",
-    "flutterDebugger.refreshPubVersions",
     "flutterDebugger.hotReload",
     "flutterDebugger.hotRestart",
     "flutterDebugger.openDevTools",
@@ -1094,7 +1092,7 @@ impl LanguageServer for FlutterLspBackend {
 
         match doc.kind {
             DocumentKind::Pubspec | DocumentKind::PubspecOverrides => {
-                Ok(Some(build_pubspec_code_lenses(&uri, project)))
+                Ok(Some(build_pubspec_code_lenses(&uri)))
             }
             DocumentKind::Dart { .. } => {
                 let Some(parsed) = &doc.dart else {
@@ -1355,10 +1353,6 @@ impl LanguageServer for FlutterLspBackend {
             "flutterDebugger.doctor" => {
                 self.execute_project_cli(&uri, AllowedCommand::Doctor).await;
             }
-            "flutterDebugger.buildRunner" => {
-                self.execute_project_cli(&uri, AllowedCommand::BuildRunnerBuild)
-                    .await;
-            }
             "flutterDebugger.runTest" => {
                 let test_name = params
                     .arguments
@@ -1415,22 +1409,6 @@ impl LanguageServer for FlutterLspBackend {
             }
             "flutterDebugger.cycleDevice" => {
                 self.cycle_selected_device(&uri).await;
-            }
-            "flutterDebugger.refreshPubVersions" => {
-                let packages: Vec<String> = self
-                    .docs
-                    .get(&uri)
-                    .and_then(|d| {
-                        d.pubspec.as_ref().map(|p| {
-                            p.dependencies
-                                .iter()
-                                .filter(|dep| dep.is_hosted_pub_dev)
-                                .map(|dep| dep.name.clone())
-                                .collect()
-                        })
-                    })
-                    .unwrap_or_default();
-                self.maybe_fetch_pub_versions(packages, true).await;
             }
             "flutterDebugger.hotReload" => {
                 self.trigger_reload_or_restart(&uri, false).await;

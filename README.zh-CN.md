@@ -15,7 +15,7 @@
 - **运行中调试视图开关与截图**：在 Debug/Profile 会话期间，可通过 Code Actions 一键切换 `Performance Overlay`、`Debug Paint`、`Repaint Rainbow`、`Slow Animations`、`Debug Banner`、`Target Platform`（`ext.flutter.platformOverride`），或执行 `Flutter: Save Screenshot` 保存设备截图。
 - **测试一键运行与文件互跳**：自动识别 `*_test.dart` 中的 `test()`、`testWidgets()` 与 `group()` 提供 `Run Test` / `Run Group`，并支持通过 Code Actions 在 `lib/*.dart` 与 `test/*_test.dart` 之间一键互跳。
 - **Pub 依赖工作流（`pubspec.yaml` / `pubspec_overrides.yaml`）**：
-  - 文件顶部严格只展示依赖相关操作：`Pub Get`、`Pub Upgrade`、`Pub Outdated`、`Build Runner`（存在该依赖时）与 `Refresh Versions`。
+  - 文件顶部严格只展示依赖相关操作：`Pub Get`、`Pub Upgrade`、`Pub Outdated`。
   - 按住 `Cmd+Click`（macOS）/ `Ctrl+Click`（Windows/Linux）点击包名直接打开 `pub.dev` 详情页。
   - 缓存版依赖更新提示（`latest: x.y.z`）与一键升级 Code Action。
 - **设备切换、模拟器启动、Clean、Doctor 与新建项目向导**：

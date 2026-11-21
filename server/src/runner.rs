@@ -17,7 +17,6 @@ pub enum AllowedCommand {
     PubOutdated,
     Clean,
     Doctor,
-    BuildRunnerBuild,
     Screenshot {
         device_id: Option<String>,
         output_path: String,
@@ -36,7 +35,6 @@ impl AllowedCommand {
             Self::PubOutdated => "pub outdated",
             Self::Clean => "flutter clean",
             Self::Doctor => "flutter doctor",
-            Self::BuildRunnerBuild => "build_runner build",
             Self::Screenshot { .. } => "screenshot",
             Self::TestFile { .. } => "test",
         }
@@ -46,28 +44,13 @@ impl AllowedCommand {
         matches!(self, Self::PubOutdated | Self::Doctor | Self::TestFile { .. })
     }
 
-    pub fn build_args(&self, project: &ProjectInfo) -> Vec<String> {
+    pub fn build_args(&self) -> Vec<String> {
         match self {
             Self::PubGet => vec!["pub".into(), "get".into()],
             Self::PubUpgrade => vec!["pub".into(), "upgrade".into()],
             Self::PubOutdated => vec!["pub".into(), "outdated".into()],
             Self::Clean => vec!["clean".into()],
             Self::Doctor => vec!["doctor".into(), "-v".into()],
-            Self::BuildRunnerBuild => match project.kind {
-                crate::project::ProjectKind::Flutter => vec![
-                    "pub".into(),
-                    "run".into(),
-                    "build_runner".into(),
-                    "build".into(),
-                    "--delete-conflicting-outputs".into(),
-                ],
-                crate::project::ProjectKind::Dart => vec![
-                    "run".into(),
-                    "build_runner".into(),
-                    "build".into(),
-                    "--delete-conflicting-outputs".into(),
-                ],
-            },
             Self::Screenshot {
                 device_id,
                 output_path,
@@ -163,7 +146,7 @@ impl CommandRunner {
         };
 
         let program = resolve_sdk_executable(&project.root, project.kind, custom_sdk_path);
-        let args = cmd.build_args(project);
+        let args = cmd.build_args();
         let command_line = format!("{program} {}", args.join(" "));
 
         let output = spawn_cli(&program, &args, &project.root)

@@ -26,7 +26,6 @@ pub struct ProjectInfo {
     pub root: PathBuf,
     pub pubspec_path: PathBuf,
     pub kind: ProjectKind,
-    pub has_build_runner: bool,
 }
 
 /// Walks upward from `file_or_dir` to find the nearest `pubspec.yaml`.
@@ -45,12 +44,11 @@ pub fn find_project_for_path(file_or_dir: &Path) -> Option<ProjectInfo> {
         let pubspec_path = dir.join("pubspec.yaml");
         if pubspec_path.is_file() {
             let content = fs::read_to_string(&pubspec_path).ok()?;
-            let (kind, has_build_runner) = classify_pubspec(&content);
+            let kind = classify_pubspec(&content);
             return Some(ProjectInfo {
                 root: dir.to_path_buf(),
                 pubspec_path,
                 kind,
-                has_build_runner,
             });
         }
         current = dir.parent();
@@ -59,15 +57,14 @@ pub fn find_project_for_path(file_or_dir: &Path) -> Option<ProjectInfo> {
     None
 }
 
-/// Classifies a `pubspec.yaml` document as Flutter vs. pure Dart and detects `build_runner`.
+/// Classifies a `pubspec.yaml` document as Flutter vs. pure Dart.
 ///
 /// A project is classified as [`ProjectKind::Flutter`] if any of the following holds:
 /// 1. A top-level `flutter:` section exists.
 /// 2. `environment:` contains a `flutter:` SDK constraint.
 /// 3. Any dependency declares `sdk: flutter`.
-pub fn classify_pubspec(content: &str) -> (ProjectKind, bool) {
+pub fn classify_pubspec(content: &str) -> ProjectKind {
     let mut is_flutter = false;
-    let mut has_build_runner = false;
     let mut current_section: Option<&str> = None;
 
     for raw_line in content.lines() {
@@ -99,28 +96,20 @@ pub fn classify_pubspec(content: &str) -> (ProjectKind, bool) {
                     is_flutter = true;
                 }
             }
-            Some("dependencies" | "dev_dependencies" | "dependency_overrides") => {
-                if is_sdk_flutter_line(trimmed) {
-                    is_flutter = true;
-                }
-                if indent <= 2
-                    && let Some(key) = extract_yaml_key(trimmed)
-                    && key == "build_runner"
-                {
-                    has_build_runner = true;
-                }
+            Some("dependencies" | "dev_dependencies" | "dependency_overrides")
+                if is_sdk_flutter_line(trimmed) =>
+            {
+                is_flutter = true;
             }
             _ => {}
         }
     }
 
-    let kind = if is_flutter {
+    if is_flutter {
         ProjectKind::Flutter
     } else {
         ProjectKind::Dart
-    };
-
-    (kind, has_build_runner)
+    }
 }
 
 /// Resolves the executable path for `flutter` or `dart`.
@@ -229,7 +218,7 @@ environment:
 flutter:
   uses-material-design: true
 "#;
-        assert_eq!(classify_pubspec(yaml), (ProjectKind::Flutter, false));
+        assert_eq!(classify_pubspec(yaml), ProjectKind::Flutter);
     }
 
     #[test]
@@ -239,10 +228,8 @@ name: my_plugin
 dependencies:
   flutter:
     sdk: flutter
-dev_dependencies:
-  build_runner: ^2.4.15
 "#;
-        assert_eq!(classify_pubspec(yaml), (ProjectKind::Flutter, true));
+        assert_eq!(classify_pubspec(yaml), ProjectKind::Flutter);
     }
 
     #[test]
@@ -253,7 +240,7 @@ environment:
   sdk: ^3.7.0
   flutter: ">=3.24.0"
 "#;
-        assert_eq!(classify_pubspec(yaml), (ProjectKind::Flutter, false));
+        assert_eq!(classify_pubspec(yaml), ProjectKind::Flutter);
     }
 
     #[test]
@@ -268,7 +255,7 @@ dependencies:
 dev_dependencies:
   test: ^1.25.0
 "#;
-        assert_eq!(classify_pubspec(yaml), (ProjectKind::Dart, false));
+        assert_eq!(classify_pubspec(yaml), ProjectKind::Dart);
     }
 
     #[test]

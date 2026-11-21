@@ -4,7 +4,6 @@ use tower_lsp_server::ls_types::{
 };
 
 use crate::cache::PubVersionCache;
-use crate::project::ProjectInfo;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PubDependency {
@@ -169,14 +168,14 @@ pub fn build_inlay_hints(parsed: &ParsedPubspec, pub_cache: &PubVersionCache) ->
 }
 
 /// Builds top-of-file dependency-only CodeLens actions for `pubspec.yaml` / `pubspec_overrides.yaml`.
-pub fn build_pubspec_code_lenses(uri: &Uri, project: &ProjectInfo) -> Vec<CodeLens> {
+pub fn build_pubspec_code_lenses(uri: &Uri) -> Vec<CodeLens> {
     let top_range = Range {
         start: Position::new(0, 0),
         end: Position::new(0, 0),
     };
     let uri_str = uri.as_str().to_string();
 
-    let mut lenses = vec![
+    vec![
         make_lens(
             top_range,
             "Pub Get",
@@ -195,25 +194,7 @@ pub fn build_pubspec_code_lenses(uri: &Uri, project: &ProjectInfo) -> Vec<CodeLe
             "flutterDebugger.pubOutdated",
             vec![json!(uri_str)],
         ),
-    ];
-
-    if project.has_build_runner {
-        lenses.push(make_lens(
-            top_range,
-            "Build Runner",
-            "flutterDebugger.buildRunner",
-            vec![json!(uri_str)],
-        ));
-    }
-
-    lenses.push(make_lens(
-        top_range,
-        "Refresh Versions",
-        "flutterDebugger.refreshPubVersions",
-        vec![json!(uri_str)],
-    ));
-
-    lenses
+    ]
 }
 
 fn make_lens(range: Range, title: &str, command: &str, arguments: Vec<serde_json::Value>) -> CodeLens {

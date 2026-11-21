@@ -15,7 +15,7 @@ Flutter debugging, quick Debug/Profile/Release launching, automatic DevTools Per
 - **Visual Debug Overlays & Screenshots**: While an app is running in Debug or Profile mode, toggle `Performance Overlay`, `Debug Paint`, `Repaint Rainbow`, `Slow Animations`, `Debug Banner`, and `Target Platform` (`ext.flutter.platformOverride`), or capture a device screenshot (`Flutter: Save Screenshot`) directly from Code Actions (`Cmd+.` / `Ctrl+.`).
 - **Test Runner & File Navigation**: Clean CodeLens (`Run Test` / `Run Group`) on `test()`, `testWidgets()`, and `group()` in `*_test.dart` files (automatically invoking `flutter test` or `dart test`), plus `Dart: Go to Test File` / `Dart: Go to Implementation File` in Code Actions.
 - **Pub Dependency Workflow (`pubspec.yaml` / `pubspec_overrides.yaml`)**:
-  - Top-of-file actions stay strictly dependency-focused: `Pub Get`, `Pub Upgrade`, `Pub Outdated`, `Build Runner` (when present), and `Refresh Versions`.
+  - Top-of-file actions stay strictly dependency-focused: `Pub Get`, `Pub Upgrade`, and `Pub Outdated`.
   - `Cmd+Click` (macOS) / `Ctrl+Click` (Windows/Linux) any hosted package name to open its page on `pub.dev`.
   - Cached version hints (`latest: x.y.z`) and one-click upgrade Code Actions.
 - **Devices, Emulators, Clean, Doctor & Project Wizard**:
