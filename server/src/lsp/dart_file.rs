@@ -4,6 +4,7 @@ use regex::Regex;
 use serde_json::json;
 use tower_lsp_server::ls_types::{CodeLens, Command, Position, Range, Uri};
 
+use crate::app_runner::{FlutterRunMode, ManagedAppSnapshot};
 use crate::ipc::ActiveSessionRecord;
 use crate::project::ProjectKind;
 
@@ -63,12 +64,17 @@ pub fn parse_dart_file(content: &str, is_test_file: bool) -> ParsedDartFile {
 }
 
 /// Builds monochrome Unicode CodeLens entries for a Dart source or test file.
+///
+/// For Flutter projects, `main()` exposes quick `Debug`, `Profile`, and `Release` actions
+/// mirroring VS Code's Flutter extension, plus active-session controls (`Hot Reload`,
+/// `Hot Restart`, `DevTools`/`Performance`, `Stop`) and target device selection.
 pub fn build_dart_code_lenses(
     uri: &Uri,
     parsed: &ParsedDartFile,
     project_kind: ProjectKind,
     selected_device_label: Option<&str>,
-    active_session: Option<&ActiveSessionRecord>,
+    dap_session: Option<&ActiveSessionRecord>,
+    managed_app: Option<&ManagedAppSnapshot>,
 ) -> Vec<CodeLens> {
     let mut lenses = Vec::new();
     let uri_str = uri.as_str().to_string();
@@ -79,8 +85,17 @@ pub fn build_dart_code_lenses(
             end: Position::new(line, 0),
         };
 
-        if let Some(session) = active_session {
-            if session.mode == "debug" {
+        let active_mode = managed_app
+            .map(|m| m.mode.as_str())
+            .or_else(|| dap_session.map(|s| s.mode.as_str()));
+
+        let has_devtools = managed_app
+            .is_some_and(|m| m.devtools_uri.is_some() || m.vm_service_uri.is_some())
+            || dap_session
+                .is_some_and(|s| s.devtools_uri.is_some() || s.vm_service_uri.is_some());
+
+        if let Some(mode) = active_mode {
+            if mode == "debug" {
                 lenses.push(make_lens(
                     range,
                     "⟳ Hot Reload",
@@ -94,14 +109,46 @@ pub fn build_dart_code_lenses(
                     vec![json!(uri_str)],
                 ));
             }
-            if session.devtools_uri.is_some() || session.vm_service_uri.is_some() {
+            if has_devtools {
+                let dt_label = if mode == "profile" {
+                    "⊞ Performance"
+                } else {
+                    "⊞ DevTools"
+                };
                 lenses.push(make_lens(
                     range,
-                    "⊞ Open DevTools",
+                    dt_label,
                     "flutterDebugger.openDevTools",
                     vec![json!(uri_str)],
                 ));
             }
+            if managed_app.is_some() {
+                lenses.push(make_lens(
+                    range,
+                    "■ Stop",
+                    "flutterDebugger.stopApp",
+                    vec![json!(uri_str)],
+                ));
+            }
+        } else if project_kind == ProjectKind::Flutter {
+            lenses.push(make_lens(
+                range,
+                "▷ Debug",
+                "flutterDebugger.runMode",
+                vec![json!(uri_str), json!(FlutterRunMode::Debug.as_str())],
+            ));
+            lenses.push(make_lens(
+                range,
+                "◈ Profile",
+                "flutterDebugger.runMode",
+                vec![json!(uri_str), json!(FlutterRunMode::Profile.as_str())],
+            ));
+            lenses.push(make_lens(
+                range,
+                "▸ Release",
+                "flutterDebugger.runMode",
+                vec![json!(uri_str), json!(FlutterRunMode::Release.as_str())],
+            ));
         }
 
         if project_kind == ProjectKind::Flutter {
@@ -180,5 +227,19 @@ Future<void> main() async {
         assert_eq!(parsed.tests[0].name, "Counter");
         assert_eq!(parsed.tests[1].name, "increments counter");
         assert_eq!(parsed.tests[2].name, "adds numbers");
+    }
+
+    #[test]
+    fn shows_debug_profile_release_lenses_on_flutter_main() {
+        let parsed = parse_dart_file("void main() => runApp(const App());", false);
+        let uri: Uri = "file:///tmp/app/lib/main.dart".parse().expect("uri");
+        let lenses = build_dart_code_lenses(&uri, &parsed, ProjectKind::Flutter, None, None, None);
+        let titles: Vec<&str> = lenses
+            .iter()
+            .filter_map(|l| l.command.as_ref().map(|c| c.title.as_str()))
+            .collect();
+        assert!(titles.contains(&"▷ Debug"));
+        assert!(titles.contains(&"◈ Profile"));
+        assert!(titles.contains(&"▸ Release"));
     }
 }

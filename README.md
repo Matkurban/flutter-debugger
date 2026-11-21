@@ -2,13 +2,17 @@
 
 [简体中文](README.zh-CN.md)
 
-Flutter debugging, Hot Reload, target device switching, test runner, and Pub dependency workflows for the [Zed](https://zed.dev) editor. Designed to work alongside Zed's official **Dart** extension without interfering with Dart syntax highlighting, diagnostics, completion, or formatting.
+Flutter debugging, quick Debug/Profile/Release launching, automatic DevTools Performance view, Hot Reload, target device switching, test runner, project creation wizard, and Pub dependency workflows for the [Zed](https://zed.dev) editor. Designed to work alongside Zed's official **Dart** extension without interfering with Dart syntax highlighting, diagnostics, completion, or formatting.
 
 ## Features
 
-- **Flutter & Dart Debugging (DAP)**: Full `.zed/debug.json` schema support (`deviceId`, `flutterMode`, `flavor`, `dartDefineFromFile`, `toolArgs`, `env`) plus automatic task-to-debug conversion for `flutter run`, `flutter test`, `dart run`, and `dart test`.
-- **Automatic Hot Reload on Save**: Saves in `.dart` files automatically trigger Hot Reload on active debug sessions (disabled in `profile` and `release` modes). Manual **Hot Reload**, **Hot Restart**, and **Open DevTools** actions are also available via CodeLens on `main()` and Code Actions (`Cmd+.` / `Ctrl+.`).
-- **Device Discovery & Switching**: Caches `flutter devices --machine` locally so opening files stays fast. Cycle target devices directly from CodeLens (`◎ Device`) and refresh manually whenever needed (`↻ Refresh Devices`). Selected devices are persisted per project and automatically injected into debug launches.
+- **Quick `main()` Launchers (`Debug` / `Profile` / `Release`)**: In Flutter projects, `main()` displays clean CodeLens buttons (`Debug`, `Profile`, `Release`) just like VS Code's Flutter extension:
+  - **Debug**: Launches `flutter run --debug --machine` with live log streaming, automatic Hot Reload on save, `⟳ Hot Reload`, `↻ Hot Restart`, `⊞ DevTools`, and `■ Stop`.
+  - **Profile**: Launches `flutter run --profile --machine` and automatically opens the official **Flutter DevTools Performance** view once the VM Service is ready.
+  - **Release**: Launches `flutter run --release --machine` with live log streaming.
+- **Full Breakpoint Debugging (DAP)**: Full `.zed/debug.json` schema support (`deviceId`, `flutterMode`, `flavor`, `dartDefineFromFile`, `toolArgs`, `env`) plus automatic task-to-debug conversion for `flutter run`, `flutter test`, `dart run`, and `dart test`.
+- **Flutter Project Creation Wizard**: Click `⊞ New Project` in `pubspec.yaml` (or trigger `⊞ Flutter: New Project Wizard` via Code Actions `Cmd+.` / `Ctrl+.`) to open an editable `flutter-project-wizard.json` manifest (project name, org, template: `app`/`package`/`plugin`/`plugin_ffi`/`module`/`skeleton`, target platforms, description, output directory) with one-click `▷ Create Flutter Project`.
+- **Device Discovery & Switching**: Caches `flutter devices --machine` locally so opening files stays fast. Cycle target devices directly from CodeLens (`◎ Device`) and refresh manually whenever needed (`↻ Refresh Devices`). Selected devices are persisted per project and automatically injected into both quick runs and DAP launches.
 - **Test Runner**: Monochrome CodeLens (`▷ Run Test` / `▷ Run Group`) on `test()`, `testWidgets()`, and `group()` in `*_test.dart` files, automatically invoking `flutter test` for Flutter projects and `dart test` for pure Dart packages.
 - **Pub Dependency Workflow**:
   - `Cmd+Click` (macOS) / `Ctrl+Click` (Windows/Linux) any hosted package name in `pubspec.yaml` or `pubspec_overrides.yaml` to open its page on `pub.dev`.
@@ -30,7 +34,7 @@ On first activation, the extension automatically downloads the matching `flutter
 
 ## Recommended Configuration
 
-Add the following to your Zed `settings.json` (`Cmd+,` / `Ctrl+,`) to enable Inlay Hints and customize Flutter Debugger alongside the official Dart extension:
+Add the following to your Zed `settings.json` (`Cmd+,` / `Ctrl+,`) to enable Inlay Hints and configure Flutter Debugger alongside the official Dart extension:
 
 ```json
 {
@@ -43,6 +47,9 @@ Add the following to your Zed `settings.json` (`Cmd+,` / `Ctrl+,`) to enable Inl
       "language_servers": ["dart", "flutter-debugger"]
     },
     "YAML": {
+      "language_servers": ["flutter-debugger", "..."]
+    },
+    "JSON": {
       "language_servers": ["flutter-debugger", "..."]
     }
   },

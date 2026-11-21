@@ -243,6 +243,13 @@ pub fn build_pubspec_code_lenses(
         vec![json!(uri_str)],
     ));
 
+    lenses.push(make_lens(
+        top_range,
+        "⊞ New Project",
+        "flutterDebugger.openProjectWizard",
+        vec![json!(uri_str)],
+    ));
+
     lenses
 }
 
@@ -315,7 +322,7 @@ dev_dependencies:
         let links = build_document_links(&parsed);
         assert_eq!(links.len(), 2);
         assert_eq!(
-            links[0].target.as_ref().map(Uri::as_str),
+            links[0].target.as_ref().map(|u| u.as_str()),
             Some("https://pub.dev/packages/http")
         );
     }

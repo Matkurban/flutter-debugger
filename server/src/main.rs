@@ -1,9 +1,11 @@
+mod app_runner;
 mod cache;
 mod dap;
 mod ipc;
 mod lsp;
 mod project;
 mod runner;
+mod wizard;
 
 use tracing_subscriber::EnvFilter;
 

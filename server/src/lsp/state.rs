@@ -7,6 +7,7 @@ use crate::cache::{DEFAULT_DEVICE_CACHE_TTL_SECS, DEFAULT_PUB_CACHE_TTL_SECS};
 use crate::lsp::dart_file::{ParsedDartFile, parse_dart_file};
 use crate::lsp::pubspec::{ParsedPubspec, parse_pubspec_dependencies};
 use crate::project::{ProjectInfo, find_project_for_path};
+use crate::wizard::{ProjectWizardConfig, WIZARD_FILENAME};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -56,6 +57,7 @@ pub enum DocumentKind {
     Pubspec,
     PubspecOverrides,
     Dart { is_test: bool },
+    ProjectWizard,
     Ignored,
 }
 
@@ -65,6 +67,7 @@ pub struct OpenDocument {
     pub project: Option<ProjectInfo>,
     pub pubspec: Option<ParsedPubspec>,
     pub dart: Option<ParsedDartFile>,
+    pub wizard: Option<ProjectWizardConfig>,
 }
 
 impl OpenDocument {
@@ -80,6 +83,18 @@ impl OpenDocument {
                 project: None,
                 pubspec: None,
                 dart: None,
+                wizard: None,
+            });
+        }
+
+        if kind == DocumentKind::ProjectWizard {
+            let wizard = serde_json::from_str::<ProjectWizardConfig>(text).ok();
+            return Some(Self {
+                kind,
+                project: None,
+                pubspec: None,
+                dart: None,
+                wizard,
             });
         }
 
@@ -90,7 +105,7 @@ impl OpenDocument {
                 (Some(parse_pubspec_dependencies(text)), None)
             }
             DocumentKind::Dart { is_test } => (None, Some(parse_dart_file(text, is_test))),
-            DocumentKind::Ignored => (None, None),
+            DocumentKind::ProjectWizard | DocumentKind::Ignored => (None, None),
         };
 
         Some(Self {
@@ -98,6 +113,7 @@ impl OpenDocument {
             project,
             pubspec,
             dart,
+            wizard: None,
         })
     }
 }
@@ -107,6 +123,7 @@ pub fn classify_document_path(path: &Path) -> DocumentKind {
     match file_name {
         "pubspec.yaml" => DocumentKind::Pubspec,
         "pubspec_overrides.yaml" => DocumentKind::PubspecOverrides,
+        WIZARD_FILENAME => DocumentKind::ProjectWizard,
         _ if file_name.ends_with(".dart") => {
             let is_test = file_name.ends_with("_test.dart")
                 || path.components().any(|c| c.as_os_str() == "test");
@@ -131,14 +148,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ignores_unrelated_yaml_files() {
+    fn ignores_unrelated_yaml_and_json_files() {
         assert_eq!(
             classify_document_path(Path::new("/repo/.github/workflows/ci.yml")),
             DocumentKind::Ignored
         );
         assert_eq!(
-            classify_document_path(Path::new("/repo/docker-compose.yaml")),
+            classify_document_path(Path::new("/repo/package.json")),
             DocumentKind::Ignored
+        );
+        assert_eq!(
+            classify_document_path(Path::new("/tmp/flutter-project-wizard.json")),
+            DocumentKind::ProjectWizard
         );
         assert_eq!(
             classify_document_path(Path::new("/repo/pubspec.yaml")),
