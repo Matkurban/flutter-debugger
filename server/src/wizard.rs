@@ -160,14 +160,14 @@ pub fn build_wizard_code_lenses(uri: &Uri, config: Option<&ProjectWizardConfig>)
     };
     let uri_str = uri.as_str().to_string();
     let template_label = config
-        .map(|c| format!("◎ Template: {}", c.template))
-        .unwrap_or_else(|| "◎ Template: app".to_string());
+        .map(|c| format!("Template: {}", c.template))
+        .unwrap_or_else(|| "Template: app".to_string());
 
     vec![
         CodeLens {
             range: top_range,
             command: Some(Command {
-                title: "▷ Create Flutter Project".to_string(),
+                title: "Create Flutter Project".to_string(),
                 command: "flutterDebugger.executeCreateProject".to_string(),
                 arguments: Some(vec![json!(uri_str)]),
             }),

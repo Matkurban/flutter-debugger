@@ -577,7 +577,7 @@ impl FlutterLspBackend {
                 self.client
                     .show_message(
                         MessageType::INFO,
-                        "Edit project details and click `▷ Create Flutter Project` at line 1."
+                        "Edit project details and click `Create Flutter Project` at line 1."
                             .to_string(),
                     )
                     .await;
@@ -978,7 +978,7 @@ impl LanguageServer for FlutterLspBackend {
 
         if doc.kind == DocumentKind::ProjectWizard {
             return Ok(Some(vec![CodeActionOrCommand::Command(Command {
-                title: "▷ Create Flutter Project".to_string(),
+                title: "Create Flutter Project".to_string(),
                 command: "flutterDebugger.executeCreateProject".to_string(),
                 arguments: Some(vec![json!(uri_str)]),
             })]));
@@ -1014,7 +1014,7 @@ impl LanguageServer for FlutterLspBackend {
                             }],
                         );
                         actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-                            title: format!("↑ Upgrade {} to ^{}", dep.name, cached.latest_version),
+                            title: format!("Upgrade {} to ^{}", dep.name, cached.latest_version),
                             kind: Some(CodeActionKind::QUICKFIX),
                             edit: Some(WorkspaceEdit {
                                 changes: Some(changes),
@@ -1026,12 +1026,12 @@ impl LanguageServer for FlutterLspBackend {
                 }
 
                 actions.push(CodeActionOrCommand::Command(Command {
-                    title: format!("↓ Run {} pub get", project.kind.cli_name()),
+                    title: format!("Run {} pub get", project.kind.cli_name()),
                     command: "flutterDebugger.pubGet".to_string(),
                     arguments: Some(vec![json!(uri_str)]),
                 }));
                 actions.push(CodeActionOrCommand::Command(Command {
-                    title: "⊞ Flutter: New Project Wizard".to_string(),
+                    title: "Flutter: New Project Wizard".to_string(),
                     command: "flutterDebugger.openProjectWizard".to_string(),
                     arguments: Some(vec![json!(uri_str)]),
                 }));
@@ -1047,12 +1047,12 @@ impl LanguageServer for FlutterLspBackend {
 
                 if has_debug_managed || has_debug_dap {
                     actions.push(CodeActionOrCommand::Command(Command {
-                        title: "⟳ Flutter: Hot Reload".to_string(),
+                        title: "Flutter: Hot Reload".to_string(),
                         command: "flutterDebugger.hotReload".to_string(),
                         arguments: Some(vec![json!(uri_str)]),
                     }));
                     actions.push(CodeActionOrCommand::Command(Command {
-                        title: "↻ Flutter: Hot Restart".to_string(),
+                        title: "Flutter: Hot Restart".to_string(),
                         command: "flutterDebugger.hotRestart".to_string(),
                         arguments: Some(vec![json!(uri_str)]),
                     }));
@@ -1060,12 +1060,12 @@ impl LanguageServer for FlutterLspBackend {
 
                 if project.kind == ProjectKind::Flutter {
                     actions.push(CodeActionOrCommand::Command(Command {
-                        title: "◎ Flutter: Switch Target Device".to_string(),
+                        title: "Flutter: Switch Target Device".to_string(),
                         command: "flutterDebugger.cycleDevice".to_string(),
                         arguments: Some(vec![json!(uri_str)]),
                     }));
                     actions.push(CodeActionOrCommand::Command(Command {
-                        title: "⊞ Flutter: New Project Wizard".to_string(),
+                        title: "Flutter: New Project Wizard".to_string(),
                         command: "flutterDebugger.openProjectWizard".to_string(),
                         arguments: Some(vec![json!(uri_str)]),
                     }));

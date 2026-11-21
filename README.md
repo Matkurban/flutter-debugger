@@ -7,16 +7,16 @@ Flutter debugging, quick Debug/Profile/Release launching, automatic DevTools Per
 ## Features
 
 - **Quick `main()` Launchers (`Debug` / `Profile` / `Release`)**: In Flutter projects, `main()` displays clean CodeLens buttons (`Debug`, `Profile`, `Release`) just like VS Code's Flutter extension:
-  - **Debug**: Launches `flutter run --debug --machine` with live log streaming, automatic Hot Reload on save, `⟳ Hot Reload`, `↻ Hot Restart`, `⊞ DevTools`, and `■ Stop`.
+  - **Debug**: Launches `flutter run --debug --machine` with live log streaming, automatic Hot Reload on save, `Hot Reload`, `Hot Restart`, `DevTools`, and `Stop`.
   - **Profile**: Launches `flutter run --profile --machine` and automatically opens the official **Flutter DevTools Performance** view once the VM Service is ready.
   - **Release**: Launches `flutter run --release --machine` with live log streaming.
 - **Full Breakpoint Debugging (DAP)**: Full `.zed/debug.json` schema support (`deviceId`, `flutterMode`, `flavor`, `dartDefineFromFile`, `toolArgs`, `env`) plus automatic task-to-debug conversion for `flutter run`, `flutter test`, `dart run`, and `dart test`.
-- **Flutter Project Creation Wizard**: Click `⊞ New Project` in `pubspec.yaml` (or trigger `⊞ Flutter: New Project Wizard` via Code Actions `Cmd+.` / `Ctrl+.`) to open an editable `flutter-project-wizard.json` manifest (project name, org, template: `app`/`package`/`plugin`/`plugin_ffi`/`module`/`skeleton`, target platforms, description, output directory) with one-click `▷ Create Flutter Project`.
-- **Device Discovery & Switching**: Caches `flutter devices --machine` locally so opening files stays fast. Cycle target devices directly from CodeLens (`◎ Device`) and refresh manually whenever needed (`↻ Refresh Devices`). Selected devices are persisted per project and automatically injected into both quick runs and DAP launches.
-- **Test Runner**: Monochrome CodeLens (`▷ Run Test` / `▷ Run Group`) on `test()`, `testWidgets()`, and `group()` in `*_test.dart` files, automatically invoking `flutter test` for Flutter projects and `dart test` for pure Dart packages.
+- **Flutter Project Creation Wizard**: Click `New Project` in `pubspec.yaml` (or trigger `Flutter: New Project Wizard` via Code Actions `Cmd+.` / `Ctrl+.`) to open an editable `flutter-project-wizard.json` manifest (project name, org, template: `app`/`package`/`plugin`/`plugin_ffi`/`module`/`skeleton`, target platforms, description, output directory) with one-click `Create Flutter Project`.
+- **Device Discovery & Switching**: Caches `flutter devices --machine` locally so opening files stays fast. Cycle target devices directly from CodeLens (`Device`) and refresh manually whenever needed (`Refresh Devices`). Selected devices are persisted per project and automatically injected into both quick runs and DAP launches.
+- **Test Runner**: Clean CodeLens (`Run Test` / `Run Group`) on `test()`, `testWidgets()`, and `group()` in `*_test.dart` files, automatically invoking `flutter test` for Flutter projects and `dart test` for pure Dart packages.
 - **Pub Dependency Workflow**:
   - `Cmd+Click` (macOS) / `Ctrl+Click` (Windows/Linux) any hosted package name in `pubspec.yaml` or `pubspec_overrides.yaml` to open its page on `pub.dev`.
-  - Cached version hints (`↑ x.y.z`) and one-click upgrade Code Actions.
+  - Cached version hints (`latest: x.y.z`) and one-click upgrade Code Actions.
   - Top-of-file actions for `pub get`, `pub upgrade`, `pub outdated`, `build_runner`, and `flutter doctor` with live status bar progress and full ANSI-cleaned log output opened in a new Zed tab on failure or reports.
 - **FVM & Monorepo Aware**: Automatically detects `.fvm/flutter_sdk` and resolves the nearest `pubspec.yaml` per file (including `pubspec_overrides.yaml`), distinguishing Flutter apps/plugins from pure Dart packages.
 

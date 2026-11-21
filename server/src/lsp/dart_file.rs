@@ -98,22 +98,22 @@ pub fn build_dart_code_lenses(
             if mode == "debug" {
                 lenses.push(make_lens(
                     range,
-                    "⟳ Hot Reload",
+                    "Hot Reload",
                     "flutterDebugger.hotReload",
                     vec![json!(uri_str)],
                 ));
                 lenses.push(make_lens(
                     range,
-                    "↻ Hot Restart",
+                    "Hot Restart",
                     "flutterDebugger.hotRestart",
                     vec![json!(uri_str)],
                 ));
             }
             if has_devtools {
                 let dt_label = if mode == "profile" {
-                    "⊞ Performance"
+                    "Performance"
                 } else {
-                    "⊞ DevTools"
+                    "DevTools"
                 };
                 lenses.push(make_lens(
                     range,
@@ -125,7 +125,7 @@ pub fn build_dart_code_lenses(
             if managed_app.is_some() {
                 lenses.push(make_lens(
                     range,
-                    "■ Stop",
+                    "Stop",
                     "flutterDebugger.stopApp",
                     vec![json!(uri_str)],
                 ));
@@ -153,8 +153,8 @@ pub fn build_dart_code_lenses(
 
         if project_kind == ProjectKind::Flutter {
             let device_title = match selected_device_label {
-                Some(label) => format!("◎ Device: {label}"),
-                None => "◎ Device: Auto".to_string(),
+                Some(label) => format!("Device: {label}"),
+                None => "Device: Auto".to_string(),
             };
             lenses.push(make_lens(
                 range,
@@ -164,7 +164,7 @@ pub fn build_dart_code_lenses(
             ));
             lenses.push(make_lens(
                 range,
-                "↻ Refresh Devices",
+                "Refresh Devices",
                 "flutterDebugger.refreshDevices",
                 vec![json!(uri_str)],
             ));
@@ -177,9 +177,9 @@ pub fn build_dart_code_lenses(
             end: Position::new(entry.line, 0),
         };
         let label = if entry.is_group {
-            "▷ Run Group"
+            "Run Group"
         } else {
-            "▷ Run Test"
+            "Run Test"
         };
         lenses.push(make_lens(
             range,

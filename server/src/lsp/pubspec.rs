@@ -156,7 +156,7 @@ pub fn build_inlay_hints(parsed: &ParsedPubspec, pub_cache: &PubVersionCache) ->
 
             Some(InlayHint {
                 position: Position::new(dep.line, dep.line_end_col),
-                label: InlayHintLabel::String(format!("  ↑ {}", cached.latest_version)),
+                label: InlayHintLabel::String(format!("  latest: {}", cached.latest_version)),
                 kind: Some(InlayHintKind::TYPE),
                 text_edits: None,
                 tooltip: None,
@@ -183,19 +183,19 @@ pub fn build_pubspec_code_lenses(
     let mut lenses = vec![
         make_lens(
             top_range,
-            "↓ Pub Get",
+            "Pub Get",
             "flutterDebugger.pubGet",
             vec![json!(uri_str)],
         ),
         make_lens(
             top_range,
-            "↑ Pub Upgrade",
+            "Pub Upgrade",
             "flutterDebugger.pubUpgrade",
             vec![json!(uri_str)],
         ),
         make_lens(
             top_range,
-            "≡ Pub Outdated",
+            "Pub Outdated",
             "flutterDebugger.pubOutdated",
             vec![json!(uri_str)],
         ),
@@ -204,7 +204,7 @@ pub fn build_pubspec_code_lenses(
     if project.has_build_runner {
         lenses.push(make_lens(
             top_range,
-            "⟳ Build Runner",
+            "Build Runner",
             "flutterDebugger.buildRunner",
             vec![json!(uri_str)],
         ));
@@ -212,8 +212,8 @@ pub fn build_pubspec_code_lenses(
 
     if project.kind == ProjectKind::Flutter {
         let device_title = match selected_device_label {
-            Some(label) => format!("◎ Device: {label}"),
-            None => "◎ Device: Auto".to_string(),
+            Some(label) => format!("Device: {label}"),
+            None => "Device: Auto".to_string(),
         };
         lenses.push(make_lens(
             top_range,
@@ -223,13 +223,13 @@ pub fn build_pubspec_code_lenses(
         ));
         lenses.push(make_lens(
             top_range,
-            "↻ Refresh Devices",
+            "Refresh Devices",
             "flutterDebugger.refreshDevices",
             vec![json!(uri_str)],
         ));
         lenses.push(make_lens(
             top_range,
-            "≡ Doctor",
+            "Doctor",
             "flutterDebugger.doctor",
             vec![json!(uri_str)],
         ));
@@ -237,14 +237,14 @@ pub fn build_pubspec_code_lenses(
 
     lenses.push(make_lens(
         top_range,
-        "↻ Refresh Versions",
+        "Refresh Versions",
         "flutterDebugger.refreshPubVersions",
         vec![json!(uri_str)],
     ));
 
     lenses.push(make_lens(
         top_range,
-        "⊞ New Project",
+        "New Project",
         "flutterDebugger.openProjectWizard",
         vec![json!(uri_str)],
     ));
