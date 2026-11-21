@@ -79,7 +79,20 @@ impl BinaryResolver {
                 require_assets: true,
                 pre_release: false,
             },
-        )?;
+        )
+        .map_err(|err| {
+            let msg = format!(
+                "No downloadable release found in {GITHUB_REPO} ({err}). \
+                 Install `{BINARY_NAME}` on PATH or configure `lsp.flutter-debugger.binary.path` in settings.json."
+            );
+            if let Some(id) = language_server_id {
+                zed::set_language_server_installation_status(
+                    id,
+                    &zed::LanguageServerInstallationStatus::Failed(msg.clone()),
+                );
+            }
+            msg
+        })?;
 
         let (platform, arch) = zed::current_platform();
         let (asset_name, file_type, exe_name) = asset_spec(platform, arch)?;
