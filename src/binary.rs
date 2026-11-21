@@ -158,10 +158,12 @@ fn asset_spec(
     };
 
     let (ext, file_type, exe_name) = match platform {
-        zed::Os::Windows => ("zip", zed::DownloadedFileType::Zip, "flutter-debugger-server.exe"),
-        zed::Os::Mac | zed::Os::Linux => {
-            ("tar.gz", zed::DownloadedFileType::GzipTar, BINARY_NAME)
-        }
+        zed::Os::Windows => (
+            "zip",
+            zed::DownloadedFileType::Zip,
+            "flutter-debugger-server.exe",
+        ),
+        zed::Os::Mac | zed::Os::Linux => ("tar.gz", zed::DownloadedFileType::GzipTar, BINARY_NAME),
     };
 
     Ok((

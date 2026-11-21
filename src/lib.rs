@@ -27,7 +27,9 @@ impl zed::Extension for FlutterDebuggerExtension {
         language_server_id: &LanguageServerId,
         worktree: &Worktree,
     ) -> Result<zed::Command> {
-        let binary_path = self.resolver.resolve_for_lsp(language_server_id, worktree)?;
+        let binary_path = self
+            .resolver
+            .resolve_for_lsp(language_server_id, worktree)?;
 
         let mut args = vec!["lsp".to_string()];
         if let Ok(settings) = LspSettings::for_worktree(SERVER_ID, worktree)
@@ -173,7 +175,8 @@ impl zed::Extension for FlutterDebuggerExtension {
         }
 
         let cmd = build_task.command.trim();
-        let is_flutter = cmd == "flutter" || cmd.ends_with("/flutter") || cmd.ends_with("\\flutter.bat");
+        let is_flutter =
+            cmd == "flutter" || cmd.ends_with("/flutter") || cmd.ends_with("\\flutter.bat");
         let is_dart = cmd == "dart" || cmd.ends_with("/dart") || cmd.ends_with("\\dart.bat");
 
         if !is_flutter && !is_dart {
