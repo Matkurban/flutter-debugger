@@ -58,6 +58,7 @@ pub enum DocumentKind {
     PubspecOverrides,
     Dart { is_test: bool },
     ProjectWizard,
+    RunLog,
     Ignored,
 }
 
@@ -77,44 +78,39 @@ impl OpenDocument {
         let path = uri_to_file_path(uri)?;
         let kind = classify_document_path(&path);
 
-        if kind == DocumentKind::Ignored {
-            return Some(Self {
+        match kind {
+            DocumentKind::Ignored | DocumentKind::RunLog => Some(Self {
                 kind,
                 project: None,
                 pubspec: None,
                 dart: None,
                 wizard: None,
-            });
-        }
-
-        if kind == DocumentKind::ProjectWizard {
-            let wizard = serde_json::from_str::<ProjectWizardConfig>(text).ok();
-            return Some(Self {
-                kind,
-                project: None,
-                pubspec: None,
-                dart: None,
-                wizard,
-            });
-        }
-
-        let project = find_project_for_path(&path);
-
-        let (pubspec, dart) = match kind {
-            DocumentKind::Pubspec | DocumentKind::PubspecOverrides => {
-                (Some(parse_pubspec_dependencies(text)), None)
+            }),
+            DocumentKind::ProjectWizard => {
+                let wizard = serde_json::from_str::<ProjectWizardConfig>(text).ok();
+                Some(Self {
+                    kind,
+                    project: None,
+                    pubspec: None,
+                    dart: None,
+                    wizard,
+                })
             }
-            DocumentKind::Dart { is_test } => (None, Some(parse_dart_file(text, is_test))),
-            DocumentKind::ProjectWizard | DocumentKind::Ignored => (None, None),
-        };
-
-        Some(Self {
-            kind,
-            project,
-            pubspec,
-            dart,
-            wizard: None,
-        })
+            DocumentKind::Pubspec | DocumentKind::PubspecOverrides => Some(Self {
+                kind,
+                project: find_project_for_path(&path),
+                pubspec: Some(parse_pubspec_dependencies(text)),
+                dart: None,
+                wizard: None,
+            }),
+            DocumentKind::Dart { is_test } => Some(Self {
+                kind,
+                project: find_project_for_path(&path),
+                pubspec: None,
+                dart: Some(parse_dart_file(text, is_test)),
+                wizard: None,
+            }),
+        }
     }
 }
 
@@ -124,6 +120,9 @@ pub fn classify_document_path(path: &Path) -> DocumentKind {
         "pubspec.yaml" => DocumentKind::Pubspec,
         "pubspec_overrides.yaml" => DocumentKind::PubspecOverrides,
         WIZARD_FILENAME => DocumentKind::ProjectWizard,
+        _ if file_name.starts_with("flutter-run-") && file_name.ends_with(".log") => {
+            DocumentKind::RunLog
+        }
         _ if file_name.ends_with(".dart") => {
             let is_test = file_name.ends_with("_test.dart")
                 || path.components().any(|c| c.as_os_str() == "test");
@@ -148,7 +147,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ignores_unrelated_yaml_and_json_files() {
+    fn classifies_only_target_files_and_ignores_others() {
         assert_eq!(
             classify_document_path(Path::new("/repo/.github/workflows/ci.yml")),
             DocumentKind::Ignored
@@ -156,6 +155,14 @@ mod tests {
         assert_eq!(
             classify_document_path(Path::new("/repo/package.json")),
             DocumentKind::Ignored
+        );
+        assert_eq!(
+            classify_document_path(Path::new("/var/log/system.log")),
+            DocumentKind::Ignored
+        );
+        assert_eq!(
+            classify_document_path(Path::new("/tmp/flutter-debugger-logs/flutter-run-debug-1.log")),
+            DocumentKind::RunLog
         );
         assert_eq!(
             classify_document_path(Path::new("/tmp/flutter-project-wizard.json")),

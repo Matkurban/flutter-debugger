@@ -2,7 +2,7 @@
 
 [English](README.md)
 
-为 [Zed](https://zed.dev) 编辑器打造的 Flutter 调试、快捷 Debug/Profile/Release 运行、Profile 性能面板自动拉起、热重载、目标设备切换、测试运行、项目创建向导与 Pub 依赖管理扩展。专为与 Zed 官方 **Dart** 扩展和平共处而设计，不破坏原有的 Dart 语法高亮、诊断、补全与格式化能力。
+为 [Zed](https://zed.dev) 编辑器打造的 Flutter 调试、快捷 Debug/Profile/Release 运行、Profile 性能面板自动拉起、热重载、运行中调试视图开关、目标设备切换、测试运行、项目创建向导与 Pub 依赖管理扩展。专为与 Zed 官方 **Dart** 扩展和平共处而设计，不破坏原有的 Dart 语法高亮、诊断、补全与格式化能力。
 
 ## 核心功能
 
@@ -10,14 +10,17 @@
   - **Debug**：启动 `flutter run --debug --machine`，实时流式输出日志，支持保存自动 Hot Reload、`Hot Reload`、`Hot Restart`、`DevTools` 与 `Stop`。
   - **Profile**：启动 `flutter run --profile --machine`，VM Service 就绪后自动打开官方 **Flutter DevTools Performance** 性能分析面板。
   - **Release**：启动 `flutter run --release --machine` 并输出完整构建运行日志。
-- **完整断点调试（DAP）**：支持 `.zed/debug.json` 完整配置补全与校验（`deviceId`、`flutterMode`、`flavor`、`dartDefineFromFile`、`toolArgs`、`env`），并支持将 `flutter run`、`flutter test`、`dart run`、`dart test` 任务一键转为调试会话。
-- **Flutter 项目创建向导**：点击 `pubspec.yaml` 顶部的 `New Project`（或在 Code Actions `Cmd+.` / `Ctrl+.` 中触发 `Flutter: New Project Wizard`），即可打开可编辑的 `flutter-project-wizard.json` 向导面板，配置项目名、组织名、模板（`app`/`package`/`plugin`/`plugin_ffi`/`module`/`skeleton`）、目标平台、描述与输出目录，点击顶部 `Create Flutter Project` 一键创建并自动打开新项目。
-- **目标设备发现与切换**：`flutter devices --machine` 扫描结果自动落盘缓存，首开文件不重复扫描、不闪烁进度条。点击 `Device` CodeLens 可切换目标设备并按项目持久化，自动注入快捷运行与 DAP 调试；随时可通过 `Refresh Devices` 手动刷新。
-- **测试一键运行**：自动识别 `*_test.dart` 中的 `test()`、`testWidgets()` 与 `group()`，提供简洁的 CodeLens（`Run Test` / `Run Group`），并按项目类型自动调用 `flutter test` 或 `dart test`。
-- **Pub 依赖工作流**：
-  - 在 `pubspec.yaml` 或 `pubspec_overrides.yaml` 中按住 `Cmd+Click`（macOS）/ `Ctrl+Click`（Windows/Linux）点击包名直接打开 `pub.dev` 详情页。
+- **实时运行日志顶部控制条与可靠停止**：应用运行期间，实时日志标签页第 1 行直接展示 `Hot Reload`、`Hot Restart`、`DevTools`/`Performance` 与 `Stop`，且任意 `.dart` 文件的 Code Actions（`Cmd+.` / `Ctrl+.`）均置顶 `Flutter: Stop App`。停止时优先优雅请求 `app.stop`，超时或退出 LSP 时自动强杀完整进程树，避免残留进程。
+- **完整断点调试（DAP）**：支持 `.zed/debug.json` 完整配置补全与校验（`deviceId`、`flutterMode`、`flavor`、`dartDefineFromFile`、`toolArgs`、`env`）、一键生成 `.zed/debug.json`（`Flutter: Generate .zed/debug.json`），以及任务一键转调试；通过 `F4` 以 `flutterMode: "profile"` 启动时同样自动打开 DevTools Performance 面板。
+- **运行中调试视图开关与截图**：在 Debug/Profile 会话期间，可通过 Code Actions 一键切换 `Performance Overlay`、`Debug Paint`、`Repaint Rainbow`、`Slow Animations`、`Debug Banner`、`Target Platform`（`ext.flutter.platformOverride`），或执行 `Flutter: Save Screenshot` 保存设备截图。
+- **测试一键运行与文件互跳**：自动识别 `*_test.dart` 中的 `test()`、`testWidgets()` 与 `group()` 提供 `Run Test` / `Run Group`，并支持通过 Code Actions 在 `lib/*.dart` 与 `test/*_test.dart` 之间一键互跳。
+- **Pub 依赖工作流（`pubspec.yaml` / `pubspec_overrides.yaml`）**：
+  - 文件顶部严格只展示依赖相关操作：`Pub Get`、`Pub Upgrade`、`Pub Outdated`、`Build Runner`（存在该依赖时）与 `Refresh Versions`。
+  - 按住 `Cmd+Click`（macOS）/ `Ctrl+Click`（Windows/Linux）点击包名直接打开 `pub.dev` 详情页。
   - 缓存版依赖更新提示（`latest: x.y.z`）与一键升级 Code Action。
-  - 文件顶部提供 `pub get`、`pub upgrade`、`pub outdated`、`build_runner`、`flutter doctor` 快捷入口；耗时操作在 Zed 底部状态栏显示实时进度，失败或报表命令会自动去除 ANSI 颜色码并在 Zed 新标签页打开完整日志。
+- **设备切换、模拟器启动、Clean、Doctor 与新建项目向导**：
+  - 在 `main()` 上方（`Device: ...` / `Refresh Devices`）或 Dart 文件 Code Actions 中切换目标设备并按项目持久化，自动注入快捷运行与 DAP 调试。
+  - 在 Dart 文件 Code Actions 中触发 `Flutter: Launch Emulator`、`Flutter: Clean Project`、`Flutter: Run Doctor` 或 `Flutter: New Project Wizard`（打开可编辑的 `flutter-project-wizard.json` 并一键创建）。
 - **FVM 与 Monorepo 兼容**：优先识别项目内 `.fvm/flutter_sdk`，按当前文件逐级向上定位最近的 `pubspec.yaml`（编辑 `pubspec_overrides.yaml` 自动参考同级 `pubspec.yaml`），精准区分 Flutter 应用/插件与纯 Dart 包。
 
 ## 环境要求
@@ -34,7 +37,7 @@
 
 ## 推荐配置
 
-在 Zed 的 `settings.json`（`Cmd+,` / `Ctrl+,`）中添加以下配置，以确保与官方 Dart 扩展协同工作并开启 Inlay Hints：
+在 Zed 的 `settings.json`（`Cmd+,` / `Ctrl+,`）中添加以下配置，以确保与官方 Dart 扩展协同工作并开启 Inlay Hints 与运行日志控制条：
 
 ```json
 {
@@ -50,6 +53,12 @@
       "language_servers": ["flutter-debugger", "..."]
     },
     "JSON": {
+      "language_servers": ["flutter-debugger", "..."]
+    },
+    "Log": {
+      "language_servers": ["flutter-debugger", "..."]
+    },
+    "Plain Text": {
       "language_servers": ["flutter-debugger", "..."]
     }
   },

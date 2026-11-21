@@ -204,6 +204,35 @@ fn make_lens(range: Range, title: &str, command: &str, arguments: Vec<serde_json
     }
 }
 
+/// Maps `lib/<rel>.dart` <-> `test/<rel>_test.dart` when the counterpart file exists on disk.
+pub fn find_counterpart_test_or_impl(
+    file_path: &std::path::Path,
+    project_root: &std::path::Path,
+) -> Option<(std::path::PathBuf, bool)> {
+    let rel = file_path.strip_prefix(project_root).ok()?;
+    let rel_str = rel.to_string_lossy().replace('\\', "/");
+
+    if let Some(rest) = rel_str.strip_prefix("lib/")
+        && let Some(stem) = rest.strip_suffix(".dart")
+    {
+        let candidate = project_root
+            .join("test")
+            .join(format!("{stem}_test.dart"));
+        if candidate.is_file() {
+            return Some((candidate, true));
+        }
+    } else if let Some(rest) = rel_str.strip_prefix("test/")
+        && let Some(stem) = rest.strip_suffix("_test.dart")
+    {
+        let candidate = project_root.join("lib").join(format!("{stem}.dart"));
+        if candidate.is_file() {
+            return Some((candidate, false));
+        }
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,5 +270,25 @@ Future<void> main() async {
         assert!(titles.contains(&"Debug"));
         assert!(titles.contains(&"Profile"));
         assert!(titles.contains(&"Release"));
+    }
+
+    #[test]
+    fn maps_lib_and_test_counterparts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let lib_file = dir.path().join("lib").join("counter.dart");
+        let test_file = dir.path().join("test").join("counter_test.dart");
+        std::fs::create_dir_all(lib_file.parent().expect("lib")).expect("mkdir lib");
+        std::fs::create_dir_all(test_file.parent().expect("test")).expect("mkdir test");
+        std::fs::write(&lib_file, "class Counter {}").expect("write lib");
+        std::fs::write(&test_file, "void main() {}").expect("write test");
+
+        assert_eq!(
+            find_counterpart_test_or_impl(&lib_file, dir.path()),
+            Some((test_file.clone(), true))
+        );
+        assert_eq!(
+            find_counterpart_test_or_impl(&test_file, dir.path()),
+            Some((lib_file, false))
+        );
     }
 }

@@ -95,6 +95,7 @@ pub async fn run_dap_proxy() -> Result<(), Box<dyn std::error::Error>> {
     let adapter_reader_handle = tokio::spawn(async move {
         let mut reader = BufReader::new(child_stdout);
         let mut zed_stdout = tokio::io::stdout();
+        let mut profile_devtools_opened = false;
 
         while let Ok(Some(msg)) = read_dap_message(&mut reader).await {
             let suppress = if msg.get("type").and_then(Value::as_str) == Some("response") {
@@ -108,12 +109,28 @@ pub async fn run_dap_proxy() -> Result<(), Box<dyn std::error::Error>> {
                 false
             };
 
-            let updated = {
+            let (updated, profile_url) = {
                 let mut guard = out_state.lock().await;
-                inspect_adapter_event(&msg, &mut guard)
+                let changed = inspect_adapter_event(&msg, &mut guard);
+                let url_to_open = if !profile_devtools_opened && guard.mode == "profile" {
+                    guard.devtools_uri.clone().or_else(|| {
+                        guard
+                            .vm_service_uri
+                            .as_deref()
+                            .and_then(crate::app_runner::build_devtools_performance_url)
+                    })
+                } else {
+                    None
+                };
+                (changed, url_to_open)
             };
+
             if updated {
                 persist_session(&out_cache, &out_root, ipc_port, &out_state).await;
+            }
+            if let Some(url) = profile_url {
+                profile_devtools_opened = true;
+                open_url_in_browser(&url);
             }
 
             if !suppress && write_dap_message(&mut zed_stdout, &msg).await.is_err() {
@@ -306,4 +323,30 @@ impl Drop for SessionCleanupGuard {
     fn drop(&mut self) {
         remove_session_record(&self.cache, &self.project_root);
     }
+}
+
+fn open_url_in_browser(url: &str) {
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open")
+        .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+
+    #[cfg(target_os = "linux")]
+    let _ = std::process::Command::new("xdg-open")
+        .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+
+    #[cfg(windows)]
+    let _ = std::process::Command::new("cmd")
+        .args(["/C", "start", "", url])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
 }

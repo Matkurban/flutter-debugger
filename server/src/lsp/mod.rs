@@ -28,12 +28,16 @@ use tower_lsp_server::ls_types::{
 };
 use tower_lsp_server::{Client, LanguageServer, LspService, Server};
 
-use crate::app_runner::{FlutterRunMode, ManagedAppManager};
+use crate::app_runner::{
+    DebugOverlayToggle, FlutterRunMode, ManagedAppManager, build_run_log_code_lenses,
+};
 use crate::cache::{
     CachedPackageVersion, DiskCache, FlutterDevice, PubVersionCache, is_fresh, now_unix,
 };
+use crate::debug_config::ensure_zed_debug_config;
+use crate::emulators::{launch_emulator, list_emulators};
 use crate::ipc::{IpcRequest, read_session_record, send_ipc_request};
-use crate::lsp::dart_file::build_dart_code_lenses;
+use crate::lsp::dart_file::{build_dart_code_lenses, find_counterpart_test_or_impl};
 use crate::lsp::progress::ProgressHandle;
 use crate::lsp::pubspec::{build_document_links, build_inlay_hints, build_pubspec_code_lenses};
 use crate::lsp::state::{
@@ -43,9 +47,7 @@ use crate::project::{ProjectInfo, ProjectKind, find_project_for_path, resolve_sd
 use crate::runner::{
     AllowedCommand, CommandRunner, extract_error_summary, strip_ansi_codes, write_command_log,
 };
-use crate::wizard::{
-    ProjectWizardConfig, build_wizard_code_lenses, create_wizard_file,
-};
+use crate::wizard::{ProjectWizardConfig, build_wizard_code_lenses, create_wizard_file};
 
 /// Standard LSP `workspace/inlayHint/refresh` request.
 enum InlayHintRefreshRequest {}
@@ -66,6 +68,8 @@ const SUPPORTED_COMMANDS: &[&str] = &[
     "flutterDebugger.runTest",
     "flutterDebugger.runMode",
     "flutterDebugger.stopApp",
+    "flutterDebugger.toggleOverlay",
+    "flutterDebugger.goToCounterpart",
     "flutterDebugger.refreshDevices",
     "flutterDebugger.cycleDevice",
     "flutterDebugger.refreshPubVersions",
@@ -75,6 +79,9 @@ const SUPPORTED_COMMANDS: &[&str] = &[
     "flutterDebugger.openProjectWizard",
     "flutterDebugger.executeCreateProject",
     "flutterDebugger.cycleWizardTemplate",
+    "flutterDebugger.generateDebugConfig",
+    "flutterDebugger.launchEmulator",
+    "flutterDebugger.screenshot",
 ];
 
 pub struct FlutterLspBackend {
@@ -132,6 +139,16 @@ impl FlutterLspBackend {
         } else {
             Some(selected_id)
         }
+    }
+
+    /// Resolves the project root for either a source file (`*.dart`/`pubspec.yaml`)
+    /// or an active `flutter-run-*.log` tab.
+    async fn resolve_project_root_for_uri(&self, uri: &Uri) -> Option<PathBuf> {
+        let path = uri_to_file_path(uri)?;
+        if let Some(snapshot) = self.app_manager.snapshot_by_log_path(&path).await {
+            return Some(snapshot.project_root);
+        }
+        find_project_for_path(&path).map(|p| p.root)
     }
 
     async fn maybe_scan_devices_in_background(&self, cwd: PathBuf, force: bool) {
@@ -349,16 +366,13 @@ impl FlutterLspBackend {
     }
 
     async fn cycle_selected_device(&self, uri: &Uri) {
-        let Some(path) = uri_to_file_path(uri) else {
-            return;
-        };
-        let Some(project) = find_project_for_path(&path) else {
+        let Some(root) = self.resolve_project_root_for_uri(uri).await else {
             return;
         };
 
         let devices = self.devices.read().await.clone();
         if devices.is_empty() {
-            self.maybe_scan_devices_in_background(project.root.clone(), true)
+            self.maybe_scan_devices_in_background(root.clone(), true)
                 .await;
         }
 
@@ -374,7 +388,7 @@ impl FlutterLspBackend {
             return;
         }
 
-        let current = self.cache.get_selected_device(&project.root);
+        let current = self.cache.get_selected_device(&root);
         let next_idx = match current
             .as_deref()
             .and_then(|id| devices.iter().position(|d| d.id == id))
@@ -384,8 +398,7 @@ impl FlutterLspBackend {
         };
 
         let next_device = &devices[next_idx];
-        self.cache
-            .set_selected_device(&project.root, &next_device.id);
+        self.cache.set_selected_device(&root, &next_device.id);
 
         let _ = self.client.send_request::<CodeLensRefresh>(()).await;
         self.client
@@ -454,14 +467,11 @@ impl FlutterLspBackend {
     }
 
     async fn stop_managed_app(&self, uri: &Uri) {
-        let Some(path) = uri_to_file_path(uri) else {
-            return;
-        };
-        let Some(project) = find_project_for_path(&path) else {
+        let Some(root) = self.resolve_project_root_for_uri(uri).await else {
             return;
         };
 
-        match self.app_manager.stop_app(&project.root).await {
+        match self.app_manager.stop_app(&root).await {
             Ok(msg) => {
                 let _ = self.client.send_request::<CodeLensRefresh>(()).await;
                 self.client.show_message(MessageType::INFO, msg).await;
@@ -472,19 +482,30 @@ impl FlutterLspBackend {
         }
     }
 
-    async fn trigger_reload_or_restart(&self, uri: &Uri, full_restart: bool) {
-        let Some(path) = uri_to_file_path(uri) else {
-            return;
-        };
-        let Some(project) = find_project_for_path(&path) else {
+    async fn toggle_overlay_for_uri(&self, uri: &Uri, toggle: DebugOverlayToggle) {
+        let Some(root) = self.resolve_project_root_for_uri(uri).await else {
             return;
         };
 
-        // 1. Try managed runner session first
-        if self.app_manager.snapshot(&project.root).await.is_some() {
+        match self.app_manager.toggle_debug_overlay(&root, toggle).await {
+            Ok(msg) => {
+                self.client.show_message(MessageType::INFO, msg).await;
+            }
+            Err(err) => {
+                self.client.show_message(MessageType::WARNING, err).await;
+            }
+        }
+    }
+
+    async fn trigger_reload_or_restart(&self, uri: &Uri, full_restart: bool) {
+        let Some(root) = self.resolve_project_root_for_uri(uri).await else {
+            return;
+        };
+
+        if self.app_manager.snapshot(&root).await.is_some() {
             match self
                 .app_manager
-                .trigger_reload(&project.root, full_restart)
+                .trigger_reload(&root, full_restart)
                 .await
             {
                 Ok(msg) => {
@@ -497,14 +518,13 @@ impl FlutterLspBackend {
             return;
         }
 
-        // 2. Fall back to DAP proxy IPC session
         let req = if full_restart {
             IpcRequest::HotRestart
         } else {
             IpcRequest::HotReload
         };
 
-        match send_ipc_request(&self.cache, &project.root, &req).await {
+        match send_ipc_request(&self.cache, &root, &req).await {
             Some(resp) if resp.ok => {
                 self.client
                     .show_message(MessageType::INFO, resp.message)
@@ -527,16 +547,13 @@ impl FlutterLspBackend {
     }
 
     async fn open_devtools_for_uri(&self, uri: &Uri) {
-        let Some(path) = uri_to_file_path(uri) else {
-            return;
-        };
-        let Some(project) = find_project_for_path(&path) else {
+        let Some(root) = self.resolve_project_root_for_uri(uri).await else {
             return;
         };
 
-        let target = if let Some(managed) = self.app_manager.snapshot(&project.root).await {
+        let target = if let Some(managed) = self.app_manager.snapshot(&root).await {
             managed.devtools_uri.or(managed.vm_service_uri)
-        } else if let Some(session) = read_session_record(&self.cache, &project.root) {
+        } else if let Some(session) = read_session_record(&self.cache, &root) {
             session.devtools_uri.or(session.vm_service_uri)
         } else {
             None
@@ -561,6 +578,18 @@ impl FlutterLspBackend {
                     "DevTools URI is not ready yet for this session.".to_string(),
                 )
                 .await;
+        }
+    }
+
+    async fn go_to_counterpart_file(&self, uri: &Uri) {
+        let Some(path) = uri_to_file_path(uri) else {
+            return;
+        };
+        let Some(project) = find_project_for_path(&path) else {
+            return;
+        };
+        if let Some((target, _)) = find_counterpart_test_or_impl(&path, &project.root) {
+            self.open_local_file_in_editor(&target).await;
         }
     }
 
@@ -640,10 +669,7 @@ impl FlutterLspBackend {
             Ok(c) => c,
             Err(err) => {
                 self.client
-                    .show_message(
-                        MessageType::ERROR,
-                        format!("Invalid wizard JSON: {err}"),
-                    )
+                    .show_message(MessageType::ERROR, format!("Invalid wizard JSON: {err}"))
                     .await;
                 return;
             }
@@ -755,6 +781,119 @@ impl FlutterLspBackend {
             }
         }
     }
+
+    async fn generate_debug_config(&self, uri: &Uri) {
+        let Some(path) = uri_to_file_path(uri) else {
+            return;
+        };
+        let Some(project) = find_project_for_path(&path) else {
+            self.client
+                .show_message(
+                    MessageType::WARNING,
+                    "No pubspec.yaml found for this file.".to_string(),
+                )
+                .await;
+            return;
+        };
+
+        let selected_device = self.cache.get_selected_device(&project.root);
+        match ensure_zed_debug_config(&project, selected_device.as_deref()) {
+            Ok((config_path, created)) => {
+                self.open_local_file_in_editor(&config_path).await;
+                let msg = if created {
+                    format!("Generated {}", config_path.display())
+                } else {
+                    format!("Opened existing {}", config_path.display())
+                };
+                self.client.show_message(MessageType::INFO, msg).await;
+            }
+            Err(err) => {
+                self.client
+                    .show_message(
+                        MessageType::ERROR,
+                        format!("Failed to generate .zed/debug.json: {err}"),
+                    )
+                    .await;
+            }
+        }
+    }
+
+    async fn launch_flutter_emulator(&self, uri: &Uri) {
+        let Some(root) = self.resolve_project_root_for_uri(uri).await else {
+            return;
+        };
+        let custom_sdk = self.config.read().await.flutter_sdk_path.clone();
+        let progress = ProgressHandle::begin(
+            self.client.clone(),
+            "Flutter Emulator",
+            Some("Listing available emulators...".to_string()),
+        )
+        .await;
+
+        match list_emulators(&root, custom_sdk.as_deref()).await {
+            Ok(emulators) if emulators.is_empty() => {
+                progress.end(Some("No emulators found".to_string())).await;
+                self.client
+                    .show_message(
+                        MessageType::WARNING,
+                        "No Flutter emulators found. Create an AVD or install Xcode Simulator first."
+                            .to_string(),
+                    )
+                    .await;
+            }
+            Ok(emulators) => {
+                let first = &emulators[0];
+                progress
+                    .report(format!("Launching {}...", first.display_label()))
+                    .await;
+                match launch_emulator(&root, &first.id, custom_sdk.as_deref()).await {
+                    Ok(()) => {
+                        progress
+                            .end(Some(format!("Launched {}", first.name)))
+                            .await;
+                        self.client
+                            .show_message(
+                                MessageType::INFO,
+                                format!("Launched emulator: {}", first.display_label()),
+                            )
+                            .await;
+                        self.maybe_scan_devices_in_background(root, true).await;
+                    }
+                    Err(err) => {
+                        progress.end(Some("Launch failed".to_string())).await;
+                        self.client.show_message(MessageType::ERROR, err).await;
+                    }
+                }
+            }
+            Err(err) => {
+                progress.end(Some("Failed".to_string())).await;
+                self.client.show_message(MessageType::ERROR, err).await;
+            }
+        }
+    }
+
+    async fn save_screenshot(&self, uri: &Uri) {
+        let Some(root) = self.resolve_project_root_for_uri(uri).await else {
+            return;
+        };
+        let Some(project) = find_project_for_path(&root) else {
+            return;
+        };
+        let device_id = self.cache.get_selected_device(&project.root);
+        let output_path = project
+            .root
+            .join(format!("flutter_screenshot_{}.png", now_unix()));
+        let output_str = output_path.to_string_lossy().into_owned();
+
+        self.execute_project_cli(
+            uri,
+            AllowedCommand::Screenshot {
+                device_id,
+                output_path: output_str,
+            },
+        )
+        .await;
+    }
 }
 
 impl LanguageServer for FlutterLspBackend {
@@ -798,6 +937,7 @@ impl LanguageServer for FlutterLspBackend {
     }
 
     async fn shutdown(&self) -> RpcResult<()> {
+        self.app_manager.stop_all().await;
         Ok(())
     }
 
@@ -938,21 +1078,30 @@ impl LanguageServer for FlutterLspBackend {
             return Ok(Some(build_wizard_code_lenses(&uri, doc.wizard.as_ref())));
         }
 
+        if doc.kind == DocumentKind::RunLog {
+            let Some(path) = uri_to_file_path(&uri) else {
+                return Ok(None);
+            };
+            let Some(snapshot) = self.app_manager.snapshot_by_log_path(&path).await else {
+                return Ok(None);
+            };
+            return Ok(Some(build_run_log_code_lenses(&uri, &snapshot)));
+        }
+
         let Some(project) = &doc.project else {
             return Ok(None);
         };
 
-        let devices = self.devices.read().await;
-        let selected_label = self.selected_device_label_sync(project, &devices);
-
         match doc.kind {
-            DocumentKind::Pubspec | DocumentKind::PubspecOverrides => Ok(Some(
-                build_pubspec_code_lenses(&uri, project, selected_label.as_deref()),
-            )),
+            DocumentKind::Pubspec | DocumentKind::PubspecOverrides => {
+                Ok(Some(build_pubspec_code_lenses(&uri, project)))
+            }
             DocumentKind::Dart { .. } => {
                 let Some(parsed) = &doc.dart else {
                     return Ok(None);
                 };
+                let devices = self.devices.read().await;
+                let selected_label = self.selected_device_label_sync(project, &devices);
                 let dap_session = read_session_record(&self.cache, &project.root);
                 let managed_app = self.app_manager.snapshot(&project.root).await;
                 Ok(Some(build_dart_code_lenses(
@@ -964,7 +1113,7 @@ impl LanguageServer for FlutterLspBackend {
                     managed_app.as_ref(),
                 )))
             }
-            DocumentKind::ProjectWizard | DocumentKind::Ignored => Ok(None),
+            DocumentKind::ProjectWizard | DocumentKind::RunLog | DocumentKind::Ignored => Ok(None),
         }
     }
 
@@ -982,6 +1131,33 @@ impl LanguageServer for FlutterLspBackend {
                 command: "flutterDebugger.executeCreateProject".to_string(),
                 arguments: Some(vec![json!(uri_str)]),
             })]));
+        }
+
+        if doc.kind == DocumentKind::RunLog {
+            let Some(path) = uri_to_file_path(&uri) else {
+                return Ok(None);
+            };
+            let Some(snapshot) = self.app_manager.snapshot_by_log_path(&path).await else {
+                return Ok(None);
+            };
+            let mut actions = vec![CodeActionOrCommand::Command(Command {
+                title: "Flutter: Stop App".to_string(),
+                command: "flutterDebugger.stopApp".to_string(),
+                arguments: Some(vec![json!(uri_str)]),
+            })];
+            if snapshot.mode == FlutterRunMode::Debug {
+                actions.push(CodeActionOrCommand::Command(Command {
+                    title: "Flutter: Hot Reload".to_string(),
+                    command: "flutterDebugger.hotReload".to_string(),
+                    arguments: Some(vec![json!(uri_str)]),
+                }));
+                actions.push(CodeActionOrCommand::Command(Command {
+                    title: "Flutter: Hot Restart".to_string(),
+                    command: "flutterDebugger.hotRestart".to_string(),
+                    arguments: Some(vec![json!(uri_str)]),
+                }));
+            }
+            return Ok(Some(actions));
         }
 
         let Some(project) = &doc.project else {
@@ -1030,22 +1206,51 @@ impl LanguageServer for FlutterLspBackend {
                     command: "flutterDebugger.pubGet".to_string(),
                     arguments: Some(vec![json!(uri_str)]),
                 }));
-                actions.push(CodeActionOrCommand::Command(Command {
-                    title: "Flutter: New Project Wizard".to_string(),
-                    command: "flutterDebugger.openProjectWizard".to_string(),
-                    arguments: Some(vec![json!(uri_str)]),
-                }));
             }
             DocumentKind::Dart { .. } => {
-                let has_debug_managed = self
-                    .app_manager
-                    .snapshot(&project.root)
-                    .await
-                    .is_some_and(|m| m.mode == FlutterRunMode::Debug);
-                let has_debug_dap = read_session_record(&self.cache, &project.root)
-                    .is_some_and(|s| s.mode == "debug");
+                let managed = self.app_manager.snapshot(&project.root).await;
+                let dap = read_session_record(&self.cache, &project.root);
 
-                if has_debug_managed || has_debug_dap {
+                if let Some(ref m) = managed {
+                    actions.push(CodeActionOrCommand::Command(Command {
+                        title: "Flutter: Stop App".to_string(),
+                        command: "flutterDebugger.stopApp".to_string(),
+                        arguments: Some(vec![json!(uri_str)]),
+                    }));
+                    if m.mode == FlutterRunMode::Debug {
+                        actions.push(CodeActionOrCommand::Command(Command {
+                            title: "Flutter: Hot Reload".to_string(),
+                            command: "flutterDebugger.hotReload".to_string(),
+                            arguments: Some(vec![json!(uri_str)]),
+                        }));
+                        actions.push(CodeActionOrCommand::Command(Command {
+                            title: "Flutter: Hot Restart".to_string(),
+                            command: "flutterDebugger.hotRestart".to_string(),
+                            arguments: Some(vec![json!(uri_str)]),
+                        }));
+                    }
+                    if m.mode != FlutterRunMode::Release {
+                        for (title, key) in [
+                            ("Flutter: Toggle Performance Overlay", "performanceOverlay"),
+                            ("Flutter: Toggle Debug Paint", "debugPaint"),
+                            ("Flutter: Toggle Repaint Rainbow", "repaintRainbow"),
+                            ("Flutter: Toggle Slow Animations", "slowAnimations"),
+                            ("Flutter: Toggle Debug Banner", "debugBanner"),
+                            ("Flutter: Toggle Target Platform", "platformOverride"),
+                        ] {
+                            actions.push(CodeActionOrCommand::Command(Command {
+                                title: title.to_string(),
+                                command: "flutterDebugger.toggleOverlay".to_string(),
+                                arguments: Some(vec![json!(uri_str), json!(key)]),
+                            }));
+                        }
+                        actions.push(CodeActionOrCommand::Command(Command {
+                            title: "Flutter: Save Screenshot".to_string(),
+                            command: "flutterDebugger.screenshot".to_string(),
+                            arguments: Some(vec![json!(uri_str)]),
+                        }));
+                    }
+                } else if dap.as_ref().is_some_and(|s| s.mode == "debug") {
                     actions.push(CodeActionOrCommand::Command(Command {
                         title: "Flutter: Hot Reload".to_string(),
                         command: "flutterDebugger.hotReload".to_string(),
@@ -1058,6 +1263,20 @@ impl LanguageServer for FlutterLspBackend {
                     }));
                 }
 
+                if let Some(path) = uri_to_file_path(&uri)
+                    && let Some((_, to_test)) = find_counterpart_test_or_impl(&path, &project.root)
+                {
+                    actions.push(CodeActionOrCommand::Command(Command {
+                        title: if to_test {
+                            "Dart: Go to Test File".to_string()
+                        } else {
+                            "Dart: Go to Implementation File".to_string()
+                        },
+                        command: "flutterDebugger.goToCounterpart".to_string(),
+                        arguments: Some(vec![json!(uri_str)]),
+                    }));
+                }
+
                 if project.kind == ProjectKind::Flutter {
                     actions.push(CodeActionOrCommand::Command(Command {
                         title: "Flutter: Switch Target Device".to_string(),
@@ -1065,13 +1284,39 @@ impl LanguageServer for FlutterLspBackend {
                         arguments: Some(vec![json!(uri_str)]),
                     }));
                     actions.push(CodeActionOrCommand::Command(Command {
+                        title: "Flutter: Launch Emulator".to_string(),
+                        command: "flutterDebugger.launchEmulator".to_string(),
+                        arguments: Some(vec![json!(uri_str)]),
+                    }));
+                    actions.push(CodeActionOrCommand::Command(Command {
+                        title: "Flutter: Clean Project".to_string(),
+                        command: "flutterDebugger.clean".to_string(),
+                        arguments: Some(vec![json!(uri_str)]),
+                    }));
+                    actions.push(CodeActionOrCommand::Command(Command {
+                        title: "Flutter: Run Doctor".to_string(),
+                        command: "flutterDebugger.doctor".to_string(),
+                        arguments: Some(vec![json!(uri_str)]),
+                    }));
+                    actions.push(CodeActionOrCommand::Command(Command {
+                        title: "Flutter: Generate .zed/debug.json".to_string(),
+                        command: "flutterDebugger.generateDebugConfig".to_string(),
+                        arguments: Some(vec![json!(uri_str)]),
+                    }));
+                    actions.push(CodeActionOrCommand::Command(Command {
                         title: "Flutter: New Project Wizard".to_string(),
                         command: "flutterDebugger.openProjectWizard".to_string(),
                         arguments: Some(vec![json!(uri_str)]),
                     }));
+                } else {
+                    actions.push(CodeActionOrCommand::Command(Command {
+                        title: "Dart: Generate .zed/debug.json".to_string(),
+                        command: "flutterDebugger.generateDebugConfig".to_string(),
+                        arguments: Some(vec![json!(uri_str)]),
+                    }));
                 }
             }
-            DocumentKind::ProjectWizard | DocumentKind::Ignored => {}
+            DocumentKind::ProjectWizard | DocumentKind::RunLog | DocumentKind::Ignored => {}
         }
 
         if actions.is_empty() {
@@ -1150,12 +1395,22 @@ impl LanguageServer for FlutterLspBackend {
             "flutterDebugger.stopApp" => {
                 self.stop_managed_app(&uri).await;
             }
-            "flutterDebugger.refreshDevices" => {
-                if let Some(path) = uri_to_file_path(&uri)
-                    && let Some(project) = find_project_for_path(&path)
+            "flutterDebugger.toggleOverlay" => {
+                if let Some(toggle) = params
+                    .arguments
+                    .get(1)
+                    .and_then(Value::as_str)
+                    .and_then(DebugOverlayToggle::parse)
                 {
-                    self.maybe_scan_devices_in_background(project.root, true)
-                        .await;
+                    self.toggle_overlay_for_uri(&uri, toggle).await;
+                }
+            }
+            "flutterDebugger.goToCounterpart" => {
+                self.go_to_counterpart_file(&uri).await;
+            }
+            "flutterDebugger.refreshDevices" => {
+                if let Some(root) = self.resolve_project_root_for_uri(&uri).await {
+                    self.maybe_scan_devices_in_background(root, true).await;
                 }
             }
             "flutterDebugger.cycleDevice" => {
@@ -1194,6 +1449,15 @@ impl LanguageServer for FlutterLspBackend {
             }
             "flutterDebugger.executeCreateProject" => {
                 self.execute_create_project(&uri).await;
+            }
+            "flutterDebugger.generateDebugConfig" => {
+                self.generate_debug_config(&uri).await;
+            }
+            "flutterDebugger.launchEmulator" => {
+                self.launch_flutter_emulator(&uri).await;
+            }
+            "flutterDebugger.screenshot" => {
+                self.save_screenshot(&uri).await;
             }
             _ => {}
         }

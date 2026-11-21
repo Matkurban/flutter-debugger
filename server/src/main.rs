@@ -1,6 +1,8 @@
 mod app_runner;
 mod cache;
 mod dap;
+mod debug_config;
+mod emulators;
 mod ipc;
 mod lsp;
 mod project;

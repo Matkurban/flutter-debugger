@@ -4,7 +4,7 @@ use tower_lsp_server::ls_types::{
 };
 
 use crate::cache::PubVersionCache;
-use crate::project::{ProjectInfo, ProjectKind};
+use crate::project::ProjectInfo;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PubDependency {
@@ -168,12 +168,8 @@ pub fn build_inlay_hints(parsed: &ParsedPubspec, pub_cache: &PubVersionCache) ->
         .collect()
 }
 
-/// Builds top-of-file monochrome Unicode CodeLens actions for `pubspec.yaml` / `pubspec_overrides.yaml`.
-pub fn build_pubspec_code_lenses(
-    uri: &Uri,
-    project: &ProjectInfo,
-    selected_device_label: Option<&str>,
-) -> Vec<CodeLens> {
+/// Builds top-of-file dependency-only CodeLens actions for `pubspec.yaml` / `pubspec_overrides.yaml`.
+pub fn build_pubspec_code_lenses(uri: &Uri, project: &ProjectInfo) -> Vec<CodeLens> {
     let top_range = Range {
         start: Position::new(0, 0),
         end: Position::new(0, 0),
@@ -210,42 +206,10 @@ pub fn build_pubspec_code_lenses(
         ));
     }
 
-    if project.kind == ProjectKind::Flutter {
-        let device_title = match selected_device_label {
-            Some(label) => format!("Device: {label}"),
-            None => "Device: Auto".to_string(),
-        };
-        lenses.push(make_lens(
-            top_range,
-            &device_title,
-            "flutterDebugger.cycleDevice",
-            vec![json!(uri_str)],
-        ));
-        lenses.push(make_lens(
-            top_range,
-            "Refresh Devices",
-            "flutterDebugger.refreshDevices",
-            vec![json!(uri_str)],
-        ));
-        lenses.push(make_lens(
-            top_range,
-            "Doctor",
-            "flutterDebugger.doctor",
-            vec![json!(uri_str)],
-        ));
-    }
-
     lenses.push(make_lens(
         top_range,
         "Refresh Versions",
         "flutterDebugger.refreshPubVersions",
-        vec![json!(uri_str)],
-    ));
-
-    lenses.push(make_lens(
-        top_range,
-        "New Project",
-        "flutterDebugger.openProjectWizard",
         vec![json!(uri_str)],
     ));
 

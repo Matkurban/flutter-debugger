@@ -2,22 +2,25 @@
 
 [简体中文](README.zh-CN.md)
 
-Flutter debugging, quick Debug/Profile/Release launching, automatic DevTools Performance view, Hot Reload, target device switching, test runner, project creation wizard, and Pub dependency workflows for the [Zed](https://zed.dev) editor. Designed to work alongside Zed's official **Dart** extension without interfering with Dart syntax highlighting, diagnostics, completion, or formatting.
+Flutter debugging, quick Debug/Profile/Release launching, automatic DevTools Performance view, Hot Reload, target device switching, visual debug overlays, test runner, project creation wizard, and Pub dependency workflows for the [Zed](https://zed.dev) editor. Designed to work alongside Zed's official **Dart** extension without interfering with Dart syntax highlighting, diagnostics, completion, or formatting.
 
 ## Features
 
-- **Quick `main()` Launchers (`Debug` / `Profile` / `Release`)**: In Flutter projects, `main()` displays clean CodeLens buttons (`Debug`, `Profile`, `Release`) just like VS Code's Flutter extension:
+- **Quick `main()` Launchers (`Debug` / `Profile` / `Release`)**: In Flutter projects, `main()` displays clean CodeLens buttons (`Debug`, `Profile`, `Release`) modeled after VS Code's Flutter extension:
   - **Debug**: Launches `flutter run --debug --machine` with live log streaming, automatic Hot Reload on save, `Hot Reload`, `Hot Restart`, `DevTools`, and `Stop`.
   - **Profile**: Launches `flutter run --profile --machine` and automatically opens the official **Flutter DevTools Performance** view once the VM Service is ready.
   - **Release**: Launches `flutter run --release --machine` with live log streaming.
-- **Full Breakpoint Debugging (DAP)**: Full `.zed/debug.json` schema support (`deviceId`, `flutterMode`, `flavor`, `dartDefineFromFile`, `toolArgs`, `env`) plus automatic task-to-debug conversion for `flutter run`, `flutter test`, `dart run`, and `dart test`.
-- **Flutter Project Creation Wizard**: Click `New Project` in `pubspec.yaml` (or trigger `Flutter: New Project Wizard` via Code Actions `Cmd+.` / `Ctrl+.`) to open an editable `flutter-project-wizard.json` manifest (project name, org, template: `app`/`package`/`plugin`/`plugin_ffi`/`module`/`skeleton`, target platforms, description, output directory) with one-click `Create Flutter Project`.
-- **Device Discovery & Switching**: Caches `flutter devices --machine` locally so opening files stays fast. Cycle target devices directly from CodeLens (`Device`) and refresh manually whenever needed (`Refresh Devices`). Selected devices are persisted per project and automatically injected into both quick runs and DAP launches.
-- **Test Runner**: Clean CodeLens (`Run Test` / `Run Group`) on `test()`, `testWidgets()`, and `group()` in `*_test.dart` files, automatically invoking `flutter test` for Flutter projects and `dart test` for pure Dart packages.
-- **Pub Dependency Workflow**:
-  - `Cmd+Click` (macOS) / `Ctrl+Click` (Windows/Linux) any hosted package name in `pubspec.yaml` or `pubspec_overrides.yaml` to open its page on `pub.dev`.
+- **Live Run Log Control Bar & Reliable Stop**: While a Flutter app is running, line 1 of the live run log tab displays `Hot Reload`, `Hot Restart`, `DevTools` / `Performance`, and `Stop`, and every `.dart` file exposes `Flutter: Stop App` at the top of Code Actions (`Cmd+.` / `Ctrl+.`). Stopping gracefully requests `app.stop` and terminates the full process tree on timeout or LSP shutdown.
+- **Full Breakpoint Debugging (DAP)**: Full `.zed/debug.json` schema support (`deviceId`, `flutterMode`, `flavor`, `dartDefineFromFile`, `toolArgs`, `env`), one-click `.zed/debug.json` generation (`Flutter: Generate .zed/debug.json`), plus automatic task-to-debug conversion for `flutter run`, `flutter test`, `dart run`, and `dart test`. Launching with `flutterMode: "profile"` via `F4` also opens Flutter DevTools Performance automatically.
+- **Visual Debug Overlays & Screenshots**: While an app is running in Debug or Profile mode, toggle `Performance Overlay`, `Debug Paint`, `Repaint Rainbow`, `Slow Animations`, `Debug Banner`, and `Target Platform` (`ext.flutter.platformOverride`), or capture a device screenshot (`Flutter: Save Screenshot`) directly from Code Actions (`Cmd+.` / `Ctrl+.`).
+- **Test Runner & File Navigation**: Clean CodeLens (`Run Test` / `Run Group`) on `test()`, `testWidgets()`, and `group()` in `*_test.dart` files (automatically invoking `flutter test` or `dart test`), plus `Dart: Go to Test File` / `Dart: Go to Implementation File` in Code Actions.
+- **Pub Dependency Workflow (`pubspec.yaml` / `pubspec_overrides.yaml`)**:
+  - Top-of-file actions stay strictly dependency-focused: `Pub Get`, `Pub Upgrade`, `Pub Outdated`, `Build Runner` (when present), and `Refresh Versions`.
+  - `Cmd+Click` (macOS) / `Ctrl+Click` (Windows/Linux) any hosted package name to open its page on `pub.dev`.
   - Cached version hints (`latest: x.y.z`) and one-click upgrade Code Actions.
-  - Top-of-file actions for `pub get`, `pub upgrade`, `pub outdated`, `build_runner`, and `flutter doctor` with live status bar progress and full ANSI-cleaned log output opened in a new Zed tab on failure or reports.
+- **Devices, Emulators, Clean, Doctor & Project Wizard**:
+  - Cycle target devices from `main()` (`Device: ...` / `Refresh Devices`) or Dart Code Actions (`Flutter: Switch Target Device`), persisted per project and automatically injected into both quick runs and DAP launches.
+  - Trigger `Flutter: Launch Emulator`, `Flutter: Clean Project`, `Flutter: Run Doctor`, or `Flutter: New Project Wizard` from Dart Code Actions (`Cmd+.` / `Ctrl+.`).
 - **FVM & Monorepo Aware**: Automatically detects `.fvm/flutter_sdk` and resolves the nearest `pubspec.yaml` per file (including `pubspec_overrides.yaml`), distinguishing Flutter apps/plugins from pure Dart packages.
 
 ## Prerequisites
@@ -50,6 +53,12 @@ Add the following to your Zed `settings.json` (`Cmd+,` / `Ctrl+,`) to enable Inl
       "language_servers": ["flutter-debugger", "..."]
     },
     "JSON": {
+      "language_servers": ["flutter-debugger", "..."]
+    },
+    "Log": {
+      "language_servers": ["flutter-debugger", "..."]
+    },
+    "Plain Text": {
       "language_servers": ["flutter-debugger", "..."]
     }
   },

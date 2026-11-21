@@ -8,7 +8,7 @@ repository = "https://github.com/Matkurban/flutter-debugger"
 
 [language_servers.flutter-debugger]
 name = "Flutter Debugger"
-languages = ["Dart", "YAML", "JSON"]
+languages = ["Dart", "YAML", "JSON", "Log", "Plain Text"]
 
 [debug_adapters.Flutter]
 schema_path = "debug_adapter_schemas/Flutter.json"

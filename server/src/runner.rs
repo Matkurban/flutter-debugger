@@ -18,6 +18,10 @@ pub enum AllowedCommand {
     Clean,
     Doctor,
     BuildRunnerBuild,
+    Screenshot {
+        device_id: Option<String>,
+        output_path: String,
+    },
     TestFile {
         relative_path: String,
         test_name: Option<String>,
@@ -33,6 +37,7 @@ impl AllowedCommand {
             Self::Clean => "flutter clean",
             Self::Doctor => "flutter doctor",
             Self::BuildRunnerBuild => "build_runner build",
+            Self::Screenshot { .. } => "screenshot",
             Self::TestFile { .. } => "test",
         }
     }
@@ -63,6 +68,19 @@ impl AllowedCommand {
                     "--delete-conflicting-outputs".into(),
                 ],
             },
+            Self::Screenshot {
+                device_id,
+                output_path,
+            } => {
+                let mut args = vec!["screenshot".into(), "-o".into(), output_path.clone()];
+                if let Some(dev) = device_id
+                    && !dev.trim().is_empty()
+                {
+                    args.push("-d".into());
+                    args.push(dev.clone());
+                }
+                args
+            }
             Self::TestFile {
                 relative_path,
                 test_name,
@@ -126,7 +144,7 @@ impl CommandRunner {
         cmd: &AllowedCommand,
         custom_sdk_path: Option<&str>,
     ) -> Result<CommandOutput, RunnerError> {
-        if matches!(cmd, AllowedCommand::Clean)
+        if matches!(cmd, AllowedCommand::Clean | AllowedCommand::Screenshot { .. })
             && project.kind != crate::project::ProjectKind::Flutter
         {
             return Err(RunnerError::FlutterOnly(cmd.display_name().to_string()));
