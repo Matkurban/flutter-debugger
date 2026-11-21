@@ -67,6 +67,7 @@ impl DiskCache {
         }
     }
 
+    #[cfg(test)]
     pub fn with_root(root_dir: PathBuf) -> Self {
         Self { root_dir }
     }

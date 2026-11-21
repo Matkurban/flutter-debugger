@@ -22,7 +22,6 @@ pub enum AllowedCommand {
         relative_path: String,
         test_name: Option<String>,
     },
-    DevicesMachine,
 }
 
 impl AllowedCommand {
@@ -35,7 +34,6 @@ impl AllowedCommand {
             Self::Doctor => "flutter doctor",
             Self::BuildRunnerBuild => "build_runner build",
             Self::TestFile { .. } => "test",
-            Self::DevicesMachine => "flutter devices",
         }
     }
 
@@ -78,7 +76,6 @@ impl AllowedCommand {
                 }
                 args
             }
-            Self::DevicesMachine => vec!["devices".into(), "--machine".into()],
         }
     }
 }
@@ -86,8 +83,6 @@ impl AllowedCommand {
 /// Output captured from executing a whitelisted CLI command.
 #[derive(Debug, Clone)]
 pub struct CommandOutput {
-    pub command_line: String,
-    pub cwd: PathBuf,
     pub exit_code: i32,
     pub stdout: String,
     pub stderr: String,
@@ -179,8 +174,6 @@ impl CommandRunner {
         };
 
         Ok(CommandOutput {
-            command_line,
-            cwd: project.root.clone(),
             exit_code,
             stdout,
             stderr,
@@ -225,8 +218,6 @@ impl CommandRunner {
         };
 
         Ok(CommandOutput {
-            command_line,
-            cwd: cwd.to_path_buf(),
             exit_code,
             stdout,
             stderr,

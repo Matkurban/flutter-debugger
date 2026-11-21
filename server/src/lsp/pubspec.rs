@@ -99,15 +99,14 @@ pub fn parse_pubspec_dependencies(content: &str) -> ParsedPubspec {
             }
         } else if indent > 2
             && let Some(idx) = pending_block_dep_index
+            && let Some((sub_key, sub_val)) = trimmed.split_once(':')
         {
-            if let Some((sub_key, sub_val)) = trimmed.split_once(':') {
-                let sk = sub_key.trim();
-                let sv = sub_val.trim().trim_matches(|c| c == '"' || c == '\'');
-                if matches!(sk, "sdk" | "path" | "git") {
-                    deps[idx].is_hosted_pub_dev = false;
-                } else if sk == "version" && !sv.is_empty() {
-                    deps[idx].version_constraint = Some(sv.to_string());
-                }
+            let sk = sub_key.trim();
+            let sv = sub_val.trim().trim_matches(|c| c == '"' || c == '\'');
+            if matches!(sk, "sdk" | "path" | "git") {
+                deps[idx].is_hosted_pub_dev = false;
+            } else if sk == "version" && !sv.is_empty() {
+                deps[idx].version_constraint = Some(sv.to_string());
             }
         }
     }
