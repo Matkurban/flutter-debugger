@@ -37,7 +37,7 @@ use crate::cache::{
 use crate::debug_config::ensure_zed_debug_config;
 use crate::emulators::{launch_emulator, list_emulators};
 use crate::ipc::{IpcRequest, read_session_record, send_ipc_request};
-use crate::lsp::dart_file::{build_dart_code_lenses, find_counterpart_test_or_impl};
+use crate::lsp::dart_file::{DartFileRole, build_dart_code_lenses, find_counterpart_test_or_impl};
 use crate::lsp::progress::ProgressHandle;
 use crate::lsp::pubspec::{build_document_links, build_inlay_hints, build_pubspec_code_lenses};
 use crate::lsp::state::{
@@ -1007,7 +1007,7 @@ impl LanguageServer for FlutterLspBackend {
 
         let uri = params.text_document.uri;
         let project_root = self.docs.get(&uri).and_then(|doc| {
-            if matches!(doc.kind, DocumentKind::Dart { .. }) {
+            if doc.kind == DocumentKind::Dart {
                 doc.project.as_ref().map(|p| p.root.clone())
             } else {
                 None
@@ -1094,7 +1094,7 @@ impl LanguageServer for FlutterLspBackend {
             DocumentKind::Pubspec | DocumentKind::PubspecOverrides => {
                 Ok(Some(build_pubspec_code_lenses(&uri)))
             }
-            DocumentKind::Dart { .. } => {
+            DocumentKind::Dart => {
                 let Some(parsed) = &doc.dart else {
                     return Ok(None);
                 };
@@ -1205,7 +1205,18 @@ impl LanguageServer for FlutterLspBackend {
                     arguments: Some(vec![json!(uri_str)]),
                 }));
             }
-            DocumentKind::Dart { .. } => {
+            DocumentKind::Dart => {
+                let is_runnable_test = doc
+                    .dart
+                    .as_ref()
+                    .is_some_and(|d| d.role.is_runnable_test());
+                if is_runnable_test {
+                    actions.push(CodeActionOrCommand::Command(Command {
+                        title: format!("{}: Run Tests in File", project.kind.cli_name()),
+                        command: "flutterDebugger.runTest".to_string(),
+                        arguments: Some(vec![json!(uri_str)]),
+                    }));
+                }
                 let managed = self.app_manager.snapshot(&project.root).await;
                 let dap = read_session_record(&self.cache, &project.root);
 
@@ -1367,11 +1378,22 @@ impl LanguageServer for FlutterLspBackend {
                         .unwrap_or(&path)
                         .to_string_lossy()
                         .into_owned();
+                    let is_integration = self.docs.get(&uri).is_some_and(|doc| {
+                        doc.dart
+                            .as_ref()
+                            .is_some_and(|d| d.role == DartFileRole::IntegrationTest)
+                    });
+                    let device_id = if is_integration && project.kind == ProjectKind::Flutter {
+                        self.cache.get_selected_device(&project.root)
+                    } else {
+                        None
+                    };
                     self.execute_project_cli(
                         &uri,
                         AllowedCommand::TestFile {
                             relative_path: rel,
                             test_name,
+                            device_id,
                         },
                     )
                     .await;

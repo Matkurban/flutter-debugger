@@ -1,6 +1,6 @@
 id = "flutter-debugger"
 name = "Flutter Debugger"
-version = "0.0.1"
+version = "0.0.2"
 schema_version = 1
 authors = ["Matkurban <https://github.com/Matkurban>"]
 description = "Flutter debugging, Hot Reload, Profile DevTools, device switching, test runner, project wizard, and Pub dependency workflow for Zed"

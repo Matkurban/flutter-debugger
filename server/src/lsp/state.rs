@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use tower_lsp_server::ls_types::Uri;
 
 use crate::cache::{DEFAULT_DEVICE_CACHE_TTL_SECS, DEFAULT_PUB_CACHE_TTL_SECS};
-use crate::lsp::dart_file::{ParsedDartFile, parse_dart_file};
+use crate::lsp::dart_file::{DartFileRole, ParsedDartFile, classify_dart_file_role, parse_dart_file};
 use crate::lsp::pubspec::{ParsedPubspec, parse_pubspec_dependencies};
 use crate::project::{ProjectInfo, find_project_for_path};
 use crate::wizard::{ProjectWizardConfig, WIZARD_FILENAME};
@@ -56,7 +56,7 @@ fn default_pub_ttl() -> u64 {
 pub enum DocumentKind {
     Pubspec,
     PubspecOverrides,
-    Dart { is_test: bool },
+    Dart,
     ProjectWizard,
     RunLog,
     Ignored,
@@ -103,13 +103,21 @@ impl OpenDocument {
                 dart: None,
                 wizard: None,
             }),
-            DocumentKind::Dart { is_test } => Some(Self {
-                kind,
-                project: find_project_for_path(&path),
-                pubspec: None,
-                dart: Some(parse_dart_file(text, is_test)),
-                wizard: None,
-            }),
+            DocumentKind::Dart => {
+                let project = find_project_for_path(&path);
+                let role: DartFileRole = classify_dart_file_role(
+                    &path,
+                    project.as_ref().map(|p| p.root.as_path()),
+                    text,
+                );
+                Some(Self {
+                    kind,
+                    project,
+                    pubspec: None,
+                    dart: Some(parse_dart_file(text, role)),
+                    wizard: None,
+                })
+            }
         }
     }
 }
@@ -123,11 +131,7 @@ pub fn classify_document_path(path: &Path) -> DocumentKind {
         _ if file_name.starts_with("flutter-run-") && file_name.ends_with(".log") => {
             DocumentKind::RunLog
         }
-        _ if file_name.ends_with(".dart") => {
-            let is_test = file_name.ends_with("_test.dart")
-                || path.components().any(|c| c.as_os_str() == "test");
-            DocumentKind::Dart { is_test }
-        }
+        _ if file_name.ends_with(".dart") => DocumentKind::Dart,
         _ => DocumentKind::Ignored,
     }
 }
@@ -178,7 +182,7 @@ mod tests {
         );
         assert_eq!(
             classify_document_path(Path::new("/repo/test/widget_test.dart")),
-            DocumentKind::Dart { is_test: true }
+            DocumentKind::Dart
         );
     }
 }

@@ -24,6 +24,7 @@ pub enum AllowedCommand {
     TestFile {
         relative_path: String,
         test_name: Option<String>,
+        device_id: Option<String>,
     },
 }
 
@@ -67,13 +68,20 @@ impl AllowedCommand {
             Self::TestFile {
                 relative_path,
                 test_name,
+                device_id,
             } => {
                 let mut args = vec!["test".into(), relative_path.clone()];
                 if let Some(name) = test_name
                     && !name.trim().is_empty()
                 {
-                    args.push("--name".into());
+                    args.push("--plain-name".into());
                     args.push(name.clone());
+                }
+                if let Some(dev) = device_id
+                    && !dev.trim().is_empty()
+                {
+                    args.push("-d".into());
+                    args.push(dev.clone());
                 }
                 args
             }
