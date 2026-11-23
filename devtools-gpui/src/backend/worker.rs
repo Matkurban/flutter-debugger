@@ -1,15 +1,14 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use async_channel::{Receiver, Sender};
 use flutter_debugger_protocol::{
-    ActiveSessionRecord, IpcRequest, OverlayState, default_sessions_dir, list_active_sessions_in,
-    select_best_session,
+    ActiveSessionRecord, IpcRequest, OverlayState, default_sessions_dir, list_active_sessions_in, select_best_session,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 
 use crate::backend::command::{BackendCommand, BackendEvent, ConnectionStatus};
 use crate::backend::editor::open_source_in_zed;
@@ -21,14 +20,11 @@ use crate::protocol::{LogEntry, ParsedLogRecord};
 pub fn spawn_backend_worker(initial_args: CliLaunchArgs) -> (Sender<BackendCommand>, Receiver<BackendEvent>) {
     let (cmd_tx, cmd_rx) = async_channel::unbounded::<BackendCommand>();
     let (event_tx, event_rx) = async_channel::unbounded::<BackendEvent>();
-    std::thread::Builder::new()
-        .name("flutter-devtools-tokio-worker".to_string())
-        .spawn(move || {
-            if let Ok(rt) = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build() {
-                rt.block_on(run_worker_loop(initial_args, cmd_rx, event_tx));
-            }
-        })
-        .ok();
+    std::thread::Builder::new().name("flutter-devtools-tokio-worker".to_string()).spawn(move || {
+        if let Ok(rt) = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build() {
+            rt.block_on(run_worker_loop(initial_args, cmd_rx, event_tx));
+        }
+    }).ok();
     (cmd_tx, event_rx)
 }
 
@@ -36,8 +32,9 @@ struct WorkerState {
     sessions: Vec<ActiveSessionRecord>, active_session: Option<ActiveSessionRecord>,
     preferred_project: Option<String>, preferred_session_id: Option<String>,
     explicit_vm_uri: Option<String>, connected_vm_uri: Option<String>,
-    vm_client: Option<DartVmClient>, overlays: OverlayState,
-    network_recording: bool, memory_polling: bool, http_updated_since: Option<u64>,
+    vm_client: Option<DartVmClient>, overlays: Arc<Mutex<OverlayState>>,
+    network_recording: bool, memory_polling: bool,
+    http_updated_since: Arc<AtomicU64>, http_poll_in_flight: Arc<AtomicBool>, memory_poll_in_flight: Arc<AtomicBool>,
     log_seq: Arc<AtomicU64>, tree_group_seq: u64, props_group_seq: u64,
     active_tree_group: String, active_props_group: String, last_gc_poll: Option<Instant>,
 }
@@ -65,9 +62,12 @@ async fn run_worker_loop(initial_args: CliLaunchArgs, cmd_rx: Receiver<BackendCo
         sessions: Vec::new(), active_session: None,
         preferred_project: initial_args.project, preferred_session_id: initial_args.session_id,
         explicit_vm_uri: initial_args.vm_uri, connected_vm_uri: None, vm_client: None,
-        overlays: OverlayState::default(), network_recording: true, memory_polling: true,
-        http_updated_since: None, log_seq: Arc::new(AtomicU64::new(1)),
-        tree_group_seq: 0, props_group_seq: 0,
+        overlays: Arc::new(Mutex::new(OverlayState::default())),
+        network_recording: true, memory_polling: true,
+        http_updated_since: Arc::new(AtomicU64::new(0)),
+        http_poll_in_flight: Arc::new(AtomicBool::new(false)),
+        memory_poll_in_flight: Arc::new(AtomicBool::new(false)),
+        log_seq: Arc::new(AtomicU64::new(1)), tree_group_seq: 0, props_group_seq: 0,
         active_tree_group: String::new(), active_props_group: String::new(), last_gc_poll: None,
     };
 
@@ -92,14 +92,25 @@ async fn run_worker_loop(initial_args: CliLaunchArgs, cmd_rx: Receiver<BackendCo
             Some(push_ev) = vm_push_rx.recv() => handle_vm_push_event(push_ev, &mut state, &event_tx).await,
             _ = session_scan_ticker.tick() => scan_sessions_and_reconcile(&mut state, &event_tx, &vm_push_tx).await,
             _ = http_poll_ticker.tick() => {
-                if state.network_recording && let Some(c) = state.vm_client.clone() && let Ok((ts, batch)) = c.poll_http_profile(state.http_updated_since).await {
-                    if ts > 0 { state.http_updated_since = Some(ts); }
-                    if !batch.is_empty() { let _ = event_tx.try_send(BackendEvent::HttpRequestsBatch(batch)); }
+                if state.network_recording && let Some(c) = state.vm_client.clone() && !state.http_poll_in_flight.swap(true, Ordering::AcqRel) {
+                    let (flag, since_atom, tx) = (Arc::clone(&state.http_poll_in_flight), Arc::clone(&state.http_updated_since), event_tx.clone());
+                    tokio::spawn(async move {
+                        let since_val = since_atom.load(Ordering::Acquire);
+                        if let Ok((ts, batch)) = c.poll_http_profile((since_val > 0).then_some(since_val)).await {
+                            if ts > 0 { since_atom.store(ts, Ordering::Release); }
+                            if !batch.is_empty() { let _ = tx.try_send(BackendEvent::HttpRequestsBatch(batch)); }
+                        }
+                        flag.store(false, Ordering::Release);
+                    });
                 }
             }
             _ = memory_poll_ticker.tick() => {
-                if state.memory_polling && let Some(c) = state.vm_client.clone() && let Ok(snap) = c.poll_memory_usage(false).await {
-                    let _ = event_tx.try_send(BackendEvent::MemoryAppended(snap));
+                if state.memory_polling && let Some(c) = state.vm_client.clone() && !state.memory_poll_in_flight.swap(true, Ordering::AcqRel) {
+                    let (flag, tx) = (Arc::clone(&state.memory_poll_in_flight), event_tx.clone());
+                    tokio::spawn(async move {
+                        if let Ok(snap) = c.poll_memory_usage(false).await { let _ = tx.try_send(BackendEvent::MemoryAppended(snap)); }
+                        flag.store(false, Ordering::Release);
+                    });
                 }
             }
         }
@@ -140,7 +151,7 @@ async fn connect_to_vm(raw_uri: &str, state: &mut WorkerState, event_tx: &Sender
     match DartVmClient::connect(raw_uri, vm_push_tx.clone(), Arc::clone(&state.log_seq)).await {
         Ok((client, meta)) => {
             state.connected_vm_uri = Some(raw_uri.to_string());
-            state.http_updated_since = None;
+            state.http_updated_since.store(0, Ordering::Release);
             state.vm_client = Some(client.clone());
             let _ = event_tx.try_send(BackendEvent::ConnectionChanged(ConnectionStatus::Connected {
                 vm_uri: client.ws_uri().to_string(), isolate_name: meta.main_isolate_name,
@@ -148,13 +159,19 @@ async fn connect_to_vm(raw_uri: &str, state: &mut WorkerState, event_tx: &Sender
             }));
             let project_root = state.active_session.as_ref().map(|s| PathBuf::from(&s.project_root)).or_else(|| state.preferred_project.as_ref().map(PathBuf::from));
             let (tree_group, prev_tree_group) = state.next_tree_group();
-            let base_overlays = state.overlays.clone();
+            let overlays_lock = Arc::clone(&state.overlays);
+            let since_atom = Arc::clone(&state.http_updated_since);
             let tx = event_tx.clone();
             tokio::spawn(async move {
                 if let Some(ref root) = project_root { client.set_pub_root_directories(root).await; }
-                let synced = client.query_initial_overlay_state(&base_overlays).await;
+                let base_ov = overlays_lock.lock().await.clone();
+                let synced = client.query_initial_overlay_state(&base_ov).await;
+                *overlays_lock.lock().await = synced.clone();
                 let _ = tx.try_send(BackendEvent::OverlayStateUpdated(synced));
-                if let Ok((_, batch)) = client.poll_http_profile(None).await && !batch.is_empty() { let _ = tx.try_send(BackendEvent::HttpRequestsBatch(batch)); }
+                if let Ok((ts, batch)) = client.poll_http_profile(None).await {
+                    if ts > 0 { since_atom.store(ts, Ordering::Release); }
+                    if !batch.is_empty() { let _ = tx.try_send(BackendEvent::HttpRequestsBatch(batch)); }
+                }
                 if let Ok(mem) = client.poll_memory_usage(false).await { let _ = tx.try_send(BackendEvent::MemoryAppended(mem)); }
                 if let Ok(tree) = client.fetch_widget_summary_tree(&tree_group).await { let _ = tx.try_send(BackendEvent::WidgetTreeLoaded(tree)); }
                 client.dispose_inspector_group(&prev_tree_group).await;
@@ -180,9 +197,7 @@ async fn handle_backend_command(cmd: BackendCommand, state: &mut WorkerState, ev
         BackendCommand::HotReload | BackendCommand::HotRestart => {
             let is_restart = matches!(cmd, BackendCommand::HotRestart);
             let Some(session) = state.active_session.clone() else { send_toast(event_tx, "No active Flutter session", true); return; };
-            let client_opt = state.vm_client.clone();
-            let (tree_group, prev_tree_group) = state.next_tree_group();
-            let tx = event_tx.clone();
+            let (client_opt, (tree_group, prev_tree_group), tx) = (state.vm_client.clone(), state.next_tree_group(), event_tx.clone());
             tokio::spawn(async move {
                 let started = Instant::now();
                 let (req, label) = if is_restart { (IpcRequest::HotRestart, "🔄 Hot Restart") } else { (IpcRequest::HotReload, "⚡ Hot Reload") };
@@ -200,15 +215,15 @@ async fn handle_backend_command(cmd: BackendCommand, state: &mut WorkerState, ev
             });
         }
         BackendCommand::ToggleOverlay(overlay) => {
+            let (overlays_lock, tx) = (Arc::clone(&state.overlays), event_tx.clone());
             if let Some(session) = state.active_session.clone() {
-                let tx = event_tx.clone();
-                let mut current_overlays = state.overlays.clone();
                 tokio::spawn(async move {
                     match send_ipc_to_session(&session, &IpcRequest::ToggleOverlay { overlay }).await {
                         Ok(resp) => {
                             if resp.ok {
-                                current_overlays.sync_from_status_message(overlay, &resp.message);
-                                let _ = tx.try_send(BackendEvent::OverlayStateUpdated(current_overlays));
+                                let mut g = overlays_lock.lock().await;
+                                g.sync_from_status_message(overlay, &resp.message);
+                                let _ = tx.try_send(BackendEvent::OverlayStateUpdated(g.clone()));
                             }
                             send_toast(&tx, resp.message, !resp.ok);
                         }
@@ -216,19 +231,22 @@ async fn handle_backend_command(cmd: BackendCommand, state: &mut WorkerState, ev
                     }
                 });
             } else if let Some(client) = state.vm_client.clone() {
-                let (method, params, status_label) = state.overlays.preview_toggle(overlay);
-                if client.call_isolate(method, params).await.is_ok() {
-                    let _ = state.overlays.toggle(overlay);
-                    let _ = event_tx.try_send(BackendEvent::OverlayStateUpdated(state.overlays.clone()));
-                    send_toast(event_tx, status_label, false);
-                }
+                tokio::spawn(async move {
+                    let (method, params, status_label) = overlays_lock.lock().await.preview_toggle(overlay);
+                    match client.call_isolate(method, params).await {
+                        Ok(_) => {
+                            let mut g = overlays_lock.lock().await;
+                            let _ = g.toggle(overlay);
+                            let _ = tx.try_send(BackendEvent::OverlayStateUpdated(g.clone()));
+                            send_toast(&tx, status_label, false);
+                        }
+                        Err(err) => send_toast(&tx, format!("Overlay toggle failed: {err}"), true),
+                    }
+                });
             }
         }
         BackendCommand::TakeScreenshot => {
-            let Some(session) = state.active_session.clone() else {
-                send_toast(event_tx, "No active session to capture screenshot", true);
-                return;
-            };
+            let Some(session) = state.active_session.clone() else { send_toast(event_tx, "No active session to capture screenshot", true); return; };
             let tx = event_tx.clone();
             tokio::spawn(async move {
                 match send_ipc_to_session(&session, &IpcRequest::Screenshot { output_path: None }).await {
@@ -238,8 +256,7 @@ async fn handle_backend_command(cmd: BackendCommand, state: &mut WorkerState, ev
             });
         }
         BackendCommand::OpenWebDevTools { page } => {
-            let session_opt = state.active_session.clone();
-            let tx = event_tx.clone();
+            let (session_opt, tx) = (state.active_session.clone(), event_tx.clone());
             tokio::spawn(async move {
                 if let Some(session) = session_opt {
                     match send_ipc_to_session(&session, &IpcRequest::OpenDevTools { page: page.clone() }).await {
@@ -256,7 +273,7 @@ async fn handle_backend_command(cmd: BackendCommand, state: &mut WorkerState, ev
             if let Some(c) = state.vm_client.clone() { tokio::spawn(async move { c.set_http_timeline_logging(enabled).await }); }
         }
         BackendCommand::ClearNetworkProfile => {
-            state.http_updated_since = None;
+            state.http_updated_since.store(0, Ordering::Release);
             if let Some(c) = state.vm_client.clone() { tokio::spawn(async move { c.clear_http_profile().await }); }
         }
         BackendCommand::FetchHttpRequestDetail { request_id } => {
@@ -271,8 +288,7 @@ async fn handle_backend_command(cmd: BackendCommand, state: &mut WorkerState, ev
         }
         BackendCommand::RefreshWidgetTree => {
             if let Some(c) = state.vm_client.clone() {
-                let (tree_group, prev_group) = state.next_tree_group();
-                let tx = event_tx.clone();
+                let ((tree_group, prev_group), tx) = (state.next_tree_group(), event_tx.clone());
                 tokio::spawn(async move {
                     match c.fetch_widget_summary_tree(&tree_group).await {
                         Ok(tree) => { let _ = tx.try_send(BackendEvent::WidgetTreeLoaded(tree)); }
@@ -284,9 +300,7 @@ async fn handle_backend_command(cmd: BackendCommand, state: &mut WorkerState, ev
         }
         BackendCommand::SelectWidgetNode { value_id } => {
             if let Some(c) = state.vm_client.clone() {
-                let tree_group = state.active_tree_group.clone();
-                let (props_group, prev_props_group) = state.next_props_group();
-                let tx = event_tx.clone();
+                let (tree_group, (props_group, prev_props_group), tx) = (state.active_tree_group.clone(), state.next_props_group(), event_tx.clone());
                 tokio::spawn(async move {
                     c.set_widget_selection_by_id(&value_id, &tree_group).await;
                     if let Ok(properties) = c.fetch_widget_properties(&value_id, &props_group).await {
@@ -298,8 +312,7 @@ async fn handle_backend_command(cmd: BackendCommand, state: &mut WorkerState, ev
         }
         BackendCommand::ExpandWidgetChildren { value_id } => {
             if let Some(c) = state.vm_client.clone() {
-                let tree_group = state.active_tree_group.clone();
-                let tx = event_tx.clone();
+                let (tree_group, tx) = (state.active_tree_group.clone(), event_tx.clone());
                 tokio::spawn(async move {
                     if let Ok(children) = c.fetch_widget_children(&value_id, &tree_group).await && !children.is_empty() {
                         let _ = tx.try_send(BackendEvent::WidgetChildrenLoaded { parent_value_id: value_id, children });
@@ -345,8 +358,9 @@ async fn handle_vm_push_event(ev: VmPushEvent, state: &mut WorkerState, event_tx
             }
         }
         VmPushEvent::ServiceExtensionStateChanged { extension, value } => {
-            state.overlays.sync_from_extension_event(&extension, &value);
-            let _ = event_tx.try_send(BackendEvent::OverlayStateUpdated(state.overlays.clone()));
+            let mut g = state.overlays.lock().await;
+            g.sync_from_extension_event(&extension, &value);
+            let _ = event_tx.try_send(BackendEvent::OverlayStateUpdated(g.clone()));
         }
         VmPushEvent::ServiceExtensionAdded { rpc } => {
             if let Some(ref client) = state.vm_client {
@@ -354,12 +368,9 @@ async fn handle_vm_push_event(ev: VmPushEvent, state: &mut WorkerState, event_tx
                 if (rpc == "ext.flutter.inspector.getRootWidgetTree" || rpc == "ext.flutter.inspector.getRootWidgetSummaryTree")
                     && let Some(c) = state.vm_client.clone()
                 {
-                    let (tree_group, prev_group) = state.next_tree_group();
-                    let tx = event_tx.clone();
+                    let ((tree_group, prev_group), tx) = (state.next_tree_group(), event_tx.clone());
                     tokio::spawn(async move {
-                        if let Ok(tree) = c.fetch_widget_summary_tree(&tree_group).await {
-                            let _ = tx.try_send(BackendEvent::WidgetTreeLoaded(tree));
-                        }
+                        if let Ok(tree) = c.fetch_widget_summary_tree(&tree_group).await { let _ = tx.try_send(BackendEvent::WidgetTreeLoaded(tree)); }
                         c.dispose_inspector_group(&prev_group).await;
                     });
                 }
@@ -367,27 +378,24 @@ async fn handle_vm_push_event(ev: VmPushEvent, state: &mut WorkerState, event_tx
         }
         VmPushEvent::WidgetInspectEvent => {
             if let Some(c) = state.vm_client.clone() {
-                let tree_group = state.active_tree_group.clone();
-                let (props_group, prev_props_group) = state.next_props_group();
-                let tx = event_tx.clone();
+                let ((tree_group, prev_tree_group), (props_group, prev_props_group), tx) = (state.next_tree_group(), state.next_props_group(), event_tx.clone());
                 tokio::spawn(async move {
+                    let tree = c.fetch_widget_summary_tree(&tree_group).await.ok();
                     if let Ok(selected_node) = c.get_selected_summary_widget(&tree_group).await {
                         let properties = c.fetch_widget_properties(&selected_node.value_id, &props_group).await.unwrap_or_default();
-                        let _ = tx.try_send(BackendEvent::WidgetSelectedFromDevice { selected_node, properties });
+                        let _ = tx.try_send(BackendEvent::WidgetSelectedFromDevice { tree, selected_node, properties });
                     }
+                    c.dispose_inspector_group(&prev_tree_group).await;
                     c.dispose_inspector_group(&prev_props_group).await;
                 });
             }
         }
         VmPushEvent::IsolateReloaded => {
             if let Some(c) = state.vm_client.clone() {
-                let (tree_group, prev_group) = state.next_tree_group();
-                let tx = event_tx.clone();
+                let ((tree_group, prev_group), tx) = (state.next_tree_group(), event_tx.clone());
                 tokio::spawn(async move {
                     let _ = c.refresh_main_isolate().await;
-                    if let Ok(tree) = c.fetch_widget_summary_tree(&tree_group).await {
-                        let _ = tx.try_send(BackendEvent::WidgetTreeLoaded(tree));
-                    }
+                    if let Ok(tree) = c.fetch_widget_summary_tree(&tree_group).await { let _ = tx.try_send(BackendEvent::WidgetTreeLoaded(tree)); }
                     c.dispose_inspector_group(&prev_group).await;
                 });
             }
@@ -398,9 +406,7 @@ async fn handle_vm_push_event(ev: VmPushEvent, state: &mut WorkerState, event_tx
             state.last_gc_poll = Some(now);
             if let Some(c) = state.vm_client.clone() {
                 let tx = event_tx.clone();
-                tokio::spawn(async move {
-                    if let Ok(snap) = c.poll_memory_usage(true).await { let _ = tx.try_send(BackendEvent::MemoryAppended(snap)); }
-                });
+                tokio::spawn(async move { if let Ok(snap) = c.poll_memory_usage(true).await { let _ = tx.try_send(BackendEvent::MemoryAppended(snap)); } });
             }
         }
         VmPushEvent::Disconnected(reason) => {
@@ -416,14 +422,10 @@ fn send_toast(tx: &Sender<BackendEvent>, message: impl Into<String>, is_error: b
 }
 
 async fn resolve_truncated_log(client: &DartVmClient, parsed: ParsedLogRecord) -> Option<LogEntry> {
-    let mut message = None;
-    let mut error = None;
-    let mut stack = parsed.entry.stack_trace.clone();
+    let (mut message, mut error, mut stack) = (None, None, parsed.entry.stack_trace.clone());
     if let Some(ref obj_id) = parsed.truncated.message_object_id { message = client.fetch_full_string_object(obj_id).await; }
     if let Some(ref obj_id) = parsed.truncated.error_object_id { error = client.fetch_full_string_object(obj_id).await; }
-    if let Some(ref obj_id) = parsed.truncated.stack_object_id && let Some(full_st) = client.fetch_full_string_object(obj_id).await {
-        stack = Some(full_st);
-    }
+    if let Some(ref obj_id) = parsed.truncated.stack_object_id && let Some(full_st) = client.fetch_full_string_object(obj_id).await { stack = Some(full_st); }
     if message.is_none() && error.is_none() && stack == parsed.entry.stack_trace { return None; }
     let base_msg = message.unwrap_or_else(|| parsed.entry.full_text.clone());
     let full_text = match error {

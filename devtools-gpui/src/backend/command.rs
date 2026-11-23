@@ -80,6 +80,7 @@ pub enum BackendEvent {
         children: Vec<WidgetTreeNode>,
     },
     WidgetSelectedFromDevice {
+        tree: Option<WidgetTreeNode>,
         selected_node: WidgetTreeNode,
         properties: Vec<WidgetProperty>,
     },

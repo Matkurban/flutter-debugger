@@ -73,9 +73,7 @@ impl InspectorTabState {
             .map(|n| (n.value_id.clone(), n.properties.clone()));
 
         let chosen_id = if let Some((id, props)) = keep_existing {
-            if !props.is_empty() {
-                self.selected_properties = props;
-            }
+            if !props.is_empty() { self.selected_properties = props; }
             self.root = Some(root);
             Some(id)
         } else {
@@ -90,34 +88,38 @@ impl InspectorTabState {
     }
 
     pub fn apply_children(&mut self, parent_value_id: &str, children: Vec<WidgetTreeNode>) {
-        if let Some(ref mut root) = self.root
-            && attach_children_mut(root, parent_value_id, children)
-        {
+        let mut children_opt = Some(children);
+        if let Some(ref mut root) = self.root && attach_children_mut(root, parent_value_id, &mut children_opt) {
             self.rebuild_flat_rows();
         }
     }
 
     pub fn apply_device_selection(
         &mut self,
+        tree: Option<WidgetTreeNode>,
         selected_node: WidgetTreeNode,
         properties: Vec<WidgetProperty>,
     ) {
         let target_id = selected_node.value_id.clone();
-        if let Some(ref mut root) = self.root {
-            if !expand_path_to_node_mut(root, &target_id) {
-                root.children.push(selected_node.clone());
-                root.expanded = true;
+        if let Some(mut new_root) = tree {
+            if let Some(ref old_root) = self.root {
+                let mut expanded_ids = std::collections::HashSet::new();
+                collect_expanded_ids(old_root, &mut expanded_ids);
+                restore_expanded_ids_mut(&mut new_root, &expanded_ids);
             }
+            self.root = Some(new_root);
+        }
+        if let Some(ref mut root) = self.root {
+            expand_path_to_node_mut(root, &target_id);
         } else {
             self.root = Some(selected_node.clone());
         }
-        self.selected_value_id = Some(target_id);
-        self.selected_properties = if !properties.is_empty() {
-            properties
-        } else {
-            selected_node.properties
-        };
+        self.selected_value_id = Some(target_id.clone());
+        self.selected_properties = if !properties.is_empty() { properties } else { selected_node.properties };
         self.rebuild_flat_rows();
+        if let Some(idx) = self.flat_rows.iter().position(|r| r.value_id == target_id) {
+            self.scroll_handle.scroll_to_item(idx, gpui_kit::ScrollStrategy::Center);
+        }
     }
 
     pub fn apply_properties(&mut self, value_id: &str, props: Vec<WidgetProperty>) {
@@ -128,17 +130,13 @@ impl InspectorTabState {
 
     pub fn select_node(&mut self, value_id: &str) -> Option<SourceLocation> {
         self.selected_value_id = Some(value_id.to_string());
-        if let Some(ref root) = self.root
-            && let Some(node) = find_node_by_id(root, value_id)
-        {
+        if let Some(ref root) = self.root && let Some(node) = find_node_by_id(root, value_id) {
             self.selected_properties = node.properties.clone();
             return node.location.clone();
         }
         None
     }
 
-    /// Toggles expansion of `value_id`. Returns `true` if the node was expanded and has
-    /// `has_children && children.is_empty()` so lazy child loading should be triggered.
     pub fn toggle_expand(&mut self, value_id: &str) -> bool {
         let mut needs_lazy_load = false;
         if let Some(ref mut root) = self.root {
@@ -156,63 +154,49 @@ impl InspectorTabState {
     }
 
     pub fn selected_node(&self) -> Option<&WidgetTreeNode> {
-        let id = self.selected_value_id.as_deref()?;
-        let root = self.root.as_ref()?;
-        find_node_by_id(root, id)
+        find_node_by_id(self.root.as_ref()?, self.selected_value_id.as_deref()?)
     }
 
     pub fn flattened_count(&self) -> usize {
-        fn count_nodes(n: &WidgetTreeNode) -> usize {
-            1 + n.children.iter().map(count_nodes).sum::<usize>()
-        }
+        fn count_nodes(n: &WidgetTreeNode) -> usize { 1 + n.children.iter().map(count_nodes).sum::<usize>() }
         self.root.as_ref().map_or(0, count_nodes)
     }
 
     pub fn rebuild_flat_rows(&mut self) {
         self.flat_rows.clear();
-        let Some(ref root) = self.root else {
-            return;
-        };
+        let Some(ref root) = self.root else { return };
         let q = self.search_query.trim().to_ascii_lowercase();
         flatten_node_rec(root, 0, &q, &mut self.flat_rows);
     }
 }
 
 fn find_node_by_id<'a>(node: &'a WidgetTreeNode, value_id: &str) -> Option<&'a WidgetTreeNode> {
-    if node.value_id == value_id {
-        return Some(node);
-    }
-    for child in &node.children {
-        if let Some(found) = find_node_by_id(child, value_id) {
-            return Some(found);
-        }
-    }
-    None
+    if node.value_id == value_id { return Some(node); }
+    node.children.iter().find_map(|c| find_node_by_id(c, value_id))
 }
 
-fn attach_children_mut(
-    node: &mut WidgetTreeNode,
-    parent_id: &str,
-    children: Vec<WidgetTreeNode>,
-) -> bool {
+fn collect_expanded_ids(node: &WidgetTreeNode, out: &mut std::collections::HashSet<String>) {
+    if node.expanded && !node.value_id.is_empty() { out.insert(node.value_id.clone()); }
+    for child in &node.children { collect_expanded_ids(child, out); }
+}
+
+fn restore_expanded_ids_mut(node: &mut WidgetTreeNode, expanded_ids: &std::collections::HashSet<String>) {
+    if expanded_ids.contains(&node.value_id) { node.expanded = true; }
+    for child in &mut node.children { restore_expanded_ids_mut(child, expanded_ids); }
+}
+
+fn attach_children_mut(node: &mut WidgetTreeNode, parent_id: &str, children: &mut Option<Vec<WidgetTreeNode>>) -> bool {
     if node.value_id == parent_id {
-        node.children = children;
+        node.children = children.take().unwrap_or_default();
         node.has_children = !node.children.is_empty();
         node.expanded = true;
         return true;
     }
-    for child in &mut node.children {
-        if attach_children_mut(child, parent_id, children.clone()) {
-            return true;
-        }
-    }
-    false
+    node.children.iter_mut().any(|c| attach_children_mut(c, parent_id, children))
 }
 
 fn expand_path_to_node_mut(node: &mut WidgetTreeNode, target_id: &str) -> bool {
-    if node.value_id == target_id {
-        return true;
-    }
+    if node.value_id == target_id { return true; }
     for child in &mut node.children {
         if expand_path_to_node_mut(child, target_id) {
             node.expanded = true;
@@ -222,49 +206,26 @@ fn expand_path_to_node_mut(node: &mut WidgetTreeNode, target_id: &str) -> bool {
     false
 }
 
-fn toggle_node_expand_mut(
-    node: &mut WidgetTreeNode,
-    value_id: &str,
-    needs_lazy_load: &mut bool,
-) -> bool {
+fn toggle_node_expand_mut(node: &mut WidgetTreeNode, value_id: &str, needs_lazy_load: &mut bool) -> bool {
     if node.value_id == value_id {
         node.expanded = !node.expanded;
-        if node.expanded && node.has_children && node.children.is_empty() {
-            *needs_lazy_load = true;
-        }
+        if node.expanded && node.has_children && node.children.is_empty() { *needs_lazy_load = true; }
         return true;
     }
-    for child in &mut node.children {
-        if toggle_node_expand_mut(child, value_id, needs_lazy_load) {
-            return true;
-        }
-    }
-    false
+    node.children.iter_mut().any(|c| toggle_node_expand_mut(c, value_id, needs_lazy_load))
 }
 
 fn set_all_expanded_mut(node: &mut WidgetTreeNode, expanded: bool) {
     node.expanded = expanded;
-    for child in &mut node.children {
-        set_all_expanded_mut(child, expanded);
-    }
+    for child in &mut node.children { set_all_expanded_mut(child, expanded); }
 }
 
 fn node_or_descendant_matches(node: &WidgetTreeNode, q: &str) -> bool {
-    if q.is_empty() {
-        return true;
-    }
-    if node.widget_runtime_type.to_ascii_lowercase().contains(q)
+    if q.is_empty() { return true; }
+    node.widget_runtime_type.to_ascii_lowercase().contains(q)
         || node.description.to_ascii_lowercase().contains(q)
-        || node
-            .location
-            .as_ref()
-            .is_some_and(|l| l.uri.to_ascii_lowercase().contains(q))
-    {
-        return true;
-    }
-    node.children
-        .iter()
-        .any(|c| node_or_descendant_matches(c, q))
+        || node.location.as_ref().is_some_and(|l| l.uri.to_ascii_lowercase().contains(q))
+        || node.children.iter().any(|c| node_or_descendant_matches(c, q))
 }
 
 fn flatten_node_rec(
@@ -423,5 +384,28 @@ impl RootView {
                         .child(resizable_panel().child(render_widget_properties_pane(self, cx))),
                 ),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn device_selection_expands_to_nested_target_without_forging_root_child() {
+        let mut tree = WidgetTreeNode::parse_from_json(&json!({
+            "result": {
+                "valueId": "inspector-root", "widgetRuntimeType": "MaterialApp", "description": "MaterialApp",
+                "children": [{
+                    "valueId": "inspector-scaffold", "widgetRuntimeType": "Scaffold", "description": "Scaffold",
+                    "children": [{ "valueId": "inspector-btn", "widgetRuntimeType": "FilledButton", "description": "FilledButton" }]
+                }]
+            }
+        })).unwrap();
+        set_all_expanded_mut(&mut tree, false);
+        assert!(expand_path_to_node_mut(&mut tree, "inspector-btn"));
+        assert!(tree.expanded && tree.children[0].expanded);
+        assert_eq!(tree.children.len(), 1);
     }
 }

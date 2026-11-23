@@ -42,6 +42,8 @@ pub struct HttpRequestRecord {
     /// `true` only after `ext.dart.io.getHttpProfileRequest` (or explicit `requestBody`/`responseBody`)
     /// has been fetched, distinguishing summary headers from full body payloads.
     pub body_loaded: bool,
+    /// `true` only when `response.endTime` is present or an error occurred.
+    pub response_complete: bool,
 }
 
 impl HttpRequestRecord {
@@ -77,9 +79,7 @@ impl HttpRequestRecord {
 
         let end_time_micros = resp_obj
             .and_then(|r| r.get("endTime"))
-            .and_then(Value::as_u64)
-            .or_else(|| v.get("endTime").and_then(Value::as_u64))
-            .or_else(|| req_obj.and_then(|r| r.get("endTime")).and_then(Value::as_u64));
+            .and_then(Value::as_u64);
 
         let duration_ms = end_time_micros
             .and_then(|end| end.checked_sub(start_time_micros))
@@ -141,6 +141,7 @@ impl HttpRequestRecord {
         }
 
         let body_loaded = v.get("requestBody").is_some() || v.get("responseBody").is_some();
+        let response_complete = end_time_micros.is_some() || error.is_some();
         let has_any_detail = body_loaded || !req_headers.is_empty() || !resp_headers.is_empty();
         let detail = has_any_detail.then(|| Self::parse_detail_from_response(v));
 
@@ -176,6 +177,7 @@ impl HttpRequestRecord {
             events,
             detail,
             body_loaded,
+            response_complete,
         })
     }
 

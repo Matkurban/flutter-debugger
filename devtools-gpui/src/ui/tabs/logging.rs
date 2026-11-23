@@ -317,7 +317,10 @@ fn render_single_log_row(
                     .bg(DevToolsTheme::bg_elevated())
                     .text_color(DevToolsTheme::accent_blue())
                     .hover(|h| h.bg(DevToolsTheme::bg_selected()))
-                    .on_click(cx.listener(move |this, _, _, _| this.jump_to_zed(loc_jump.clone())))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.jump_to_zed(loc_jump.clone());
+                    }))
                     .child(loc.short_label()),
             )
         })

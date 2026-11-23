@@ -50,11 +50,10 @@ impl DartVmClient {
         log_seq: Arc<AtomicU64>,
     ) -> Result<(Self, VmMetadata), DevToolsError> {
         let ws_uri = normalize_to_ws_uri(raw_uri)?;
-        let (ws_stream, _) =
-            tokio::time::timeout(Duration::from_secs(4), tokio_tungstenite::connect_async(&ws_uri))
-                .await
-                .map_err(|_| DevToolsError::Connection(format!("Timed out connecting to {ws_uri}")))?
-                .map_err(|e| DevToolsError::Connection(format!("Failed to connect to {ws_uri}: {e}")))?;
+        let (ws_stream, _) = tokio::time::timeout(Duration::from_secs(4), tokio_tungstenite::connect_async(&ws_uri))
+            .await
+            .map_err(|_| DevToolsError::Connection(format!("Timed out connecting to {ws_uri}")))?
+            .map_err(|e| DevToolsError::Connection(format!("Failed to connect to {ws_uri}: {e}")))?;
 
         let (mut sink, mut stream) = ws_stream.split();
         let (write_tx, mut write_rx) = mpsc::channel::<String>(256);
@@ -62,9 +61,7 @@ impl DartVmClient {
 
         tokio::spawn(async move {
             while let Some(msg) = write_rx.recv().await {
-                if sink.send(Message::Text(msg.into())).await.is_err() {
-                    break;
-                }
+                if sink.send(Message::Text(msg.into())).await.is_err() { break; }
             }
         });
 
@@ -74,15 +71,9 @@ impl DartVmClient {
                 let text = match frame_res {
                     Ok(Message::Text(t)) => t.to_string(),
                     Ok(Message::Binary(b)) => String::from_utf8_lossy(&b).into_owned(),
-                    Ok(Message::Close(_)) => {
-                        let _ = push_tx.send(VmPushEvent::Disconnected("VM Service closed".into()));
-                        break;
-                    }
+                    Ok(Message::Close(_)) => { let _ = push_tx.send(VmPushEvent::Disconnected("VM Service closed".into())); break; }
                     Ok(_) => continue,
-                    Err(e) => {
-                        let _ = push_tx.send(VmPushEvent::Disconnected(format!("WS error: {e}")));
-                        break;
-                    }
+                    Err(e) => { let _ = push_tx.send(VmPushEvent::Disconnected(format!("WS error: {e}"))); break; }
                 };
                 let Ok(val) = serde_json::from_str::<Value>(&text) else { continue };
                 if let Some(id) = parse_rpc_id(val.get("id")) {
@@ -98,9 +89,7 @@ impl DartVmClient {
                     }
                     continue;
                 }
-                if val.get("method").and_then(Value::as_str) == Some("streamNotify")
-                    && let Some(params) = val.get("params")
-                {
+                if val.get("method").and_then(Value::as_str) == Some("streamNotify") && let Some(params) = val.get("params") {
                     handle_stream_notify(params, &push_tx, &log_seq);
                 }
             }
@@ -247,18 +236,12 @@ impl DartVmClient {
     }
 
     pub async fn fetch_widget_summary_tree(&self, group_name: &str) -> Result<WidgetTreeNode, DevToolsError> {
-        let resp = match self
-            .call_isolate(
-                "ext.flutter.inspector.getRootWidgetTree",
-                json!({ "groupName": group_name, "isSummaryTree": "true", "withPreviews": "true", "fullDetails": "false" }),
-            )
-            .await
-        {
+        let params = json!({ "groupName": group_name, "isSummaryTree": "true", "withPreviews": "true", "fullDetails": "false" });
+        let resp = match self.call_isolate("ext.flutter.inspector.getRootWidgetTree", params).await {
             Ok(v) if !v.get("result").unwrap_or(&Value::Null).is_null() => v,
             _ => self.call_isolate("ext.flutter.inspector.getRootWidgetSummaryTree", json!({ "objectGroup": group_name })).await?,
         };
-        WidgetTreeNode::parse_from_json(&resp)
-            .ok_or_else(|| DevToolsError::Protocol("Inspector returned empty widget tree".into()))
+        WidgetTreeNode::parse_from_json(&resp).ok_or_else(|| DevToolsError::Protocol("Inspector returned empty widget tree".into()))
     }
 
     pub async fn fetch_widget_children(&self, value_id: &str, group_name: &str) -> Result<Vec<WidgetTreeNode>, DevToolsError> {
@@ -287,14 +270,9 @@ impl DartVmClient {
         let process_rss = if self.process_memory_supported.load(Ordering::Relaxed) {
             match self.call("getProcessMemoryUsage", json!({})).await {
                 Ok(ref v) => parse_process_memory_rss(v),
-                Err(_) => {
-                    self.process_memory_supported.store(false, Ordering::Relaxed);
-                    None
-                }
+                Err(_) => { self.process_memory_supported.store(false, Ordering::Relaxed); None }
             }
-        } else {
-            None
-        };
+        } else { None };
         let mem = self.call_isolate("getMemoryUsage", json!({})).await?;
         MemorySnapshot::parse_memory_usage(&mem, process_rss, is_gc_event)
             .ok_or_else(|| DevToolsError::Protocol("Failed to parse getMemoryUsage".into()))
@@ -310,7 +288,7 @@ impl DartVmClient {
         let fut = self.call_isolate("getObject", json!({ "objectId": object_id }));
         let resp = tokio::time::timeout(Duration::from_secs(1), fut).await.ok()?.ok()?;
         let s = resp.get("valueAsString")?.as_str()?;
-        Some(if s.len() > MAX_CHARS { format!("{}... [truncated at 64KB]", &s[..MAX_CHARS]) } else { s.to_string() })
+        Some(truncate_utf8_bytes(s, MAX_CHARS))
     }
 
     pub async fn query_initial_overlay_state(&self, base: &OverlayState) -> OverlayState {
@@ -429,11 +407,20 @@ pub fn normalize_to_ws_uri(uri: &str) -> Result<String, DevToolsError> {
     } else {
         return Err(DevToolsError::Connection(format!("Unsupported VM Service URI scheme: `{trimmed}`")));
     };
-        let mut parsed = url::Url::parse(&with_scheme).map_err(|e| DevToolsError::Connection(format!("Invalid VM Service URI: {e}")))?;
-        let path = parsed.path().trim_end_matches('/').to_string();
-        if !path.ends_with("/ws") { parsed.set_path(&format!("{path}/ws")); }
-        Ok(parsed.to_string())
+    let mut parsed = url::Url::parse(&with_scheme).map_err(|e| DevToolsError::Connection(format!("Invalid VM Service URI: {e}")))?;
+    let path = parsed.path().trim_end_matches('/').to_string();
+    if !path.ends_with("/ws") { parsed.set_path(&format!("{path}/ws")); }
+    Ok(parsed.to_string())
+}
+
+pub fn truncate_utf8_bytes(s: &str, max_bytes: usize) -> String {
+    if s.len() > max_bytes {
+        let end = s.floor_char_boundary(max_bytes);
+        format!("{}... [truncated at 64KB]", &s[..end])
+    } else {
+        s.to_string()
     }
+}
 
 #[cfg(test)]
 mod tests {
@@ -445,5 +432,14 @@ mod tests {
         assert_eq!(normalize_to_ws_uri("ws://localhost:8181").unwrap(), "ws://localhost:8181/ws");
         assert_eq!(normalize_to_ws_uri("https://127.0.0.1:9100/token").unwrap(), "wss://127.0.0.1:9100/token/ws");
         assert!(normalize_to_ws_uri("").is_err());
+    }
+    #[test]
+    fn truncates_multibyte_utf8_safely_at_64kb_boundary() {
+        let mut s = "a".repeat(65534);
+        s.push('🦀'); // 4-byte emoji straddling 65536 (64KB)
+        s.push_str("中文结尾");
+        let truncated = truncate_utf8_bytes(&s, 64 * 1024);
+        assert!(truncated.ends_with("... [truncated at 64KB]"));
+        assert_eq!(truncated.len(), 65534 + "... [truncated at 64KB]".len());
     }
 }

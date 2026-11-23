@@ -130,6 +130,7 @@ fn render_single_widget_row(
                         .w(px(16.0))
                         .text_color(DevToolsTheme::text_secondary())
                         .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
                             let lazy_load = this.inspector.toggle_expand(&vid_toggle);
                             if lazy_load && !vid_toggle.is_empty() {
                                 this.send_cmd(BackendCommand::ExpandWidgetChildren {
@@ -185,7 +186,8 @@ fn render_single_widget_row(
                         DevToolsTheme::text_secondary()
                     })
                     .hover(|h| h.bg(DevToolsTheme::bg_selected()))
-                    .on_click(cx.listener(move |this, _, _, _| {
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
                         this.jump_to_zed(loc_jump.clone());
                     }))
                     .child(format!("↗ {}", loc.short_label())),

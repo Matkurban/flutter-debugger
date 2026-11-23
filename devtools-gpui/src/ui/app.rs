@@ -244,11 +244,12 @@ impl RootView {
                 self.inspector.apply_children(&parent_value_id, children);
             }
             BackendEvent::WidgetSelectedFromDevice {
+                tree,
                 selected_node,
                 properties,
             } => {
                 self.inspector
-                    .apply_device_selection(selected_node, properties);
+                    .apply_device_selection(tree, selected_node, properties);
                 self.active_page = DevToolsPage::Inspector;
             }
             BackendEvent::WidgetPropertiesLoaded {
@@ -282,6 +283,12 @@ impl RootView {
 
     pub fn toggle_overlay(&mut self, overlay: ServiceOverlay) {
         self.send_cmd(BackendCommand::ToggleOverlay(overlay));
+    }
+}
+
+impl Drop for RootView {
+    fn drop(&mut self) {
+        let _ = self.cmd_tx.try_send(BackendCommand::Shutdown);
     }
 }
 

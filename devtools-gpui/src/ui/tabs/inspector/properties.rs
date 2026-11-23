@@ -1,5 +1,5 @@
 use gpui_kit::{
-    Context, InteractiveElement as _, IntoElement, ParentElement as _, Rgba, Styled as _,
+    Context, InteractiveElement as _, IntoElement, ParentElement as _, Styled as _,
     component::{
         Sizable as _,
         button::Button,
@@ -173,8 +173,8 @@ pub fn render_widget_properties_pane(
                                 .items_center()
                                 .gap_2()
                                 .when_some(prop.color_argb, |el, argb| {
-                                    let rgb_hex = argb & 0x00FF_FFFF;
-                                    let swatch: Rgba = rgb(rgb_hex);
+                                    let alpha = ((argb >> 24) & 0xFF) as f32 / 255.0;
+                                    let swatch = DevToolsTheme::to_hsla(rgb(argb & 0x00FF_FFFF), alpha);
                                     el.child(
                                         div()
                                             .w(px(12.0))

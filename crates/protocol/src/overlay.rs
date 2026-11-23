@@ -282,7 +282,7 @@ impl OverlayState {
             "ext.flutter.debugPaintBaselinesEnabled" => self.baselines = truthy,
             "ext.flutter.repaintRainbow" => self.repaint_rainbow = truthy,
             "ext.flutter.timeDilation" => {
-                self.slow_animations = value.parse::<f64>().is_ok_and(|v| v > 1.1);
+                self.slow_animations = truthy || value.parse::<f64>().is_ok_and(|v| v > 1.1);
             }
             "ext.flutter.debugAllowBanner" => self.debug_banner = truthy,
             "ext.flutter.invertOversizedImages" => self.oversized_images = truthy,
@@ -310,6 +310,14 @@ impl OverlayState {
         match overlay {
             ServiceOverlay::PlatformOverride => {
                 self.sync_from_extension_event(overlay.extension_method(), val);
+            }
+            ServiceOverlay::SlowAnimations => {
+                let ext_val = if val.eq_ignore_ascii_case("ON") {
+                    "5.0"
+                } else {
+                    "1.0"
+                };
+                self.sync_from_extension_event(overlay.extension_method(), ext_val);
             }
             ServiceOverlay::BrightnessOverride => {
                 let ext_val = if val.eq_ignore_ascii_case("Dark") {
@@ -351,6 +359,14 @@ mod tests {
         state.sync_from_extension_event("ext.flutter.platformOverride", "macOS");
         assert_eq!(state.platform_override, "macOS");
         assert_eq!(state.badge_text(ServiceOverlay::PlatformOverride), "macOS");
+
+        state.sync_from_status_message(ServiceOverlay::SlowAnimations, "Slow Animations: ON");
+        assert!(state.slow_animations);
+        assert_eq!(state.badge_text(ServiceOverlay::SlowAnimations), "ON");
+
+        state.sync_from_status_message(ServiceOverlay::SlowAnimations, "Slow Animations: OFF");
+        assert!(!state.slow_animations);
+        assert_eq!(state.badge_text(ServiceOverlay::SlowAnimations), "OFF");
     }
 
     #[test]

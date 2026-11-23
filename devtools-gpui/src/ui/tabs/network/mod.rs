@@ -30,29 +30,18 @@ use table::render_requests_table;
 const MAX_NETWORK_REQUESTS: usize = 2000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NetworkFilterChip {
-    All,
-    Status2xx,
-    Status4xx5xx,
-    Pending,
-    Json,
-}
+pub enum NetworkFilterChip { All, Status2xx, Status4xx5xx, Pending, Json }
 
 impl NetworkFilterChip {
     pub const fn all() -> [Self; 5] {
         [Self::All, Self::Status2xx, Self::Status4xx5xx, Self::Pending, Self::Json]
     }
-
     pub fn label(self) -> &'static str {
         match self {
-            Self::All => "All",
-            Self::Status2xx => "2xx",
-            Self::Status4xx5xx => "4xx/5xx",
-            Self::Pending => "Pending",
-            Self::Json => "JSON",
+            Self::All => "All", Self::Status2xx => "2xx", Self::Status4xx5xx => "4xx/5xx",
+            Self::Pending => "Pending", Self::Json => "JSON",
         }
     }
-
     pub fn matches(self, rec: &HttpRequestRecord) -> bool {
         match self {
             Self::All => true,
@@ -65,40 +54,17 @@ impl NetworkFilterChip {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NetworkSortColumn {
-    Timestamp,
-    Method,
-    Address,
-    Status,
-    Type,
-    Duration,
-    Size,
-}
+pub enum NetworkSortColumn { Timestamp, Method, Address, Status, Type, Duration, Size }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NetworkDetailSubTab {
-    Overview,
-    Headers,
-    Request,
-    Response,
-}
+pub enum NetworkDetailSubTab { Overview, Headers, Request, Response }
 
 impl NetworkDetailSubTab {
-    pub const fn all() -> [Self; 4] {
-        [
-            Self::Overview,
-            Self::Headers,
-            Self::Request,
-            Self::Response,
-        ]
-    }
-
+    pub const fn all() -> [Self; 4] { [Self::Overview, Self::Headers, Self::Request, Self::Response] }
     pub fn label(self) -> &'static str {
         match self {
-            Self::Overview => "Overview",
-            Self::Headers => "Headers",
-            Self::Request => "Request",
-            Self::Response => "Response",
+            Self::Overview => "Overview", Self::Headers => "Headers",
+            Self::Request => "Request", Self::Response => "Response",
         }
     }
 }
@@ -167,31 +133,8 @@ impl NetworkTabState {
     /// Merges an incremental batch of HTTP profile requests, deduplicating by `id`
     /// and preserving previously fetched request/response bodies.
     pub fn merge_batch(&mut self, batch: Vec<HttpRequestRecord>) -> Option<String> {
-        let mut refetch_selected = None;
-        for incoming in batch {
-            if let Some(existing) = self.requests.iter_mut().find(|r| r.id == incoming.id) {
-                let prev_detail = existing.detail.take();
-                let prev_body_loaded = existing.body_loaded;
-                *existing = incoming;
-                if !existing.body_loaded && prev_body_loaded {
-                    existing.detail = prev_detail;
-                    existing.body_loaded = true;
-                } else if existing.detail.is_none() {
-                    existing.detail = prev_detail;
-                }
-                if self.selected_id.as_deref() == Some(existing.id.as_str())
-                    && !existing.body_loaded
-                    && !existing.is_pending()
-                {
-                    refetch_selected = Some(existing.id.clone());
-                }
-            } else {
-                if self.requests.len() >= MAX_NETWORK_REQUESTS {
-                    self.requests.pop_front();
-                }
-                self.requests.push_back(incoming);
-            }
-        }
+        let refetch_selected =
+            merge_requests_into_deque(&mut self.requests, batch, self.selected_id.as_deref());
         self.rebuild_filtered_indices();
         refetch_selected
     }
@@ -240,43 +183,29 @@ impl NetworkTabState {
     }
 
     fn rebuild_selected_body_cache(&mut self) {
-        let Some(rec) = self
-            .selected_id
-            .as_deref()
-            .and_then(|id| self.requests.iter().find(|r| r.id == id))
-        else {
+        let Some(rec) = self.selected_id.as_deref().and_then(|id| self.requests.iter().find(|r| r.id == id)) else {
             self.cached_detail_id = None;
             self.cached_req_body = None;
             self.cached_resp_body = None;
             return;
         };
-
         self.cached_detail_id = Some(rec.id.clone());
         let detail = rec.detail.as_ref();
-        self.cached_req_body = detail
-            .and_then(|d| d.request_body.as_deref())
-            .filter(|s| !s.trim().is_empty())
-            .map(format_and_tokenize_json);
-        self.cached_resp_body = detail
-            .and_then(|d| d.response_body.as_deref())
-            .filter(|s| !s.trim().is_empty())
-            .map(format_and_tokenize_json);
+        self.cached_req_body = detail.and_then(|d| d.request_body.as_deref()).filter(|s| !s.trim().is_empty()).map(format_and_tokenize_json);
+        self.cached_resp_body = detail.and_then(|d| d.response_body.as_deref()).filter(|s| !s.trim().is_empty()).map(format_and_tokenize_json);
     }
 
     pub fn rebuild_filtered_indices(&mut self) {
         let q = self.search_query.trim().to_ascii_lowercase();
         let chip = self.filter_chip;
-
         let mut indices: Vec<usize> = self
             .requests
             .iter()
             .enumerate()
             .filter(|(_, rec)| chip.matches(rec))
             .filter(|(_, rec)| {
-                if q.is_empty() {
-                    return true;
-                }
-                rec.uri.to_ascii_lowercase().contains(&q)
+                q.is_empty()
+                    || rec.uri.to_ascii_lowercase().contains(&q)
                     || rec.method.to_ascii_lowercase().contains(&q)
                     || rec.status_code.is_some_and(|s| s.to_string().contains(&q))
                     || rec.mime_short.to_ascii_lowercase().contains(&q)
@@ -284,29 +213,20 @@ impl NetworkTabState {
             .map(|(idx, _)| idx)
             .collect();
 
-        let sort_col = self.sort_column;
-        let sort_asc = self.sort_ascending;
-        let reqs = &self.requests;
-
+        let (sort_col, sort_asc, reqs) = (self.sort_column, self.sort_ascending, &self.requests);
         indices.sort_by(|&ia, &ib| {
-            let a = &reqs[ia];
-            let b = &reqs[ib];
+            let (a, b) = (&reqs[ia], &reqs[ib]);
             let ord = match sort_col {
                 NetworkSortColumn::Timestamp => a.start_time_micros.cmp(&b.start_time_micros),
                 NetworkSortColumn::Method => a.method.cmp(&b.method),
                 NetworkSortColumn::Address => a.path_and_query.cmp(&b.path_and_query),
-                NetworkSortColumn::Status => {
-                    a.status_code.unwrap_or(0).cmp(&b.status_code.unwrap_or(0))
-                }
+                NetworkSortColumn::Status => a.status_code.unwrap_or(0).cmp(&b.status_code.unwrap_or(0)),
                 NetworkSortColumn::Type => a.mime_short.cmp(&b.mime_short),
-                NetworkSortColumn::Duration => {
-                    a.duration_ms.unwrap_or(0).cmp(&b.duration_ms.unwrap_or(0))
-                }
+                NetworkSortColumn::Duration => a.duration_ms.unwrap_or(0).cmp(&b.duration_ms.unwrap_or(0)),
                 NetworkSortColumn::Size => a.total_bytes().cmp(&b.total_bytes()),
             };
             if sort_asc { ord } else { ord.reverse() }
         });
-
         self.filtered_indices = indices;
     }
 }
@@ -440,5 +360,79 @@ impl RootView {
                         .child(resizable_panel().child(render_request_detail_pane(self, cx))),
                 ),
             )
+    }
+}
+
+pub(crate) fn merge_requests_into_deque(
+    requests: &mut VecDeque<HttpRequestRecord>,
+    batch: Vec<HttpRequestRecord>,
+    selected_id: Option<&str>,
+) -> Option<String> {
+    let mut refetch_selected = None;
+    for incoming in batch {
+        if let Some(existing) = requests.iter_mut().find(|r| r.id == incoming.id) {
+            let prev_complete = existing.response_complete;
+            let prev_detail = existing.detail.take();
+            let prev_body_loaded = existing.body_loaded;
+            *existing = incoming;
+            if !prev_complete && existing.response_complete {
+                existing.body_loaded = false;
+                if existing.detail.is_none() {
+                    existing.detail = prev_detail;
+                }
+            } else if !existing.body_loaded && prev_body_loaded {
+                existing.detail = prev_detail;
+                existing.body_loaded = true;
+            } else if existing.detail.is_none() {
+                existing.detail = prev_detail;
+            }
+            if selected_id == Some(existing.id.as_str())
+                && !existing.body_loaded
+                && (existing.response_complete || !existing.is_pending())
+            {
+                refetch_selected = Some(existing.id.clone());
+            }
+        } else {
+            if requests.len() >= MAX_NETWORK_REQUESTS {
+                requests.pop_front();
+            }
+            requests.push_back(incoming);
+        }
+    }
+    refetch_selected
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn streaming_request_resets_body_loaded_and_refetches_when_response_completes() {
+        let partial = HttpRequestRecord::parse_from_profile_entry(&json!({
+            "id": "req-stream-1", "method": "GET", "uri": "https://api.example.com/stream",
+            "startTime": 1_000_000, "endTime": 1_010_000,
+            "responseData": { "statusCode": 200 }
+        }))
+        .unwrap();
+        assert!(!partial.response_complete);
+
+        let mut deque = VecDeque::new();
+        assert_eq!(merge_requests_into_deque(&mut deque, vec![partial], Some("req-stream-1")), None);
+        // Simulate premature detail load while streaming response was still incomplete
+        deque[0].body_loaded = true;
+        deque[0].detail = Some(HttpRequestDetail::default());
+
+        let completed = HttpRequestRecord::parse_from_profile_entry(&json!({
+            "id": "req-stream-1", "method": "GET", "uri": "https://api.example.com/stream",
+            "startTime": 1_000_000, "endTime": 1_010_000,
+            "responseData": { "statusCode": 200, "endTime": 1_500_000 }
+        }))
+        .unwrap();
+        assert!(completed.response_complete);
+
+        let refetch = merge_requests_into_deque(&mut deque, vec![completed], Some("req-stream-1"));
+        assert_eq!(refetch.as_deref(), Some("req-stream-1"));
+        assert!(!deque[0].body_loaded);
     }
 }
