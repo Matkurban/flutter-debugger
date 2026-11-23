@@ -301,13 +301,16 @@ pub async fn run_dap_proxy() -> Result<(), Box<dyn std::error::Error>> {
 
             if let Some(notice) = device_notice {
                 let proxy_seq = state.lock().await.allocate_proxy_seq();
+                let raw_notice = format!("[flutter-debugger] {notice}\n");
+                let colored_notice =
+                    flutter_debugger_protocol::colorize_dap_output(&raw_notice, Some("console"));
                 let output_event = json!({
                     "seq": proxy_seq,
                     "type": "event",
                     "event": "output",
                     "body": {
                         "category": "console",
-                        "output": format!("[flutter-debugger] {notice}\n")
+                        "output": colored_notice
                     }
                 });
                 let mut out = zed_stdout.lock().await;
@@ -997,8 +1000,10 @@ impl Drop for SessionCleanupGuard {
 }
 
 
-/// Rewrites DAP `output` events so `file://` and `package:` Dart locations become clickable
-/// local `path:line:col` links in Zed Debug Console, and enriches missing `body.source` metadata.
+/// Rewrites DAP `output` events so `file://`, `package:`, and bare local `.dart:line(:col)?`
+/// locations become clickable `zed://file/...` links in Zed Debug Console, enriches missing
+/// `body.source` metadata (keeping `body.source.path` as a pure local path), and applies
+/// multi-state ANSI colors.
 pub fn rewrite_dap_output_event(msg: &mut Value, project_root: &Path) {
     if msg.get("type").and_then(Value::as_str) != Some("event")
         || msg.get("event").and_then(Value::as_str) != Some("output")
@@ -1010,13 +1015,15 @@ pub fn rewrite_dap_output_event(msg: &mut Value, project_root: &Path) {
         return;
     };
 
-    // Normalize an existing `body.source.path` if it uses `file://` or `package:`
+    // 1. Normalize an existing `body.source.path` if it uses `file://`, `package:`, or `zed://file`
     if let Some(source_obj) = body.get_mut("source").and_then(Value::as_object_mut)
         && let Some(raw_path) = source_obj
             .get("path")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned)
-        && (raw_path.starts_with("file://") || raw_path.starts_with("package:"))
+        && (raw_path.starts_with("file://")
+            || raw_path.starts_with("package:")
+            || raw_path.starts_with("zed://file"))
         && let Some(resolved) =
             flutter_debugger_protocol::resolve_dart_uri_to_local_path(&raw_path, Some(project_root))
     {
@@ -1031,21 +1038,28 @@ pub fn rewrite_dap_output_event(msg: &mut Value, project_root: &Path) {
         return;
     };
 
+    // 2. Rewrite Dart locations to `zed://file/...` and enrich missing `body.source` / `line` / `column`
     let (rewritten, first_loc) =
         flutter_debugger_protocol::rewrite_dart_output_paths(&raw_output, project_root);
-    if rewritten != raw_output {
-        body.insert("output".to_string(), Value::String(rewritten));
-    }
 
     let source_missing = body.get("source").is_none_or(Value::is_null);
     if source_missing
         && let Some((abs_path, line, col_opt)) = first_loc
     {
         let root_clean = flutter_debugger_protocol::clean_relative_segments(project_root);
+        let root_canon = std::fs::canonicalize(project_root).ok();
+        let abs_canon = std::fs::canonicalize(&abs_path).ok();
         let name = abs_path
             .strip_prefix(&root_clean)
             .ok()
             .or_else(|| abs_path.strip_prefix(project_root).ok())
+            .or_else(|| {
+                if let (Some(ac), Some(rc)) = (&abs_canon, &root_canon) {
+                    ac.strip_prefix(rc).ok()
+                } else {
+                    None
+                }
+            })
             .map(|rel| rel.to_string_lossy().replace('\\', "/"))
             .or_else(|| {
                 abs_path
@@ -1069,6 +1083,17 @@ pub fn rewrite_dap_output_event(msg: &mut Value, project_root: &Path) {
         {
             body.insert("column".to_string(), json!(col));
         }
+    }
+
+    // 3. Colorize output lines by DAP `category` and Flutter log semantics
+    let category = body
+        .get("category")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let colored =
+        flutter_debugger_protocol::colorize_dap_output(&rewritten, category.as_deref());
+    if colored != raw_output {
+        body.insert("output".to_string(), Value::String(colored));
     }
 }
 
@@ -1109,6 +1134,10 @@ mod tests {
         let proj_root = dir.path().join("my_app");
         let dart_tool = proj_root.join(".dart_tool");
         std::fs::create_dir_all(&dart_tool).expect("mkdir .dart_tool");
+        let nicepay_file = proj_root.join("lib/pages/home/nicepay_view.dart");
+        std::fs::create_dir_all(nicepay_file.parent().expect("parent")).expect("mkdir pages/home");
+        std::fs::write(&nicepay_file, "void main() {}\n").expect("write nicepay_view.dart");
+
         let pub_cache_pkg = dir.path().join("pub_cache").join("provider-6.1.0");
         std::fs::create_dir_all(pub_cache_pkg.join("lib/src")).expect("mkdir provider");
 
@@ -1125,31 +1154,64 @@ mod tests {
         )
         .expect("write package_config.json");
 
-        // 1. Flutter rendering error with glued `Scaffold:file:///...` and `source: null`
+        // 1a. Flutter rendering exception banner on `stderr` -> colored red (`\x1b[31m`)
+        let mut msg_err_banner = json!({
+            "seq": 9,
+            "type": "event",
+            "event": "output",
+            "body": {
+                "category": "stderr",
+                "output": "════════ Exception caught by widgets library ════════\nThe following assertion was thrown building NicePayView:\n"
+            }
+        });
+        rewrite_dap_output_event(&mut msg_err_banner, &proj_root);
+        assert_eq!(
+            msg_err_banner["body"]["output"].as_str().unwrap(),
+            "\x1b[31m════════ Exception caught by widgets library ════════\x1b[0m\n\x1b[31mThe following assertion was thrown building NicePayView:\x1b[0m\n"
+        );
+
+        // 1b. Flutter error-causing widget detail on `stdout` with bare relative path -> blue (`\x1b[34m`) + clickable `zed://file/...:374:40`
+        let expected_nicepay_uri =
+            flutter_debugger_protocol::format_zed_file_uri(&nicepay_file, Some(374), Some(40));
         let mut msg1 = json!({
             "seq": 10,
             "type": "event",
             "event": "output",
             "body": {
-                "category": "stderr",
-                "output": format!("The relevant error-causing widget was:\n  Scaffold:file://{}/lib/home.dart:88:12\n", proj_root.display()),
+                "category": "stdout",
+                "output": "The relevant error-causing widget was:\n  Swiper Swiper (lib/pages/home/nicepay_view.dart:374:40)\n",
                 "source": null
             }
         });
         rewrite_dap_output_event(&mut msg1, &proj_root);
         assert_eq!(
             msg1["body"]["output"].as_str().unwrap(),
-            "The relevant error-causing widget was:\n  Scaffold (lib/home.dart:88:12)\n"
+            format!(
+                "\x1b[34mThe relevant error-causing widget was:\x1b[0m\n\x1b[34m  Swiper Swiper ({expected_nicepay_uri})\x1b[0m\n"
+            )
         );
-        assert_eq!(msg1["body"]["source"]["name"], "lib/home.dart");
+        assert_eq!(
+            msg1["body"]["source"]["name"],
+            "lib/pages/home/nicepay_view.dart"
+        );
         assert_eq!(
             msg1["body"]["source"]["path"],
-            proj_root.join("lib/home.dart").to_string_lossy().as_ref()
+            nicepay_file.to_string_lossy().as_ref()
         );
-        assert_eq!(msg1["body"]["line"], 88);
-        assert_eq!(msg1["body"]["column"], 12);
+        assert!(
+            !msg1["body"]["source"]["path"]
+                .as_str()
+                .unwrap()
+                .starts_with("zed://"),
+            "body.source.path must remain a pure local filesystem path"
+        );
+        assert_eq!(msg1["body"]["line"], 374);
+        assert_eq!(msg1["body"]["column"], 40);
 
-        // 2. Dart stack trace with ANSI dim escape codes and `package:my_app/...`
+        // 2. Dart stack trace with ANSI dim escape codes (`\x1b[2m`) and `package:my_app/...` -> `\x1b[90m` + `zed://file/...`
+        let home_file = proj_root.join("lib/pages/home.dart");
+        let expected_home_uri =
+            flutter_debugger_protocol::format_zed_file_uri(&home_file, Some(42), Some(5));
         let mut msg2 = json!({
             "seq": 11,
             "type": "event",
@@ -1162,13 +1224,20 @@ mod tests {
         rewrite_dap_output_event(&mut msg2, &proj_root);
         assert_eq!(
             msg2["body"]["output"].as_str().unwrap(),
-            "\x1b[2m#0      _HomeState.build (lib/pages/home.dart:42:5)\x1b[0m\n"
+            format!("\x1b[90m#0      _HomeState.build ({expected_home_uri})\x1b[0m\n")
         );
         assert_eq!(msg2["body"]["source"]["name"], "lib/pages/home.dart");
+        assert_eq!(
+            msg2["body"]["source"]["path"],
+            home_file.to_string_lossy().as_ref()
+        );
         assert_eq!(msg2["body"]["line"], 42);
         assert_eq!(msg2["body"]["column"], 5);
 
         // 3. Third-party pub package `package:provider/...` + existing `file://` source.path normalization
+        let provider_file = pub_cache_pkg.join("lib/src/provider.dart");
+        let expected_provider_uri =
+            flutter_debugger_protocol::format_zed_file_uri(&provider_file, Some(19), Some(7));
         let mut msg3 = json!({
             "seq": 12,
             "type": "event",
@@ -1178,23 +1247,20 @@ mod tests {
                 "output": "#1      Provider.of (package:provider/src/provider.dart:19:7) see https://pub.dev/packages/provider\n",
                 "source": {
                     "name": "package:provider/src/provider.dart",
-                    "path": format!("file://{}/lib/src/provider.dart", pub_cache_pkg.display())
+                    "path": format!("file://{}", provider_file.display())
                 }
             }
         });
         rewrite_dap_output_event(&mut msg3, &proj_root);
         let out3 = msg3["body"]["output"].as_str().unwrap();
-        assert!(out3.contains(&format!(
-            "({}:19:7)",
-            pub_cache_pkg.join("lib/src/provider.dart").display()
-        )));
+        assert!(
+            out3.contains(&format!("({expected_provider_uri})")),
+            "Actual out3: {out3}"
+        );
         assert!(out3.contains("https://pub.dev/packages/provider"));
         assert_eq!(
             msg3["body"]["source"]["path"],
-            pub_cache_pkg
-                .join("lib/src/provider.dart")
-                .to_string_lossy()
-                .as_ref()
+            provider_file.to_string_lossy().as_ref()
         );
     }
 
