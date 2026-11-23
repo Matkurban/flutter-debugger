@@ -11,7 +11,7 @@ path = "src/lib.rs"
 crate-type = ["cdylib"]
 
 [workspace]
-exclude = ["server"]
+exclude = ["server", "devtools-gpui"]
 
 [dependencies]
 zed_extension_api = "0.7.0"

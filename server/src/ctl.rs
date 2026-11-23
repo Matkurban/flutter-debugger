@@ -53,6 +53,7 @@ pub async fn run_ctl(args: Vec<String>) -> Result<(), String> {
         }
         "status" | "sessions" => cmd_status(rest).await,
         "devtools" | "dt" => cmd_devtools(rest).await,
+        "devtools-ui" | "dt-ui" | "gpui" => cmd_devtools_ui(rest),
         "overlay" => cmd_overlay(rest).await,
         "screenshot" => cmd_screenshot(rest).await,
         "devices" => cmd_devices(rest).await,
@@ -90,6 +91,8 @@ Session Control:
   stop [--project <dir>]                 Stop active Flutter session
   status [--project <dir>]               Show active sessions
   devtools [--page <name>]               Open DevTools (inspector|performance|memory|network|logging|cpu-profiler)
+  devtools-ui [--project <dir>] [--page <inspector|network|logging|performance|memory>]
+                                         Open Native GPUI Flutter DevTools companion app
   overlay <name> [--project <dir>]       Toggle overlay (inspector|performance|debug-paint|baselines|repaint|slow-anim|banner|oversized|platform|brightness)
   screenshot [--out <path>]              Capture screenshot from active session or device
 
@@ -258,6 +261,99 @@ async fn cmd_devtools(args: &[String]) -> Result<(), String> {
             }
         }
     }
+}
+
+fn cmd_devtools_ui(args: &[String]) -> Result<(), String> {
+    let project_flag = parse_project_flag(args);
+    let page = parse_flag_value(args, "--page", None);
+    let root = resolve_project_root(project_flag.as_deref());
+    let msg = launch_native_devtools_ui(Some(&root), page.as_deref())?;
+    println!("{msg}");
+    Ok(())
+}
+
+/// Resolves `flutter-devtools-gpui` (sibling binary -> `~/.local/bin/flutter-devtools-gpui` -> `$PATH`)
+/// and spawns it in a detached session (`setsid` + `Stdio::null()`).
+pub fn launch_native_devtools_ui(
+    project_root: Option<&Path>,
+    page: Option<&str>,
+) -> Result<String, String> {
+    let bin = resolve_native_devtools_binary().ok_or_else(|| {
+        "Native GPUI DevTools binary `flutter-devtools-gpui` not found.\n\
+         Build and install it with:\n\
+         ./scripts/install-local.sh\n\
+         (or `cd devtools-gpui && cargo build --release && cp target/release/flutter-devtools-gpui ~/.local/bin/`)"
+            .to_string()
+    })?;
+
+    let mut cmd = std::process::Command::new(&bin);
+    if let Some(root) = project_root {
+        cmd.arg("--project").arg(root);
+    }
+    if let Some(p) = page
+        && !p.trim().is_empty()
+    {
+        cmd.arg("--page").arg(p);
+    }
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.pre_exec(|| {
+                unsafe extern "C" {
+                    fn setsid() -> i32;
+                }
+                let _ = setsid();
+                Ok(())
+            });
+        }
+    }
+
+    cmd.spawn()
+        .map_err(|e| format!("Failed to launch `{}`: {e}", bin.display()))?;
+
+    let page_suffix = page.map(|p| format!(" (page: {p})")).unwrap_or_default();
+    Ok(format!(
+        "Launched Native GPUI Flutter DevTools{page_suffix}"
+    ))
+}
+
+fn resolve_native_devtools_binary() -> Option<PathBuf> {
+    const BIN_NAME: &str = "flutter-devtools-gpui";
+
+    // 1. Sibling binary in the same directory as `flutter-debugger-server`
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let sibling = dir.join(BIN_NAME);
+        if sibling.is_file() {
+            return Some(sibling);
+        }
+    }
+
+    // 2. `~/.local/bin/flutter-devtools-gpui`
+    if let Some(home) = dirs::home_dir() {
+        let local_bin = home.join(".local").join("bin").join(BIN_NAME);
+        if local_bin.is_file() {
+            return Some(local_bin);
+        }
+    }
+
+    // 3. `$PATH` lookup
+    if let Some(path_os) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_os) {
+            let candidate = dir.join(BIN_NAME);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    None
 }
 
 async fn cmd_overlay(args: &[String]) -> Result<(), String> {

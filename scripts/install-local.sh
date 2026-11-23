@@ -3,28 +3,52 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
-INSTALLED_BIN="$INSTALL_DIR/flutter-debugger-server"
+INSTALLED_SERVER_BIN="$INSTALL_DIR/flutter-debugger-server"
+INSTALLED_GUI_BIN="$INSTALL_DIR/flutter-devtools-gpui"
 
-echo "==> [1/4] Checking & building WASM extension (wasm32-wasip2)..."
+SERVER_ONLY=0
+for arg in "$@"; do
+  case "$arg" in
+    --server-only)
+      SERVER_ONLY=1
+      ;;
+  esac
+done
+
+echo "==> [1/5] Checking & building WASM extension (wasm32-wasip2)..."
 cd "$REPO_ROOT"
 cargo clippy --target wasm32-wasip2 --all-targets -- -D warnings
 cargo build --release --target wasm32-wasip2
 
-echo "==> [2/4] Running server clippy & unit tests..."
+echo "==> [2/5] Running server clippy & unit tests..."
 cd "$REPO_ROOT/server"
 cargo clippy --all-targets -- -D warnings
 cargo test --all-targets
 
-echo "==> [3/4] Building release flutter-debugger-server..."
+echo "==> [3/5] Building release flutter-debugger-server..."
 cargo build --release
 
-echo "==> [4/4] Installing binary to $INSTALLED_BIN..."
 mkdir -p "$INSTALL_DIR"
-cp "$REPO_ROOT/server/target/release/flutter-debugger-server" "$INSTALLED_BIN"
-chmod +x "$INSTALLED_BIN"
+cp "$REPO_ROOT/server/target/release/flutter-debugger-server" "$INSTALLED_SERVER_BIN"
+chmod +x "$INSTALLED_SERVER_BIN"
 
-echo ""
-echo "Installed: $INSTALLED_BIN ($("$INSTALLED_BIN" --version))"
+if [[ "$SERVER_ONLY" -eq 0 ]]; then
+  echo "==> [4/5] Running devtools-gpui clippy, unit tests & release build..."
+  cd "$REPO_ROOT/devtools-gpui"
+  cargo clippy --all-targets -- -D warnings
+  cargo test --all-targets
+  cargo build --release
+  cp "$REPO_ROOT/devtools-gpui/target/release/flutter-devtools-gpui" "$INSTALLED_GUI_BIN"
+  chmod +x "$INSTALLED_GUI_BIN"
+else
+  echo "==> [4/5] Skipping devtools-gpui build (--server-only)"
+fi
+
+echo "==> [5/5] Installation Summary:"
+echo "  Server: $INSTALLED_SERVER_BIN ($("$INSTALLED_SERVER_BIN" --version))"
+if [[ -x "$INSTALLED_GUI_BIN" ]]; then
+  echo "  GPUI DevTools: $INSTALLED_GUI_BIN ($("$INSTALLED_GUI_BIN" --version))"
+fi
 echo ""
 
 if [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then
@@ -35,9 +59,9 @@ fi
 
 echo "NOTE for macOS Zed GUI (if GUI app does not inherit ~/.local/bin in PATH):"
 echo "  You can point Zed directly to the installed binary in ~/.config/zed/settings.json:"
-echo "    \"lsp\": { \"flutter-debugger\": { \"binary\": { \"path\": \"$INSTALLED_BIN\" } } }"
+echo "    \"lsp\": { \"flutter-debugger\": { \"binary\": { \"path\": \"$INSTALLED_SERVER_BIN\" } } }"
 echo ""
 echo "Next steps in Zed:"
 echo "  1. Command Palette -> 'zed: install dev extension' -> select: $REPO_ROOT"
 echo "  2. In any Flutter project root, run: flutter-debugger-server init-zed"
-echo "  3. Print recommended settings.json & keymap.json: flutter-debugger-server ctl print-zed-config"
+echo "  3. Launch Native GPUI DevTools anytime: flutter-debugger-server ctl devtools-ui"

@@ -276,6 +276,12 @@ pub fn build_dart_code_lenses(
                     }
                     lenses.push(make_lens(
                         range,
+                        "DevTools (GPUI)",
+                        "flutterDebugger.openNativeDevTools",
+                        vec![json!(uri_str)],
+                    ));
+                    lenses.push(make_lens(
+                        range,
                         "Stop",
                         "flutterDebugger.stopApp",
                         vec![json!(uri_str)],

@@ -3,3 +3,4 @@
 **/*.rs.bk
 *.wasm
 .DS_Store
+devtools-gpui/target

@@ -82,6 +82,7 @@ const SUPPORTED_COMMANDS: &[&str] = &[
     "flutterDebugger.hotReload",
     "flutterDebugger.hotRestart",
     "flutterDebugger.openDevTools",
+    "flutterDebugger.openNativeDevTools",
     "flutterDebugger.generateDebugConfig",
     "flutterDebugger.screenshot",
 ];
@@ -555,6 +556,18 @@ impl FlutterLspBackend {
                     "DevTools URI is not ready yet for this session.".to_string(),
                 )
                 .await;
+        }
+    }
+
+    async fn open_native_devtools_for_uri(&self, uri: &Uri, page: Option<&str>) {
+        let root = self.resolve_project_root_for_uri(uri);
+        match crate::ctl::launch_native_devtools_ui(root.as_deref(), page) {
+            Ok(msg) => {
+                self.client.show_message(MessageType::INFO, msg).await;
+            }
+            Err(err) => {
+                self.client.show_message(MessageType::WARNING, err).await;
+            }
         }
     }
 
@@ -1263,6 +1276,13 @@ impl LanguageServer for FlutterLspBackend {
             }
             "flutterDebugger.openDevTools" => {
                 self.open_devtools_for_uri(&uri).await;
+            }
+            "flutterDebugger.openNativeDevTools" => {
+                let page = params
+                    .arguments
+                    .get(1)
+                    .and_then(Value::as_str);
+                self.open_native_devtools_for_uri(&uri, page).await;
             }
             "flutterDebugger.generateDebugConfig" => {
                 self.generate_debug_config(&uri).await;
