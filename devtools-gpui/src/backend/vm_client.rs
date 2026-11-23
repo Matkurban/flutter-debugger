@@ -407,6 +407,13 @@ impl DartVmClient {
                             if rec.isolate_id.is_none() {
                                 rec.isolate_id = Some(iso_id.clone());
                             }
+                            if !rec.body_loaded
+                                && let Ok(detail) = self
+                                    .get_websocket_connection(&rec.id, rec.isolate_id.as_deref())
+                                    .await
+                            {
+                                rec.apply_hydrated_websocket_detail(detail);
+                            }
                             all_connections.push(rec);
                         }
                     }
@@ -599,8 +606,8 @@ impl DartVmClient {
             "ext.flutter.inspector.setFlexProperties",
             json!({
                 "id": value_id,
-                "mainAxisAlignment": main_axis_alignment,
-                "crossAxisAlignment": cross_axis_alignment
+                "mainAxisAlignment": qualify_enum("MainAxisAlignment", main_axis_alignment),
+                "crossAxisAlignment": qualify_enum("CrossAxisAlignment", cross_axis_alignment)
             }),
         )
         .await?;
@@ -612,7 +619,7 @@ impl DartVmClient {
             "ext.flutter.inspector.setFlexFit",
             json!({
                 "id": value_id,
-                "flexFit": flex_fit
+                "flexFit": qualify_enum("FlexFit", flex_fit)
             }),
         )
         .await?;
@@ -628,7 +635,7 @@ impl DartVmClient {
             "ext.flutter.inspector.setFlexFactor",
             json!({
                 "id": value_id,
-                "flexFactor": flex_factor.to_string()
+                "flexFactor": format_flex_factor_param(flex_factor)
             }),
         )
         .await?;
@@ -858,6 +865,27 @@ pub fn normalize_to_ws_uri(uri: &str) -> Result<String, DevToolsError> {
     Ok(parsed.to_string())
 }
 
+pub fn qualify_enum(prefix: &str, value: &str) -> String {
+    let trimmed = value.trim();
+    let expected_prefix = format!("{prefix}.");
+    if trimmed.starts_with(&expected_prefix) {
+        trimmed.to_string()
+    } else {
+        format!(
+            "{prefix}.{}",
+            trimmed.rsplit('.').next().unwrap_or(trimmed).trim()
+        )
+    }
+}
+
+pub fn format_flex_factor_param(flex_factor: u32) -> String {
+    if flex_factor == 0 {
+        "null".to_string()
+    } else {
+        flex_factor.to_string()
+    }
+}
+
 pub fn truncate_utf8_bytes(s: &str, max_bytes: usize) -> String {
     if s.len() > max_bytes {
         let end = s.floor_char_boundary(max_bytes);
@@ -886,5 +914,30 @@ mod tests {
         let truncated = truncate_utf8_bytes(&s, 64 * 1024);
         assert!(truncated.ends_with("... [truncated at 64KB]"));
         assert_eq!(truncated.len(), 65534 + "... [truncated at 64KB]".len());
+    }
+    #[test]
+    fn qualifies_flutter_inspector_flex_enums_and_serializes_flex_factor() {
+        assert_eq!(
+            qualify_enum("MainAxisAlignment", "center"),
+            "MainAxisAlignment.center"
+        );
+        assert_eq!(
+            qualify_enum("MainAxisAlignment", "MainAxisAlignment.spaceBetween"),
+            "MainAxisAlignment.spaceBetween"
+        );
+        assert_eq!(
+            qualify_enum("CrossAxisAlignment", "stretch"),
+            "CrossAxisAlignment.stretch"
+        );
+        assert_eq!(
+            qualify_enum("CrossAxisAlignment", "CrossAxisAlignment.start"),
+            "CrossAxisAlignment.start"
+        );
+        assert_eq!(qualify_enum("FlexFit", "tight"), "FlexFit.tight");
+        assert_eq!(qualify_enum("FlexFit", "FlexFit.loose"), "FlexFit.loose");
+
+        assert_eq!(format_flex_factor_param(0), "null");
+        assert_eq!(format_flex_factor_param(1), "1");
+        assert_eq!(format_flex_factor_param(3), "3");
     }
 }

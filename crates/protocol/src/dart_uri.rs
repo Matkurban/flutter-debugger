@@ -1,5 +1,8 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::SystemTime;
 
 use serde::Deserialize;
 
@@ -16,6 +19,28 @@ struct PackageConfigEntry {
     root_uri: String,
     #[serde(default)]
     package_uri: Option<String>,
+}
+
+type PackageConfigCache = HashMap<PathBuf, (Option<SystemTime>, Arc<PackageConfigFile>)>;
+
+static PACKAGE_CONFIG_CACHE: OnceLock<Mutex<PackageConfigCache>> = OnceLock::new();
+
+fn load_package_config(config_path: &Path) -> Option<Arc<PackageConfigFile>> {
+    let mtime = fs::metadata(config_path).ok()?.modified().ok();
+    let cache = PACKAGE_CONFIG_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(guard) = cache.lock()
+        && let Some((cached_mtime, cached_cfg)) = guard.get(config_path)
+        && *cached_mtime == mtime
+    {
+        return Some(Arc::clone(cached_cfg));
+    }
+
+    let bytes = fs::read(config_path).ok()?;
+    let parsed = Arc::new(serde_json::from_slice::<PackageConfigFile>(&bytes).ok()?);
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(config_path.to_path_buf(), (mtime, Arc::clone(&parsed)));
+    }
+    Some(parsed)
 }
 
 /// Resolves a Dart `file:///...` or `package:<pkg>/<rel>.dart` URI to a local disk path.
@@ -41,8 +66,7 @@ pub fn resolve_dart_uri_to_local_path(uri: &str, project_root: Option<&Path>) ->
         let root = project_root?;
         let config_dir = root.join(".dart_tool");
         let config_path = config_dir.join("package_config.json");
-        if let Ok(bytes) = fs::read(&config_path)
-            && let Ok(parsed) = serde_json::from_slice::<PackageConfigFile>(&bytes)
+        if let Some(parsed) = load_package_config(&config_path)
             && let Some(entry) = parsed.packages.iter().find(|p| p.name == pkg_name)
             && let Some(pkg_root) = resolve_package_root_uri(&entry.root_uri, &config_dir)
         {
@@ -393,5 +417,15 @@ mod tests {
         assert_eq!(path, expected_provider);
         assert_eq!(line, 19);
         assert_eq!(col, Some(7));
+    }
+
+    #[test]
+    fn caches_package_config_by_mtime_and_invalidates_on_file_change() {
+        let (_dir, project_root, _ext_pkg) = setup_mock_project();
+        let config_path = project_root.join(".dart_tool").join("package_config.json");
+
+        let first = load_package_config(&config_path).expect("load 1");
+        let second = load_package_config(&config_path).expect("load 2");
+        assert!(Arc::ptr_eq(&first, &second));
     }
 }

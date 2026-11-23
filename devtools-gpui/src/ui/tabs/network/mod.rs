@@ -240,34 +240,9 @@ impl NetworkTabState {
         self.detail_errors.remove(request_id);
 
         if let Some(rec) = self.requests.iter_mut().find(|r| r.id == request_id) {
-            rec.request_bytes = detail.bytes_sent;
-            rec.response_bytes = detail.bytes_received;
-            rec.reason_phrase = Some(detail.state.to_ascii_uppercase());
-            rec.content_type = detail.protocol.clone();
-            rec.end_time_micros = detail.close_timestamp;
-            rec.duration_ms = detail
-                .close_timestamp
-                .or_else(|| detail.events.last().map(|e| e.timestamp_micros))
-                .or(detail.open_timestamp)
-                .and_then(|end| end.checked_sub(rec.start_time_micros))
-                .map(|us| us / 1000);
-            rec.status_code = detail.close_code.or(
-                if detail.state.eq_ignore_ascii_case("open") {
-                    Some(101)
-                } else {
-                    None
-                },
-            );
-            if detail.error.is_some() {
-                rec.error = detail.error.clone();
-            }
-            rec.response_complete =
-                matches!(detail.state.to_ascii_lowercase().as_str(), "closed" | "error")
-                    || detail.close_timestamp.is_some()
-                    || detail.error.is_some();
-            rec.body_loaded = true;
-            rec.ws_detail = Some(detail);
+            rec.apply_hydrated_websocket_detail(detail);
         }
+        self.rebuild_filtered_indices();
     }
 
     pub fn apply_detail(&mut self, request_id: &str, mut detail: HttpRequestDetail) {
@@ -649,18 +624,62 @@ pub(crate) fn merge_requests_into_deque(
     for incoming in batch {
         if let Some(existing) = requests.iter_mut().find(|r| r.id == incoming.id) {
             if existing.is_websocket() {
-                let prev_ws_detail = existing.ws_detail.take();
-                let prev_body_loaded = existing.body_loaded;
-                let prev_iso = existing.isolate_id.take();
-                *existing = incoming;
-                if existing.isolate_id.is_none() {
-                    existing.isolate_id = prev_iso;
-                }
-                if let (Some(cur_ws), Some(prev_ws)) = (&mut existing.ws_detail, prev_ws_detail) {
-                    if cur_ws.events.is_empty() && !prev_ws.events.is_empty() {
-                        cur_ws.events = prev_ws.events;
+                if !incoming.body_loaded {
+                    if existing.isolate_id.is_none() {
+                        existing.isolate_id = incoming.isolate_id;
                     }
-                    existing.body_loaded = existing.body_loaded || prev_body_loaded;
+                    if incoming.reason_phrase.is_some() {
+                        existing.reason_phrase = incoming.reason_phrase;
+                    }
+                    if incoming.error.is_some() {
+                        existing.error = incoming.error;
+                    }
+                    existing.response_complete =
+                        existing.response_complete || incoming.response_complete;
+                    if let Some(incoming_ws) = incoming.ws_detail {
+                        if let Some(ref mut cur_ws) = existing.ws_detail {
+                            if !incoming_ws.state.is_empty() {
+                                cur_ws.state = incoming_ws.state;
+                            }
+                            if incoming_ws.error.is_some() {
+                                cur_ws.error = incoming_ws.error;
+                            }
+                            if incoming_ws.close_code.is_some() {
+                                cur_ws.close_code = incoming_ws.close_code;
+                            }
+                            if incoming_ws.close_reason.is_some() {
+                                cur_ws.close_reason = incoming_ws.close_reason;
+                            }
+                        } else {
+                            existing.ws_detail = Some(incoming_ws);
+                        }
+                    }
+                    existing.status_code = existing
+                        .ws_detail
+                        .as_ref()
+                        .and_then(|d| d.close_code)
+                        .or(incoming.status_code);
+                } else {
+                    let prev_ws_detail = existing.ws_detail.take();
+                    let prev_body_loaded = existing.body_loaded;
+                    let prev_iso = existing.isolate_id.take();
+                    let prev_start = existing.start_time_micros;
+                    let prev_hms = existing.timestamp_hms.clone();
+                    *existing = incoming;
+                    if existing.isolate_id.is_none() {
+                        existing.isolate_id = prev_iso;
+                    }
+                    if existing.start_time_micros == 0 && prev_start > 0 {
+                        existing.start_time_micros = prev_start;
+                        existing.timestamp_hms = prev_hms;
+                    }
+                    if let (Some(cur_ws), Some(prev_ws)) = (&mut existing.ws_detail, prev_ws_detail)
+                    {
+                        if cur_ws.events.is_empty() && !prev_ws.events.is_empty() {
+                            cur_ws.events = prev_ws.events;
+                        }
+                        existing.body_loaded = existing.body_loaded || prev_body_loaded;
+                    }
                 }
                 if selected_id == Some(existing.id.as_str()) {
                     refetch_selected = Some((existing.id.clone(), existing.isolate_id.clone()));
@@ -795,5 +814,78 @@ mod tests {
         reqs.push_back(ws);
         assert!(NetworkFilterChip::WebSocket.matches(&reqs[3]));
         assert!(!NetworkFilterChip::WebSocket.matches(&reqs[0]));
+    }
+
+    #[test]
+    fn websocket_ref_poll_preserves_hydrated_bytes_timestamp_and_events() {
+        let ws_ref_open = HttpRequestRecord::parse_from_websocket_profile_entry(&json!({
+            "type": "@WebSocketConnection",
+            "id": "42",
+            "isolateId": "isolates/1",
+            "uri": "wss://echo.example.com/ws",
+            "state": "open"
+        }))
+        .unwrap();
+        assert!(!ws_ref_open.body_loaded);
+
+        let mut deque = VecDeque::new();
+        merge_requests_into_deque(&mut deque, vec![ws_ref_open], Some("ws:42"));
+
+        // Hydrate with full Dart 3.14 getWebSocketConnection response
+        let detail = HttpRequestRecord::parse_websocket_detail_from_response(&json!({
+            "type": "WebSocketConnection",
+            "id": "42",
+            "isolateId": "isolates/1",
+            "uri": "wss://echo.example.com/ws",
+            "state": "open",
+            "protocol": "v1.echo",
+            "connectTimestamp": 1_700_000_000_000_000u64,
+            "openTimestamp": 1_700_000_000_020_000u64,
+            "bytesSent": 256,
+            "bytesReceived": 1024,
+            "framesSent": 2,
+            "framesReceived": 4,
+            "events": [
+                {
+                    "timestamp": 1_700_000_000_120_000u64,
+                    "event": "WebSocket.Send",
+                    "opcode": "TEXT",
+                    "payloadSize": 256,
+                    "arguments": { "opcode": 1, "payloadSize": 256 }
+                }
+            ]
+        }));
+        deque[0].apply_hydrated_websocket_detail(detail);
+        assert!(deque[0].body_loaded);
+        assert_eq!(deque[0].start_time_micros, 1_700_000_000_000_000u64);
+        assert_eq!(deque[0].duration_ms, Some(120));
+        assert_eq!(deque[0].request_bytes, 256);
+        assert_eq!(deque[0].response_bytes, 1024);
+
+        // Next 500ms poll returns a 5-field `@WebSocketConnection` ref (now state = "closed")
+        let ws_ref_closed = HttpRequestRecord::parse_from_websocket_profile_entry(&json!({
+            "type": "@WebSocketConnection",
+            "id": "42",
+            "isolateId": "isolates/1",
+            "uri": "wss://echo.example.com/ws",
+            "state": "closed"
+        }))
+        .unwrap();
+        assert!(!ws_ref_closed.body_loaded);
+
+        merge_requests_into_deque(&mut deque, vec![ws_ref_closed], Some("ws:42"));
+
+        // Hydrated timestamp, byte counters, duration, and events must NOT be wiped out
+        assert!(deque[0].body_loaded);
+        assert_eq!(deque[0].start_time_micros, 1_700_000_000_000_000u64);
+        assert_eq!(deque[0].request_bytes, 256);
+        assert_eq!(deque[0].response_bytes, 1024);
+        assert_eq!(deque[0].duration_ms, Some(120));
+        assert_eq!(deque[0].reason_phrase.as_deref(), Some("CLOSED"));
+        assert!(deque[0].response_complete);
+        let ws_d = deque[0].ws_detail.as_ref().unwrap();
+        assert_eq!(ws_d.state, "closed");
+        assert_eq!(ws_d.events.len(), 1);
+        assert_eq!(ws_d.events[0].opcode.as_deref(), Some("TEXT"));
     }
 }

@@ -1,4 +1,5 @@
 use std::io::Read as _;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use flate2::read::{DeflateDecoder, GzDecoder, ZlibDecoder};
 use serde_json::Value;
@@ -221,13 +222,22 @@ impl HttpRequestRecord {
         };
 
         let ws_detail = Self::parse_websocket_detail_from_response(v);
-        let start_time_micros = ws_detail.connect_timestamp;
+        let has_connect_ts = ws_detail.connect_timestamp > 0;
+        let start_time_micros = if has_connect_ts {
+            ws_detail.connect_timestamp
+        } else {
+            current_unix_micros()
+        };
         let end_time_micros = ws_detail.close_timestamp;
-        let duration_ms = end_time_micros
-            .or_else(|| ws_detail.events.last().map(|e| e.timestamp_micros))
-            .or(ws_detail.open_timestamp)
-            .and_then(|end| end.checked_sub(start_time_micros))
-            .map(|us| us / 1000);
+        let duration_ms = if has_connect_ts {
+            end_time_micros
+                .or_else(|| ws_detail.events.last().map(|e| e.timestamp_micros))
+                .or(ws_detail.open_timestamp)
+                .and_then(|end| end.checked_sub(start_time_micros))
+                .map(|us| us / 1000)
+        } else {
+            None
+        };
 
         let state_lower = ws_detail.state.to_ascii_lowercase();
         let response_complete = matches!(state_lower.as_str(), "closed" | "error")
@@ -238,7 +248,7 @@ impl HttpRequestRecord {
             .get("type")
             .and_then(Value::as_str)
             .is_some_and(|t| t == "WebSocketConnection" || t == "WebSocketProfileConnection");
-        let body_loaded = has_events_array || is_full_type;
+        let body_loaded = has_connect_ts && (has_events_array || is_full_type);
 
         let status_code = ws_detail.close_code.or(if state_lower == "open" {
             Some(101)
@@ -272,6 +282,46 @@ impl HttpRequestRecord {
             body_loaded,
             response_complete,
         })
+    }
+
+    pub fn apply_hydrated_websocket_detail(&mut self, detail: WebSocketConnectionDetail) {
+        if detail.connect_timestamp > 0 {
+            self.start_time_micros = detail.connect_timestamp;
+            self.timestamp_hms = format_micros_local_hms(detail.connect_timestamp);
+        }
+        self.request_bytes = detail.bytes_sent;
+        self.response_bytes = detail.bytes_received;
+        self.reason_phrase = Some(detail.state.to_ascii_uppercase());
+        if detail.protocol.is_some() {
+            self.content_type = detail.protocol.clone();
+        }
+        self.end_time_micros = detail.close_timestamp;
+        self.duration_ms = if self.start_time_micros > 0 {
+            detail
+                .close_timestamp
+                .or_else(|| detail.events.last().map(|e| e.timestamp_micros))
+                .or(detail.open_timestamp)
+                .and_then(|end| end.checked_sub(self.start_time_micros))
+                .map(|us| us / 1000)
+        } else {
+            None
+        };
+        self.status_code = detail.close_code.or(
+            if detail.state.eq_ignore_ascii_case("open") {
+                Some(101)
+            } else {
+                None
+            },
+        );
+        if detail.error.is_some() {
+            self.error = detail.error.clone();
+        }
+        self.response_complete =
+            matches!(detail.state.to_ascii_lowercase().as_str(), "closed" | "error")
+                || detail.close_timestamp.is_some()
+                || detail.error.is_some();
+        self.body_loaded = true;
+        self.ws_detail = Some(detail);
     }
 
     pub fn parse_websocket_detail_from_response(raw_v: &Value) -> WebSocketConnectionDetail {
@@ -346,14 +396,14 @@ impl HttpRequestRecord {
                     .unwrap_or("WebSocket.Event")
                     .to_string();
 
-                let args = ev.get("arguments").filter(|a| a.is_object()).unwrap_or(ev);
-                let frame_number = parse_u64_val(args.get("frameNumber"))
-                    .or_else(|| parse_u64_val(ev.get("frameNumber")));
+                let args = ev.get("arguments").filter(|a| a.is_object());
+                let frame_number = parse_u64_val(ev.get("frameNumber"))
+                    .or_else(|| args.and_then(|a| parse_u64_val(a.get("frameNumber"))));
 
-                let direction = args
+                let direction = ev
                     .get("direction")
-                    .or_else(|| ev.get("direction"))
                     .and_then(Value::as_str)
+                    .or_else(|| args.and_then(|a| a.get("direction")).and_then(Value::as_str))
                     .map(ToOwned::to_owned)
                     .or_else(|| {
                         let lower = event_name.to_ascii_lowercase();
@@ -366,28 +416,40 @@ impl HttpRequestRecord {
                         }
                     });
 
-                let opcode = args
+                let opcode = ev
                     .get("opcode")
-                    .or_else(|| ev.get("opcode"))
                     .and_then(Value::as_str)
-                    .map(ToOwned::to_owned);
+                    .or_else(|| args.and_then(|a| a.get("opcode")).and_then(Value::as_str))
+                    .map(ToOwned::to_owned)
+                    .or_else(|| {
+                        parse_u64_val(ev.get("opcode"))
+                            .or_else(|| args.and_then(|a| parse_u64_val(a.get("opcode"))))
+                            .and_then(map_websocket_opcode_num)
+                            .map(ToOwned::to_owned)
+                    });
 
-                let payload_size = parse_u64_val(args.get("payloadSize"))
-                    .or_else(|| parse_u64_val(args.get("size")))
-                    .or_else(|| parse_u64_val(args.get("bytes")))
-                    .or_else(|| parse_u64_val(ev.get("payloadSize")));
+                let payload_size = parse_u64_val(ev.get("payloadSize"))
+                    .or_else(|| parse_u64_val(ev.get("size")))
+                    .or_else(|| parse_u64_val(ev.get("bytes")))
+                    .or_else(|| args.and_then(|a| parse_u64_val(a.get("payloadSize"))))
+                    .or_else(|| args.and_then(|a| parse_u64_val(a.get("size"))))
+                    .or_else(|| args.and_then(|a| parse_u64_val(a.get("bytes"))));
 
-                let error_type = args
+                let error_type = ev
                     .get("errorType")
-                    .or_else(|| ev.get("errorType"))
                     .and_then(Value::as_str)
+                    .or_else(|| args.and_then(|a| a.get("errorType")).and_then(Value::as_str))
                     .map(ToOwned::to_owned);
 
-                let error_message = args
+                let error_message = ev
                     .get("errorMessage")
-                    .or_else(|| ev.get("errorMessage"))
-                    .or_else(|| args.get("error"))
                     .and_then(Value::as_str)
+                    .or_else(|| ev.get("error").and_then(Value::as_str))
+                    .or_else(|| {
+                        args.and_then(|a| a.get("errorMessage"))
+                            .and_then(Value::as_str)
+                    })
+                    .or_else(|| args.and_then(|a| a.get("error")).and_then(Value::as_str))
                     .map(ToOwned::to_owned);
 
                 let arguments_json = ev
@@ -827,6 +889,24 @@ impl HttpRequestRecord {
     }
 }
 
+fn current_unix_micros() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_micros() as u64)
+}
+
+fn map_websocket_opcode_num(code: u64) -> Option<&'static str> {
+    match code {
+        0 => Some("CONTINUATION"),
+        1 => Some("TEXT"),
+        2 => Some("BINARY"),
+        8 => Some("CLOSE"),
+        9 => Some("PING"),
+        10 => Some("PONG"),
+        _ => None,
+    }
+}
+
 fn parse_u64_val(val: Option<&Value>) -> Option<u64> {
     let v = val?;
     v.as_u64()
@@ -1141,11 +1221,29 @@ mod tests {
 
     #[test]
     fn parses_dart_3_14_websocket_profile_and_connection_events() {
+        // 1. Exact Dart 3.14 `@WebSocketConnection` 5-field ref from `ext.dart.io.getWebSocketProfile`
+        let ws_ref_json = json!({
+            "type": "@WebSocketConnection",
+            "id": "7",
+            "isolateId": "isolates/101",
+            "uri": "wss://stream.example.com/v1/live?token=abc",
+            "state": "open"
+        });
+        let mut ref_rec =
+            HttpRequestRecord::parse_from_websocket_profile_entry(&ws_ref_json).expect("parse ref");
+        assert!(ref_rec.is_websocket());
+        assert!(!ref_rec.body_loaded);
+        assert!(ref_rec.start_time_micros > 0);
+        assert_ne!(ref_rec.timestamp_hms, "00:00:00");
+        assert_eq!(ref_rec.duration_ms, None);
+
+        // 2. Exact Dart 3.14 `WebSocketConnection` from `ext.dart.io.getWebSocketConnection`
+        //    with top-level string `"opcode": "TEXT"` and `arguments: { "opcode": 1 }`
         let ws_conn_json = json!({
             "type": "WebSocketConnection",
             "id": "7",
             "isolateId": "isolates/101",
-            "url": "wss://stream.example.com/v1/live?token=abc",
+            "uri": "wss://stream.example.com/v1/live?token=abc",
             "state": "closed",
             "protocol": "chat.v1",
             "connectTimestamp": 1_700_000_000_000_000u64,
@@ -1163,7 +1261,7 @@ mod tests {
                 {
                     "timestamp": 1_700_000_000_000_000u64,
                     "event": "WebSocket.Connect",
-                    "arguments": { "url": "wss://stream.example.com/v1/live?token=abc" }
+                    "arguments": { "uri": "wss://stream.example.com/v1/live?token=abc" }
                 },
                 {
                     "timestamp": 1_700_000_000_030_000u64,
@@ -1173,20 +1271,28 @@ mod tests {
                 {
                     "timestamp": 1_700_000_000_100_000u64,
                     "event": "WebSocket.Send",
+                    "frameNumber": 1,
+                    "direction": "out",
+                    "opcode": "TEXT",
+                    "payloadSize": 64,
                     "arguments": {
                         "frameNumber": 1,
                         "direction": "out",
-                        "opcode": "TEXT",
+                        "opcode": 1,
                         "payloadSize": 64
                     }
                 },
                 {
                     "timestamp": 1_700_000_000_250_000u64,
                     "event": "WebSocket.Receive",
+                    "frameNumber": 2,
+                    "direction": "in",
+                    "opcode": "BINARY",
+                    "payloadSize": 512,
                     "arguments": {
                         "frameNumber": 2,
                         "direction": "in",
-                        "opcode": "BINARY",
+                        "opcode": 2,
                         "payloadSize": 512
                     }
                 },
@@ -1197,6 +1303,13 @@ mod tests {
                 }
             ]
         });
+
+        let detail = HttpRequestRecord::parse_websocket_detail_from_response(&ws_conn_json);
+        ref_rec.apply_hydrated_websocket_detail(detail);
+        assert!(ref_rec.body_loaded);
+        assert_eq!(ref_rec.start_time_micros, 1_700_000_000_000_000u64);
+        assert_eq!(ref_rec.duration_ms, Some(1530));
+        assert_eq!(ref_rec.total_bytes(), 640);
 
         let rec =
             HttpRequestRecord::parse_from_websocket_profile_entry(&ws_conn_json).expect("parse ws");

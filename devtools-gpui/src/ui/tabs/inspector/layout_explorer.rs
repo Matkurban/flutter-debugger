@@ -468,6 +468,7 @@ pub fn render_layout_explorer_subtab(
         )
         .when(!layout.children.is_empty(), |el| {
             let children = layout.children.clone();
+            let parent_vid = layout.value_id.clone();
             el.child(
                 div()
                     .p_3()
@@ -489,7 +490,7 @@ pub fn render_layout_explorer_subtab(
                             )),
                     )
                     .children(children.into_iter().enumerate().map(|(idx, child)| {
-                        render_child_flex_row(idx, &child, cx)
+                        render_child_flex_row(idx, &parent_vid, &child, cx)
                     })),
             )
         })
@@ -558,6 +559,7 @@ fn render_flex_child_controls_card(
                                     this.send_cmd(BackendCommand::SetFlexFactor {
                                         value_id: vid.clone(),
                                         flex_factor: factor,
+                                        refresh_value_id: vid.clone(),
                                     });
                                     cx.notify();
                                 }
@@ -596,6 +598,7 @@ fn render_flex_child_controls_card(
                                     this.send_cmd(BackendCommand::SetFlexFit {
                                         value_id: vid.clone(),
                                         flex_fit: fit_opt.to_string(),
+                                        refresh_value_id: vid.clone(),
                                     });
                                     cx.notify();
                                 }
@@ -607,10 +610,12 @@ fn render_flex_child_controls_card(
 
 fn render_child_flex_row(
     idx: usize,
+    parent_value_id: &str,
     child: &LayoutExplorerNode,
     cx: &mut Context<RootView>,
 ) -> impl IntoElement + use<> {
     let vid = child.value_id.clone();
+    let parent_vid = parent_value_id.to_string();
     let cur_factor = child.flex_factor.unwrap_or(0);
     let cur_fit = child.flex_fit.clone().unwrap_or_else(|| "loose".to_string());
     let sz_label = match &child.size {
@@ -661,6 +666,11 @@ fn render_child_flex_row(
                 )
                 .children([0u32, 1, 2, 3].into_iter().map(|factor| {
                     let child_id = vid.clone();
+                    let refresh_id = if parent_vid.is_empty() {
+                        child_id.clone()
+                    } else {
+                        parent_vid.clone()
+                    };
                     Button::new(SharedString::from(format!(
                         "btn-ch-flex-{idx}-{factor}"
                     )))
@@ -679,6 +689,7 @@ fn render_child_flex_row(
                             this.send_cmd(BackendCommand::SetFlexFactor {
                                 value_id: child_id.clone(),
                                 flex_factor: factor,
+                                refresh_value_id: refresh_id.clone(),
                             });
                             cx.notify();
                         }
@@ -686,6 +697,11 @@ fn render_child_flex_row(
                 }))
                 .children(["tight", "loose"].into_iter().map(|fit_opt| {
                     let child_id = vid.clone();
+                    let refresh_id = if parent_vid.is_empty() {
+                        child_id.clone()
+                    } else {
+                        parent_vid.clone()
+                    };
                     let active = cur_fit.eq_ignore_ascii_case(fit_opt)
                         || cur_fit.ends_with(&format!(".{fit_opt}"));
                     Button::new(SharedString::from(format!("btn-ch-fit-{idx}-{fit_opt}")))
@@ -704,6 +720,7 @@ fn render_child_flex_row(
                                 this.send_cmd(BackendCommand::SetFlexFit {
                                     value_id: child_id.clone(),
                                     flex_fit: fit_opt.to_string(),
+                                    refresh_value_id: refresh_id.clone(),
                                 });
                                 cx.notify();
                             }

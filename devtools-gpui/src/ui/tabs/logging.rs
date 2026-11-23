@@ -164,6 +164,13 @@ impl LoggingTabState {
         }
         let matches = self.entry_matches(&entry);
 
+        if self.auto_scroll
+            && self.selected_seq.is_none()
+            && self.scroll_handle.is_scrolled_to_end() == Some(false)
+        {
+            self.auto_scroll = false;
+        }
+
         if self.entries.len() >= MAX_LOG_ENTRIES {
             let evicted_visible = self.filtered_indices.first() == Some(&0);
             self.entries.pop_front();
@@ -197,7 +204,14 @@ impl LoggingTabState {
         }
 
         if self.auto_scroll && self.selected_seq.is_none() {
-            self.scroll_handle.scroll_to_bottom();
+            if self.scroll_handle.is_scrolled_to_end() == Some(false) {
+                self.auto_scroll = false;
+                if matches {
+                    self.pending_new_count += 1;
+                }
+            } else {
+                self.scroll_handle.scroll_to_bottom();
+            }
         } else if matches {
             self.pending_new_count += 1;
         }

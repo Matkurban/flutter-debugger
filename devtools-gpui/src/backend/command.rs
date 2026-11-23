@@ -65,10 +65,12 @@ pub enum BackendCommand {
     SetFlexFit {
         value_id: String,
         flex_fit: String,
+        refresh_value_id: String,
     },
     SetFlexFactor {
         value_id: String,
         flex_factor: u32,
+        refresh_value_id: String,
     },
     SetMemoryPolling(bool),
     ForceGc,

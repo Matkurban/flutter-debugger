@@ -748,18 +748,27 @@ async fn handle_backend_command(
                 });
             }
         }
-        BackendCommand::SetFlexFit { value_id, flex_fit } => {
+        BackendCommand::SetFlexFit {
+            value_id,
+            flex_fit,
+            refresh_value_id,
+        } => {
             if let Some(c) = state.vm_client.clone() {
                 let props_group = state.active_props_group.clone();
                 let tx = event_tx.clone();
                 tokio::spawn(async move {
                     match c.set_flex_fit(&value_id, &flex_fit).await {
                         Ok(()) => {
+                            let target_id = if refresh_value_id.is_empty() {
+                                value_id
+                            } else {
+                                refresh_value_id
+                            };
                             if let Ok(layout_node) =
-                                c.fetch_layout_explorer_node(&value_id, &props_group).await
+                                c.fetch_layout_explorer_node(&target_id, &props_group).await
                             {
                                 let _ = tx.try_send(BackendEvent::WidgetLayoutUpdated {
-                                    value_id,
+                                    value_id: target_id,
                                     layout_node,
                                 });
                             }
@@ -772,6 +781,7 @@ async fn handle_backend_command(
         BackendCommand::SetFlexFactor {
             value_id,
             flex_factor,
+            refresh_value_id,
         } => {
             if let Some(c) = state.vm_client.clone() {
                 let props_group = state.active_props_group.clone();
@@ -779,11 +789,16 @@ async fn handle_backend_command(
                 tokio::spawn(async move {
                     match c.set_flex_factor(&value_id, flex_factor).await {
                         Ok(()) => {
+                            let target_id = if refresh_value_id.is_empty() {
+                                value_id
+                            } else {
+                                refresh_value_id
+                            };
                             if let Ok(layout_node) =
-                                c.fetch_layout_explorer_node(&value_id, &props_group).await
+                                c.fetch_layout_explorer_node(&target_id, &props_group).await
                             {
                                 let _ = tx.try_send(BackendEvent::WidgetLayoutUpdated {
-                                    value_id,
+                                    value_id: target_id,
                                     layout_node,
                                 });
                             }
