@@ -135,19 +135,21 @@ pub async fn run_dap_proxy() -> Result<(), Box<dyn std::error::Error>> {
                 custom_sdk.as_deref(),
             );
 
-            let (proj_root, executable, is_test, mode, device_id) = match resolved {
+            let (proj_root, executable, is_test, mode, device_id, device_notice) = match resolved {
                 Some(r) => (
                     r.project_root,
                     r.executable,
                     r.is_test,
                     r.mode,
                     r.device_id,
+                    r.device_notice,
                 ),
                 None => (
                     default_cwd.clone(),
                     crate::project::platform_cli_filename("flutter").to_string(),
                     false,
                     "debug".to_string(),
+                    None,
                     None,
                 ),
             };
@@ -278,6 +280,21 @@ pub async fn run_dap_proxy() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             child_spawned = true;
+
+            if let Some(notice) = device_notice {
+                let proxy_seq = state.lock().await.allocate_proxy_seq();
+                let output_event = json!({
+                    "seq": proxy_seq,
+                    "type": "event",
+                    "event": "output",
+                    "body": {
+                        "category": "console",
+                        "output": format!("[flutter-debugger] {notice}\n")
+                    }
+                });
+                let mut out = zed_stdout.lock().await;
+                let _ = write_dap_message(&mut *out, &output_event).await;
+            }
 
             if to_adapter_tx.send(msg).await.is_err() {
                 break;
@@ -499,8 +516,9 @@ async fn handle_ipc_connection(
             if let Some(mut child) = child_handle.lock().await.take() {
                 terminate_child_tree(&mut child).await;
             }
+            let terminated_seq = state.lock().await.allocate_proxy_seq();
             let terminated_event = json!({
-                "seq": 0,
+                "seq": terminated_seq,
                 "type": "event",
                 "event": "terminated"
             });
@@ -509,19 +527,28 @@ async fn handle_ipc_connection(
                 let _ = write_dap_message(&mut *out, &terminated_event).await;
             }
             remove_session_record_by_id(&cache, &session_id);
-            stop_notify.notify_waiters();
+            stop_notify.notify_one();
             return;
         }
         Ok(IpcRequest::ToggleOverlay { overlay }) => {
             handle_overlay_toggle(&state, &to_adapter_tx, overlay).await
         }
         Ok(IpcRequest::CallServiceExtension { method, params }) => {
-            let (mode, dev, vm, dt) = snapshot_meta(&state).await;
+            let (mode, dev, vm, dt, params_with_isolate) = {
+                let guard = state.lock().await;
+                (
+                    guard.mode.clone(),
+                    guard.device_id.clone(),
+                    guard.vm_service_uri.clone(),
+                    guard.devtools_uri.clone(),
+                    attach_isolate_id(&params, &guard, &method),
+                )
+            };
             let dap_res = inject_and_await(
                 &state,
                 &to_adapter_tx,
-                "callServiceExtension",
-                json!({ "methodName": method, "params": params }),
+                "callService",
+                json!({ "method": method, "params": params_with_isolate }),
                 10,
             )
             .await;
@@ -693,12 +720,26 @@ async fn handle_ipc_connection(
     }
 }
 
+fn attach_isolate_id(params: &Value, state: &ProxySessionState, method: &str) -> Value {
+    let mut enriched = params.clone();
+    if let Some(obj) = enriched.as_object_mut()
+        && !obj.contains_key("isolateId")
+        && let Some(isolate_id) = state
+            .service_extension_isolates
+            .get(method)
+            .or(state.main_isolate_id.as_ref())
+    {
+        obj.insert("isolateId".to_string(), json!(isolate_id));
+    }
+    enriched
+}
+
 async fn handle_overlay_toggle(
     state: &Arc<Mutex<ProxySessionState>>,
     to_adapter_tx: &mpsc::Sender<Value>,
     overlay: ServiceOverlay,
 ) -> IpcResponse {
-    let (mode, dev, vm, dt, method, params, status_label) = {
+    let (mode, dev, vm, dt, method, params, params_with_isolate, status_label) = {
         let guard = state.lock().await;
         if guard.mode == "release" {
             return IpcResponse {
@@ -712,6 +753,7 @@ async fn handle_overlay_toggle(
             };
         }
         let (m, p, label) = guard.overlays.preview_toggle(overlay);
+        let p_iso = attach_isolate_id(&p, &guard, m);
         (
             guard.mode.clone(),
             guard.device_id.clone(),
@@ -719,6 +761,7 @@ async fn handle_overlay_toggle(
             guard.devtools_uri.clone(),
             m,
             p,
+            p_iso,
             label,
         )
     };
@@ -726,8 +769,8 @@ async fn handle_overlay_toggle(
     match inject_and_await(
         state,
         to_adapter_tx,
-        "callServiceExtension",
-        json!({ "methodName": method, "params": params }),
+        "callService",
+        json!({ "method": method, "params": params_with_isolate }),
         10,
     )
     .await

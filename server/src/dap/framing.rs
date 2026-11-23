@@ -5,7 +5,9 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::oneshot;
 
-use crate::cache::{DiskCache, now_unix};
+use crate::cache::{
+    DiskCache, extract_device_flag_from_args, now_unix, resolve_effective_device,
+};
 use crate::ipc::OverlayState;
 use crate::project::{ProjectKind, find_project_for_path, resolve_sdk_executable};
 
@@ -18,6 +20,7 @@ pub struct ResolvedAdapterTarget {
     pub is_test: bool,
     pub mode: String,
     pub device_id: Option<String>,
+    pub device_notice: Option<String>,
 }
 
 pub struct ProxySessionState {
@@ -30,6 +33,8 @@ pub struct ProxySessionState {
     pub vm_service_uri: Option<String>,
     pub devtools_uri: Option<String>,
     pub overlays: OverlayState,
+    pub service_extension_isolates: HashMap<String, String>,
+    pub main_isolate_id: Option<String>,
     pub suppressed_seqs: HashSet<i64>,
     pub pending_injected: HashMap<i64, oneshot::Sender<Value>>,
     pub next_injected_seq: i64,
@@ -48,6 +53,8 @@ impl ProxySessionState {
             vm_service_uri: None,
             devtools_uri: None,
             overlays: OverlayState::default(),
+            service_extension_isolates: HashMap::new(),
+            main_isolate_id: None,
             suppressed_seqs: HashSet::new(),
             pending_injected: HashMap::new(),
             next_injected_seq: 900_000,
@@ -208,7 +215,8 @@ pub fn is_test_launch_request(args: &serde_json::Map<String, Value>) -> bool {
 /// Enhances a `launch` or `attach` DAP request with:
 /// - Monorepo-aware `cwd` resolution (walks up from `program` first)
 /// - FVM/SDK executable detection & `--test` detection
-/// - Dynamic `deviceId` injection from `DiskCache` when omitted
+/// - Device resolution translated into `toolArgs: ["-d", "<deviceId>"]` (since `flutter debug_adapter`
+///   ignores the top-level `deviceId` DAP field and only reads `-d` / `--device-id` in `toolArgs`)
 /// - `flutterMode` -> `--profile` / `--release` (`+ noDebug: true`) in `toolArgs`
 /// - `flavor` -> `--flavor` and `dartDefineFromFile` -> `--dart-define-from-file=...`
 pub fn resolve_and_enrich_launch_or_attach(
@@ -278,20 +286,51 @@ pub fn resolve_and_enrich_launch_or_attach(
         .is_some_and(|p| p.replace('\\', "/").contains("integration_test"));
     let needs_device = project_kind == ProjectKind::Flutter && (!is_test || is_integration_test);
 
-    let mut device_id = args
+    let mut tool_args: Vec<String> = args
+        .get("toolArgs")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let prog_args: Vec<String> = args
+        .get("args")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let explicit_device_id = args
         .get("deviceId")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(ToOwned::to_owned);
 
-    if needs_device
-        && device_id.is_none()
-        && let Some(selected) = cache.get_selected_device(&project_root)
-    {
-        args.insert("deviceId".to_string(), json!(selected));
-        device_id = Some(selected);
-    }
+    let existing_cli_device = extract_device_flag_from_args(&tool_args)
+        .or_else(|| extract_device_flag_from_args(&prog_args));
+
+    let (device_id, device_notice, inject_device_flag) =
+        if let Some(cli_dev) = existing_cli_device {
+            (Some(cli_dev), None, false)
+        } else if needs_device {
+            match resolve_effective_device(cache, &project_root, explicit_device_id.as_deref()) {
+                Some(resolved_dev) => {
+                    (Some(resolved_dev.id), resolved_dev.auto_selected_notice, true)
+                }
+                None => (None, None, false),
+            }
+        } else {
+            (explicit_device_id, None, false)
+        };
 
     let flavor = args
         .get("flavor")
@@ -316,17 +355,16 @@ pub fn resolve_and_enrich_launch_or_attach(
         args.insert("noDebug".to_string(), json!(true));
     }
 
-    if flavor.is_some() || dart_define_file.is_some() || need_profile_flag || need_release_flag {
-        let mut tool_args: Vec<String> = args
-            .get("toolArgs")
-            .and_then(Value::as_array)
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(Value::as_str)
-                    .map(ToOwned::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default();
+    if inject_device_flag
+        || flavor.is_some()
+        || dart_define_file.is_some()
+        || need_profile_flag
+        || need_release_flag
+    {
+        if inject_device_flag && let Some(ref dev) = device_id {
+            tool_args.push("-d".to_string());
+            tool_args.push(dev.clone());
+        }
 
         if need_profile_flag && !tool_args.iter().any(|a| a == "--profile") {
             tool_args.push("--profile".to_string());
@@ -362,10 +400,12 @@ pub fn resolve_and_enrich_launch_or_attach(
         is_test,
         mode,
         device_id,
+        device_notice,
     })
 }
 
-/// Inspects outgoing adapter events to capture VM Service and DevTools URIs.
+/// Inspects outgoing adapter events to capture VM Service / DevTools URIs,
+/// `flutter.appStart` metadata, and `dart.serviceExtensionAdded` isolate mappings.
 pub fn inspect_adapter_event(msg: &Value, state: &mut ProxySessionState) -> bool {
     if msg.get("type").and_then(Value::as_str) != Some("event") {
         return false;
@@ -390,6 +430,31 @@ pub fn inspect_adapter_event(msg: &Value, state: &mut ProxySessionState) -> bool
         {
             state.devtools_uri = Some(dt_uri.to_string());
             changed = true;
+        }
+    } else if event == "flutter.appStart" {
+        if let Some(dev_id) = body.get("deviceId").and_then(Value::as_str)
+            && !dev_id.trim().is_empty()
+            && state.device_id.as_deref() != Some(dev_id)
+        {
+            state.device_id = Some(dev_id.to_string());
+            changed = true;
+        }
+        if let Some(mode) = body.get("mode").and_then(Value::as_str)
+            && !mode.trim().is_empty()
+            && state.mode != mode
+        {
+            state.mode = mode.to_string();
+            changed = true;
+        }
+    } else if event == "dart.serviceExtensionAdded" {
+        if let (Some(ext_rpc), Some(isolate_id)) = (
+            body.get("extensionRPC").and_then(Value::as_str),
+            body.get("isolateId").and_then(Value::as_str),
+        ) {
+            state
+                .service_extension_isolates
+                .insert(ext_rpc.to_string(), isolate_id.to_string());
+            state.main_isolate_id = Some(isolate_id.to_string());
         }
     } else if event == "output"
         && let Some(output) = body.get("output").and_then(Value::as_str)
@@ -420,17 +485,25 @@ fn extract_local_devtools_url(text: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache::FlutterDevice;
     use std::fs;
+
+    fn make_flutter_project(dir: &Path, platforms: &[&str]) {
+        fs::write(
+            dir.join("pubspec.yaml"),
+            "name: demo\nflutter:\n  uses-material-design: true\n",
+        )
+        .expect("write pubspec");
+        for p in platforms {
+            fs::create_dir_all(dir.join(p)).expect("mkdir platform");
+        }
+    }
 
     #[test]
     fn maps_flutter_mode_profile_and_release_into_tool_args_and_no_debug() {
         let dir = tempfile::tempdir().expect("tempdir");
         let cache = DiskCache::with_root(dir.path().join(".cache"));
-        fs::write(
-            dir.path().join("pubspec.yaml"),
-            "name: demo\nflutter:\n  uses-material-design: true\n",
-        )
-        .expect("write pubspec");
+        make_flutter_project(dir.path(), &[]);
 
         let mut profile_req = json!({
             "seq": 2,
@@ -463,6 +536,188 @@ mod tests {
         assert_eq!(resolved_r.mode, "release");
         assert_eq!(release_req["arguments"]["toolArgs"], json!(["--release"]));
         assert_eq!(release_req["arguments"]["noDebug"], json!(true));
+    }
+
+    #[test]
+    fn translates_explicit_device_id_into_tool_args_flag() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = DiskCache::with_root(dir.path().join(".cache"));
+        make_flutter_project(dir.path(), &["macos"]);
+
+        let mut req = json!({
+            "seq": 2,
+            "type": "request",
+            "command": "launch",
+            "arguments": {
+                "program": "lib/main.dart",
+                "deviceId": "macos"
+            }
+        });
+
+        let resolved =
+            resolve_and_enrich_launch_or_attach(&mut req, &cache, dir.path(), None).expect("ok");
+        assert_eq!(resolved.device_id.as_deref(), Some("macos"));
+        assert_eq!(resolved.device_notice, None);
+        assert_eq!(req["arguments"]["toolArgs"], json!(["-d", "macos"]));
+    }
+
+    #[test]
+    fn injects_selected_device_into_tool_args_for_launch_and_attach() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = DiskCache::with_root(dir.path().join(".cache"));
+        make_flutter_project(dir.path(), &["macos"]);
+        cache.set_selected_device(dir.path(), "macos");
+
+        for cmd in ["launch", "attach"] {
+            let mut req = json!({
+                "seq": 2,
+                "type": "request",
+                "command": cmd,
+                "arguments": {
+                    "program": "lib/main.dart"
+                }
+            });
+            let resolved =
+                resolve_and_enrich_launch_or_attach(&mut req, &cache, dir.path(), None)
+                    .expect("resolved");
+            assert_eq!(resolved.device_id.as_deref(), Some("macos"));
+            assert_eq!(resolved.device_notice, None);
+            assert_eq!(req["arguments"]["toolArgs"], json!(["-d", "macos"]));
+        }
+    }
+
+    #[test]
+    fn does_not_duplicate_device_flag_when_tool_args_already_specifies_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = DiskCache::with_root(dir.path().join(".cache"));
+        make_flutter_project(dir.path(), &["macos", "web"]);
+        cache.set_selected_device(dir.path(), "macos");
+
+        let mut req = json!({
+            "seq": 2,
+            "type": "request",
+            "command": "launch",
+            "arguments": {
+                "program": "lib/main.dart",
+                "toolArgs": ["-d", "chrome"]
+            }
+        });
+
+        let resolved =
+            resolve_and_enrich_launch_or_attach(&mut req, &cache, dir.path(), None).expect("ok");
+        assert_eq!(resolved.device_id.as_deref(), Some("chrome"));
+        assert_eq!(resolved.device_notice, None);
+        assert_eq!(req["arguments"]["toolArgs"], json!(["-d", "chrome"]));
+    }
+
+    #[test]
+    fn auto_selects_platform_compatible_device_by_priority_and_respects_enabled_platforms() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = DiskCache::with_root(dir.path().join(".cache"));
+
+        let devices = vec![
+            FlutterDevice {
+                id: "chrome".into(),
+                name: "Chrome".into(),
+                target_platform: "web-javascript".into(),
+                emulator: false,
+                sdk: "Google Chrome".into(),
+            },
+            FlutterDevice {
+                id: "iphone-wifi-1".into(),
+                name: "iPhone (wireless)".into(),
+                target_platform: "ios".into(),
+                emulator: false,
+                sdk: "iOS 18".into(),
+            },
+            FlutterDevice {
+                id: "macos".into(),
+                name: "macOS".into(),
+                target_platform: "darwin".into(),
+                emulator: false,
+                sdk: "macOS 15".into(),
+            },
+        ];
+        cache.save_devices(&devices);
+
+        // Project with `macos/` enabled -> Tier 2 (macos) beats Tier 3 (wireless) & Tier 4 (chrome)
+        let desktop_proj = dir.path().join("desktop_app");
+        fs::create_dir_all(&desktop_proj).expect("mkdir");
+        make_flutter_project(&desktop_proj, &["macos", "ios", "web"]);
+
+        let mut req = json!({
+            "seq": 2,
+            "type": "request",
+            "command": "launch",
+            "arguments": {
+                "cwd": desktop_proj.to_string_lossy(),
+                "program": "lib/main.dart"
+            }
+        });
+        let resolved =
+            resolve_and_enrich_launch_or_attach(&mut req, &cache, &desktop_proj, None).expect("ok");
+        assert_eq!(resolved.device_id.as_deref(), Some("macos"));
+        assert!(resolved.device_notice.is_some());
+        assert_eq!(req["arguments"]["toolArgs"], json!(["-d", "macos"]));
+
+        // Mobile-only project (`ios/` + `android/`, NO `macos/`) must NOT pick `macos`
+        let mobile_proj = dir.path().join("mobile_app");
+        fs::create_dir_all(&mobile_proj).expect("mkdir");
+        make_flutter_project(&mobile_proj, &["ios", "android"]);
+
+        let mut mobile_req = json!({
+            "seq": 3,
+            "type": "request",
+            "command": "launch",
+            "arguments": {
+                "cwd": mobile_proj.to_string_lossy(),
+                "program": "lib/main.dart"
+            }
+        });
+        let mobile_resolved =
+            resolve_and_enrich_launch_or_attach(&mut mobile_req, &cache, &mobile_proj, None)
+                .expect("ok");
+        assert_eq!(mobile_resolved.device_id.as_deref(), Some("iphone-wifi-1"));
+        assert!(mobile_resolved.device_notice.is_some());
+        assert_eq!(
+            mobile_req["arguments"]["toolArgs"],
+            json!(["-d", "iphone-wifi-1"])
+        );
+    }
+
+    #[test]
+    fn inspects_app_start_and_service_extension_added_events() {
+        let mut state = ProxySessionState::new("sess-1".into());
+
+        let app_start = json!({
+            "type": "event",
+            "event": "flutter.appStart",
+            "body": {
+                "deviceId": "macos",
+                "mode": "profile"
+            }
+        });
+        assert!(inspect_adapter_event(&app_start, &mut state));
+        assert_eq!(state.device_id.as_deref(), Some("macos"));
+        assert_eq!(state.mode, "profile");
+
+        let ext_added = json!({
+            "type": "event",
+            "event": "dart.serviceExtensionAdded",
+            "body": {
+                "extensionRPC": "ext.flutter.inspector.show",
+                "isolateId": "isolates/12345"
+            }
+        });
+        let _ = inspect_adapter_event(&ext_added, &mut state);
+        assert_eq!(
+            state
+                .service_extension_isolates
+                .get("ext.flutter.inspector.show")
+                .map(String::as_str),
+            Some("isolates/12345")
+        );
+        assert_eq!(state.main_isolate_id.as_deref(), Some("isolates/12345"));
     }
 
     #[test]

@@ -12,7 +12,10 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, mpsc, oneshot};
 
-use crate::cache::{DiskCache, FlutterDevice, normalize_project_key, now_unix};
+use crate::cache::{
+    DiskCache, FlutterDevice, extract_device_flag_from_args, normalize_project_key, now_unix,
+    resolve_effective_device,
+};
 use crate::dap::open_url_in_browser;
 use crate::debug_config::run_init_zed;
 use crate::devtools::resolve_or_start_devtools_url;
@@ -466,10 +469,17 @@ async fn cmd_run(args: &[String]) -> Result<(), String> {
     let flavor = parsed.flavor;
     let dart_define_from_file = parsed.dart_define_from_file;
     let cache = DiskCache::default_location();
-    let device_id = parsed
-        .device_flag
-        .or_else(|| cache.get_selected_device(&project.root));
     let extra_args = parsed.extra_args;
+    let (device_id, pass_device_flag) = if let Some(extra_dev) = extract_device_flag_from_args(&extra_args) {
+        (Some(extra_dev), false)
+    } else if let Some(resolved_dev) = resolve_effective_device(&cache, &project.root, parsed.device_flag.as_deref()) {
+        if let Some(notice) = resolved_dev.auto_selected_notice {
+            println!("\x1b[33m[Flutter]\x1b[0m {notice}");
+        }
+        (Some(resolved_dev.id), true)
+    } else {
+        (None, false)
+    };
 
     let mode_flag = match mode.as_str() {
         "profile" => "--profile",
@@ -484,7 +494,8 @@ async fn cmd_run(args: &[String]) -> Result<(), String> {
         "-t".to_string(),
         target.clone(),
     ];
-    if let Some(ref dev) = device_id
+    if pass_device_flag
+        && let Some(ref dev) = device_id
         && !dev.trim().is_empty()
     {
         flutter_args.push("-d".to_string());

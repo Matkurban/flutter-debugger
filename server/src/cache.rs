@@ -154,6 +154,191 @@ pub fn normalize_project_key(path: &Path) -> String {
         .into_owned()
 }
 
+/// Result of resolving which Flutter device a DAP or `ctl run` session should target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedDevice {
+    pub id: String,
+    pub auto_selected_notice: Option<String>,
+}
+
+/// Extracts a manually supplied device ID from CLI/tool arguments (`-d <id>`, `-d=<id>`,
+/// `--device-id <id>`, or `--device-id=<id>`).
+pub fn extract_device_flag_from_args(args: &[String]) -> Option<String> {
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if arg == "-d" || arg == "--device-id" {
+            if let Some(val) = iter.next()
+                && !val.trim().is_empty()
+            {
+                return Some(val.trim().to_string());
+            }
+        } else if let Some(val) = arg
+            .strip_prefix("--device-id=")
+            .or_else(|| arg.strip_prefix("-d="))
+            && !val.trim().is_empty()
+        {
+            return Some(val.trim().to_string());
+        }
+    }
+    None
+}
+
+/// Resolves the effective Flutter device ID for `project_root`:
+/// 1. Explicit device (`deviceId` in `.zed/debug.json` or CLI `--device`) always wins.
+/// 2. Persisted `selected_devices.json` selection is respected unless a fresh (<=120s)
+///    non-empty `devices.json` cache proves it is offline, in which case an online
+///    platform-compatible device is auto-selected with a user-facing notice.
+/// 3. If no device was ever selected, auto-selects the highest-priority platform-compatible
+///    device from `devices.json` with a user-facing notice.
+pub fn resolve_effective_device(
+    cache: &DiskCache,
+    project_root: &Path,
+    explicit_device: Option<&str>,
+) -> Option<ResolvedDevice> {
+    if let Some(dev) = explicit_device
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return Some(ResolvedDevice {
+            id: dev.to_string(),
+            auto_selected_notice: None,
+        });
+    }
+
+    let selected = cache.get_selected_device(project_root);
+    let device_cache = cache.load_devices();
+
+    if let Some(selected_id) = selected {
+        let cache_proves_offline = device_cache.as_ref().is_some_and(|dc| {
+            !dc.devices.is_empty()
+                && is_fresh(dc.fetched_at_unix, 120)
+                && !dc.devices.iter().any(|d| d.id == selected_id)
+        });
+
+        if !cache_proves_offline {
+            return Some(ResolvedDevice {
+                id: selected_id,
+                auto_selected_notice: None,
+            });
+        }
+
+        if let Some(dc) = device_cache.as_ref()
+            && let Some(best) = pick_best_default_device(project_root, &dc.devices)
+        {
+            return Some(ResolvedDevice {
+                id: best.id.clone(),
+                auto_selected_notice: Some(format!(
+                    "Previously selected device \"{selected_id}\" is offline; auto-selected {} ({}). Run \"Flutter: Select Device\" to switch.",
+                    best.name, best.id
+                )),
+            });
+        }
+
+        return Some(ResolvedDevice {
+            id: selected_id,
+            auto_selected_notice: None,
+        });
+    }
+
+    if let Some(dc) = device_cache
+        && !dc.devices.is_empty()
+        && let Some(best) = pick_best_default_device(project_root, &dc.devices)
+    {
+        return Some(ResolvedDevice {
+            id: best.id.clone(),
+            auto_selected_notice: Some(format!(
+                "No target device selected for this project; auto-selected {} ({}). Run \"Flutter: Select Device\" to switch.",
+                best.name, best.id
+            )),
+        });
+    }
+
+    None
+}
+
+fn device_platform_dir(device: &FlutterDevice) -> Option<&'static str> {
+    let plat = device.target_platform.to_ascii_lowercase();
+    let id = device.id.to_ascii_lowercase();
+
+    if plat.contains("darwin") || plat.contains("macos") || id == "macos" {
+        Some("macos")
+    } else if plat.contains("ios") {
+        Some("ios")
+    } else if plat.contains("android") {
+        Some("android")
+    } else if plat.contains("web") || matches!(id.as_str(), "chrome" | "edge" | "web-server") {
+        Some("web")
+    } else if plat.contains("linux") || id == "linux" {
+        Some("linux")
+    } else if plat.contains("windows") || id == "windows" {
+        Some("windows")
+    } else {
+        None
+    }
+}
+
+fn device_priority_tier(device: &FlutterDevice) -> u8 {
+    if device.emulator {
+        return 0;
+    }
+
+    let plat = device.target_platform.to_ascii_lowercase();
+    let id = device.id.to_ascii_lowercase();
+    let name_lower = device.name.to_ascii_lowercase();
+
+    let is_mobile = plat.contains("ios") || plat.contains("android");
+    if is_mobile {
+        return if name_lower.contains("wireless") {
+            3
+        } else {
+            1
+        };
+    }
+
+    let is_desktop = plat.contains("darwin")
+        || plat.contains("macos")
+        || plat.contains("linux")
+        || plat.contains("windows")
+        || matches!(id.as_str(), "macos" | "linux" | "windows");
+    if is_desktop {
+        return 2;
+    }
+
+    let is_web = plat.contains("web") || matches!(id.as_str(), "chrome" | "edge" | "web-server");
+    if is_web {
+        return 4;
+    }
+
+    5
+}
+
+fn pick_best_default_device<'a>(
+    project_root: &Path,
+    devices: &'a [FlutterDevice],
+) -> Option<&'a FlutterDevice> {
+    const PLATFORM_DIRS: [&str; 6] = ["macos", "ios", "android", "web", "linux", "windows"];
+    let enabled_platforms: Vec<&str> = PLATFORM_DIRS
+        .iter()
+        .copied()
+        .filter(|dir| project_root.join(dir).is_dir())
+        .collect();
+
+    let candidates: Vec<&FlutterDevice> = if enabled_platforms.is_empty() {
+        devices.iter().collect()
+    } else {
+        devices
+            .iter()
+            .filter(|dev| {
+                device_platform_dir(dev).is_some_and(|p| enabled_platforms.contains(&p))
+            })
+            .collect()
+    };
+
+    candidates
+        .into_iter()
+        .min_by_key(|dev| device_priority_tier(dev))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
