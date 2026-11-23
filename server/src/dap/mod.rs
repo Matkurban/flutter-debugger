@@ -213,7 +213,7 @@ pub async fn run_dap_proxy() -> Result<(), Box<dyn std::error::Error>> {
                 let mut reader = BufReader::new(child_stdout);
                 let mut profile_devtools_opened = false;
 
-                while let Ok(Some(child_msg)) = read_dap_message(&mut reader).await {
+                while let Ok(Some(mut child_msg)) = read_dap_message(&mut reader).await {
                     let mut suppress = false;
                     if child_msg.get("type").and_then(Value::as_str) == Some("response")
                         && let Some(rseq) = child_msg.get("request_seq").and_then(Value::as_i64)
@@ -227,16 +227,16 @@ pub async fn run_dap_proxy() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
 
-                    let (updated, profile_info) = {
+                    let (updated, profile_info, current_project_root) = {
                         let mut guard = out_state.lock().await;
                         let changed = inspect_adapter_event(&child_msg, &mut guard);
+                        let proj_root = guard.project_root.clone();
                         let info = if !profile_devtools_opened
                             && guard.mode == "profile"
                             && (guard.devtools_uri.is_some() || guard.vm_service_uri.is_some())
                         {
                             Some((
-                                guard
-                                    .project_root
+                                proj_root
                                     .clone()
                                     .unwrap_or_else(|| PathBuf::from(".")),
                                 guard.devtools_uri.clone(),
@@ -245,7 +245,7 @@ pub async fn run_dap_proxy() -> Result<(), Box<dyn std::error::Error>> {
                         } else {
                             None
                         };
-                        (changed, info)
+                        (changed, info, proj_root)
                     };
 
                     if updated {
@@ -267,6 +267,9 @@ pub async fn run_dap_proxy() -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     if !suppress {
+                        if let Some(ref root) = current_project_root {
+                            rewrite_dap_output_event(&mut child_msg, root);
+                        }
                         let mut out = out_stdout.lock().await;
                         if write_dap_message(&mut *out, &child_msg).await.is_err() {
                             break;
@@ -976,6 +979,81 @@ impl Drop for SessionCleanupGuard {
 }
 
 
+/// Rewrites DAP `output` events so `file://` and `package:` Dart locations become clickable
+/// local `path:line:col` links in Zed Debug Console, and enriches missing `body.source` metadata.
+pub fn rewrite_dap_output_event(msg: &mut Value, project_root: &Path) {
+    if msg.get("type").and_then(Value::as_str) != Some("event")
+        || msg.get("event").and_then(Value::as_str) != Some("output")
+    {
+        return;
+    }
+
+    let Some(body) = msg.get_mut("body").and_then(Value::as_object_mut) else {
+        return;
+    };
+
+    // Normalize an existing `body.source.path` if it uses `file://` or `package:`
+    if let Some(source_obj) = body.get_mut("source").and_then(Value::as_object_mut)
+        && let Some(raw_path) = source_obj
+            .get("path")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+        && (raw_path.starts_with("file://") || raw_path.starts_with("package:"))
+        && let Some(resolved) =
+            flutter_debugger_protocol::resolve_dart_uri_to_local_path(&raw_path, Some(project_root))
+    {
+        source_obj.insert("path".to_string(), json!(resolved.to_string_lossy()));
+    }
+
+    let Some(raw_output) = body
+        .get("output")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+    else {
+        return;
+    };
+
+    let (rewritten, first_loc) =
+        flutter_debugger_protocol::rewrite_dart_output_paths(&raw_output, project_root);
+    if rewritten != raw_output {
+        body.insert("output".to_string(), Value::String(rewritten));
+    }
+
+    let source_missing = body.get("source").is_none_or(Value::is_null);
+    if source_missing
+        && let Some((abs_path, line, col_opt)) = first_loc
+    {
+        let root_clean = flutter_debugger_protocol::clean_relative_segments(project_root);
+        let name = abs_path
+            .strip_prefix(&root_clean)
+            .ok()
+            .or_else(|| abs_path.strip_prefix(project_root).ok())
+            .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+            .or_else(|| {
+                abs_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+            })
+            .unwrap_or_else(|| abs_path.to_string_lossy().into_owned());
+
+        body.insert(
+            "source".to_string(),
+            json!({
+                "name": name,
+                "path": abs_path.to_string_lossy(),
+            }),
+        );
+        if body.get("line").is_none_or(Value::is_null) {
+            body.insert("line".to_string(), json!(line));
+        }
+        if let Some(col) = col_opt
+            && body.get("column").is_none_or(Value::is_null)
+        {
+            body.insert("column".to_string(), json!(col));
+        }
+    }
+}
+
 pub fn open_url_in_browser(url: &str) {
     #[cfg(target_os = "macos")]
     let _ = std::process::Command::new("open")
@@ -1006,6 +1084,101 @@ pub fn open_url_in_browser(url: &str) {
 mod tests {
     use super::*;
     use crate::ipc::{list_active_sessions, send_ipc_request};
+
+    #[test]
+    fn rewrites_dap_output_events_and_enriches_missing_source_metadata() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let proj_root = dir.path().join("my_app");
+        let dart_tool = proj_root.join(".dart_tool");
+        std::fs::create_dir_all(&dart_tool).expect("mkdir .dart_tool");
+        let pub_cache_pkg = dir.path().join("pub_cache").join("provider-6.1.0");
+        std::fs::create_dir_all(pub_cache_pkg.join("lib/src")).expect("mkdir provider");
+
+        let pkg_cfg = json!({
+            "configVersion": 2,
+            "packages": [
+                { "name": "my_app", "rootUri": "../", "packageUri": "lib/" },
+                { "name": "provider", "rootUri": format!("file://{}", pub_cache_pkg.display()), "packageUri": "lib/" }
+            ]
+        });
+        std::fs::write(
+            dart_tool.join("package_config.json"),
+            serde_json::to_vec_pretty(&pkg_cfg).expect("json"),
+        )
+        .expect("write package_config.json");
+
+        // 1. Flutter rendering error with glued `Scaffold:file:///...` and `source: null`
+        let mut msg1 = json!({
+            "seq": 10,
+            "type": "event",
+            "event": "output",
+            "body": {
+                "category": "stderr",
+                "output": format!("The relevant error-causing widget was:\n  Scaffold:file://{}/lib/home.dart:88:12\n", proj_root.display()),
+                "source": null
+            }
+        });
+        rewrite_dap_output_event(&mut msg1, &proj_root);
+        assert_eq!(
+            msg1["body"]["output"].as_str().unwrap(),
+            "The relevant error-causing widget was:\n  Scaffold (lib/home.dart:88:12)\n"
+        );
+        assert_eq!(msg1["body"]["source"]["name"], "lib/home.dart");
+        assert_eq!(
+            msg1["body"]["source"]["path"],
+            proj_root.join("lib/home.dart").to_string_lossy().as_ref()
+        );
+        assert_eq!(msg1["body"]["line"], 88);
+        assert_eq!(msg1["body"]["column"], 12);
+
+        // 2. Dart stack trace with ANSI dim escape codes and `package:my_app/...`
+        let mut msg2 = json!({
+            "seq": 11,
+            "type": "event",
+            "event": "output",
+            "body": {
+                "category": "stdout",
+                "output": "\x1b[2m#0      _HomeState.build (package:my_app/pages/home.dart:42:5)\x1b[0m\n"
+            }
+        });
+        rewrite_dap_output_event(&mut msg2, &proj_root);
+        assert_eq!(
+            msg2["body"]["output"].as_str().unwrap(),
+            "\x1b[2m#0      _HomeState.build (lib/pages/home.dart:42:5)\x1b[0m\n"
+        );
+        assert_eq!(msg2["body"]["source"]["name"], "lib/pages/home.dart");
+        assert_eq!(msg2["body"]["line"], 42);
+        assert_eq!(msg2["body"]["column"], 5);
+
+        // 3. Third-party pub package `package:provider/...` + existing `file://` source.path normalization
+        let mut msg3 = json!({
+            "seq": 12,
+            "type": "event",
+            "event": "output",
+            "body": {
+                "category": "stdout",
+                "output": "#1      Provider.of (package:provider/src/provider.dart:19:7) see https://pub.dev/packages/provider\n",
+                "source": {
+                    "name": "package:provider/src/provider.dart",
+                    "path": format!("file://{}/lib/src/provider.dart", pub_cache_pkg.display())
+                }
+            }
+        });
+        rewrite_dap_output_event(&mut msg3, &proj_root);
+        let out3 = msg3["body"]["output"].as_str().unwrap();
+        assert!(out3.contains(&format!(
+            "({}:19:7)",
+            pub_cache_pkg.join("lib/src/provider.dart").display()
+        )));
+        assert!(out3.contains("https://pub.dev/packages/provider"));
+        assert_eq!(
+            msg3["body"]["source"]["path"],
+            pub_cache_pkg
+                .join("lib/src/provider.dart")
+                .to_string_lossy()
+                .as_ref()
+        );
+    }
 
     #[tokio::test]
     async fn stop_ipc_removes_session_record_before_returning_ok_response() {

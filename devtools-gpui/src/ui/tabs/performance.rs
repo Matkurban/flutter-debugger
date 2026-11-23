@@ -8,6 +8,7 @@ use gpui_kit::{
     component::{
         Icon, Selectable as _, Sizable as _,
         button::Button,
+        scroll::ScrollableElement as _,
     },
     div,
     prelude::FluentBuilder as _,
@@ -214,6 +215,8 @@ impl RootView {
             )
             .child(
                 div()
+                    .id("performance-main-scroll")
+                    .relative()
                     .flex_1()
                     .min_h_0()
                     .w_full()
@@ -221,6 +224,7 @@ impl RootView {
                     .flex()
                     .flex_col()
                     .gap_4()
+                    .overflow_y_scrollbar()
                     .child(
                         div()
                             .w_full()

@@ -59,6 +59,20 @@ fn main() {
         .run(move |cx| {
             gpui_kit::init(cx);
             Theme::change(ThemeMode::Dark, None, cx);
+            Theme::set_scrollbar_mode(
+                gpui_kit::component::scroll::ScrollbarMode::Always,
+                cx,
+            );
+            Theme::update(cx, |theme| {
+                theme.scrollbar =
+                    theme::DevToolsTheme::to_hsla(theme::DevToolsTheme::bg_toolbar(), 0.78);
+                theme.tokens.scrollbar_thumb =
+                    theme::DevToolsTheme::to_hsla(theme::DevToolsTheme::text_secondary(), 0.62)
+                        .into();
+                theme.tokens.scrollbar_thumb_hover =
+                    theme::DevToolsTheme::to_hsla(theme::DevToolsTheme::accent_blue(), 0.90)
+                        .into();
+            });
 
             cx.bind_keys([
                 KeyBinding::new("cmd-1", SwitchTabInspector, None),

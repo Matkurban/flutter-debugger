@@ -1,5 +1,8 @@
+pub mod layout_explorer;
 pub mod properties;
 pub mod tree;
+
+use std::collections::HashSet;
 
 use flutter_debugger_protocol::ServiceOverlay;
 use gpui_kit::{
@@ -16,13 +19,39 @@ use gpui_kit::{
 };
 
 use crate::backend::BackendCommand;
-use crate::protocol::{SourceLocation, WidgetProperty, WidgetTreeNode};
+use crate::protocol::{LayoutExplorerNode, SourceLocation, WidgetProperty, WidgetTreeNode};
 use crate::theme::DevToolsTheme;
 use crate::ui::app::RootView;
 use crate::ui::components::subtoolbar_container;
 
 use properties::render_widget_properties_pane;
 use tree::render_widget_tree_list;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InspectorDetailSubTab {
+    #[default]
+    LayoutExplorer,
+    Properties,
+    DetailsTree,
+}
+
+impl InspectorDetailSubTab {
+    pub const fn all() -> [Self; 3] {
+        [
+            Self::LayoutExplorer,
+            Self::Properties,
+            Self::DetailsTree,
+        ]
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::LayoutExplorer => "Layout Explorer",
+            Self::Properties => "Properties",
+            Self::DetailsTree => "Details Tree",
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct FlatWidgetRow {
@@ -40,6 +69,12 @@ pub struct InspectorTabState {
     pub root: Option<WidgetTreeNode>,
     pub selected_value_id: Option<String>,
     pub selected_properties: Vec<WidgetProperty>,
+    pub selected_layout_node: Option<LayoutExplorerNode>,
+    pub selected_details_subtree: Option<WidgetTreeNode>,
+    pub collapsed_details_ids: HashSet<String>,
+    pub detail_sub_tab: InspectorDetailSubTab,
+    pub show_implementation_widgets: bool,
+    pub show_all_properties: bool,
     pub auto_jump_to_source: bool,
     pub search_input: Entity<InputState>,
     pub search_query: String,
@@ -53,6 +88,12 @@ impl InspectorTabState {
             root: None,
             selected_value_id: None,
             selected_properties: Vec::new(),
+            selected_layout_node: None,
+            selected_details_subtree: None,
+            collapsed_details_ids: HashSet::new(),
+            detail_sub_tab: InspectorDetailSubTab::LayoutExplorer,
+            show_implementation_widgets: false,
+            show_all_properties: false,
             auto_jump_to_source: true,
             search_input,
             search_query: String::new(),
@@ -76,13 +117,17 @@ impl InspectorTabState {
             .map(|n| (n.value_id.clone(), n.properties.clone()));
 
         let chosen_id = if let Some((id, props)) = keep_existing {
-            if !props.is_empty() { self.selected_properties = props; }
+            if !props.is_empty() {
+                self.selected_properties = props;
+            }
             self.root = Some(root);
             Some(id)
         } else {
             let id = root.value_id.clone();
             self.selected_value_id = Some(id.clone());
             self.selected_properties = root.properties.clone();
+            self.selected_layout_node = None;
+            self.selected_details_subtree = None;
             self.root = Some(root);
             Some(id)
         };
@@ -92,7 +137,9 @@ impl InspectorTabState {
 
     pub fn apply_children(&mut self, parent_value_id: &str, children: Vec<WidgetTreeNode>) {
         let mut children_opt = Some(children);
-        if let Some(ref mut root) = self.root && attach_children_mut(root, parent_value_id, &mut children_opt) {
+        if let Some(ref mut root) = self.root
+            && attach_children_mut(root, parent_value_id, &mut children_opt)
+        {
             self.rebuild_flat_rows();
         }
     }
@@ -102,11 +149,13 @@ impl InspectorTabState {
         tree: Option<WidgetTreeNode>,
         selected_node: WidgetTreeNode,
         properties: Vec<WidgetProperty>,
+        layout_node: Option<LayoutExplorerNode>,
+        details_subtree: Option<WidgetTreeNode>,
     ) {
         let target_id = selected_node.value_id.clone();
         if let Some(mut new_root) = tree {
             if let Some(ref old_root) = self.root {
-                let mut expanded_ids = std::collections::HashSet::new();
+                let mut expanded_ids = HashSet::new();
                 collect_expanded_ids(old_root, &mut expanded_ids);
                 restore_expanded_ids_mut(&mut new_root, &expanded_ids);
             }
@@ -118,26 +167,86 @@ impl InspectorTabState {
             self.root = Some(selected_node.clone());
         }
         self.selected_value_id = Some(target_id.clone());
-        self.selected_properties = if !properties.is_empty() { properties } else { selected_node.properties };
+        self.selected_properties = if !properties.is_empty() {
+            properties
+        } else {
+            selected_node.properties
+        };
+        self.selected_layout_node = layout_node;
+        self.selected_details_subtree = details_subtree;
+        self.collapsed_details_ids.clear();
         self.rebuild_flat_rows();
         if let Some(idx) = self.flat_rows.iter().position(|r| r.value_id == target_id) {
-            self.scroll_handle.scroll_to_item(idx, gpui_kit::ScrollStrategy::Center);
+            self.scroll_handle
+                .scroll_to_item(idx, gpui_kit::ScrollStrategy::Center);
         }
     }
 
-    pub fn apply_properties(&mut self, value_id: &str, props: Vec<WidgetProperty>) {
-        if self.selected_value_id.as_deref() == Some(value_id) && !props.is_empty() {
-            self.selected_properties = props;
+    pub fn apply_properties(
+        &mut self,
+        value_id: &str,
+        props: Vec<WidgetProperty>,
+        layout_node: Option<LayoutExplorerNode>,
+        details_subtree: Option<WidgetTreeNode>,
+    ) {
+        if self.selected_value_id.as_deref() == Some(value_id) {
+            if !props.is_empty() {
+                self.selected_properties = props;
+            }
+            if layout_node.is_some() {
+                self.selected_layout_node = layout_node;
+            }
+            if details_subtree.is_some() {
+                self.selected_details_subtree = details_subtree;
+            }
+        }
+    }
+
+    pub fn apply_layout_update(&mut self, value_id: &str, layout_node: LayoutExplorerNode) {
+        if self.selected_value_id.as_deref() == Some(value_id) {
+            self.selected_layout_node = Some(layout_node);
         }
     }
 
     pub fn select_node(&mut self, value_id: &str) -> Option<SourceLocation> {
+        let changed = self.selected_value_id.as_deref() != Some(value_id);
         self.selected_value_id = Some(value_id.to_string());
-        if let Some(ref root) = self.root && let Some(node) = find_node_by_id(root, value_id) {
+        if changed {
+            self.selected_layout_node = None;
+            self.selected_details_subtree = None;
+            self.collapsed_details_ids.clear();
+        }
+        if let Some(ref root) = self.root
+            && let Some(node) = find_node_by_id(root, value_id)
+        {
             self.selected_properties = node.properties.clone();
             return node.location.clone();
         }
         None
+    }
+
+    pub fn find_node(&self, value_id: &str) -> Option<&WidgetTreeNode> {
+        find_node_by_id(self.root.as_ref()?, value_id)
+    }
+
+    pub fn selected_ancestor_breadcrumbs(&self) -> Vec<(String, String)> {
+        let (Some(root), Some(target_id)) = (self.root.as_ref(), self.selected_value_id.as_deref())
+        else {
+            return Vec::new();
+        };
+        let mut chain: Vec<&WidgetTreeNode> = Vec::new();
+        if collect_ancestor_chain(root, target_id, &mut chain) {
+            let mut out: Vec<(String, String)> = chain
+                .into_iter()
+                .map(|n| (n.value_id.clone(), n.widget_runtime_type.clone()))
+                .collect();
+            if let Some(sel) = find_node_by_id(root, target_id) {
+                out.push((sel.value_id.clone(), sel.widget_runtime_type.clone()));
+            }
+            out
+        } else {
+            Vec::new()
+        }
     }
 
     pub fn toggle_expand(&mut self, value_id: &str) -> bool {
@@ -205,7 +314,9 @@ impl InspectorTabState {
     }
 
     pub fn flattened_count(&self) -> usize {
-        fn count_nodes(n: &WidgetTreeNode) -> usize { 1 + n.children.iter().map(count_nodes).sum::<usize>() }
+        fn count_nodes(n: &WidgetTreeNode) -> usize {
+            1 + n.children.iter().map(count_nodes).sum::<usize>()
+        }
         self.root.as_ref().map_or(0, count_nodes)
     }
 
@@ -218,8 +329,12 @@ impl InspectorTabState {
 }
 
 fn find_node_by_id<'a>(node: &'a WidgetTreeNode, value_id: &str) -> Option<&'a WidgetTreeNode> {
-    if node.value_id == value_id { return Some(node); }
-    node.children.iter().find_map(|c| find_node_by_id(c, value_id))
+    if node.value_id == value_id {
+        return Some(node);
+    }
+    node.children
+        .iter()
+        .find_map(|c| find_node_by_id(c, value_id))
 }
 
 fn collect_ancestor_chain<'a>(
@@ -240,28 +355,44 @@ fn collect_ancestor_chain<'a>(
     false
 }
 
-fn collect_expanded_ids(node: &WidgetTreeNode, out: &mut std::collections::HashSet<String>) {
-    if node.expanded && !node.value_id.is_empty() { out.insert(node.value_id.clone()); }
-    for child in &node.children { collect_expanded_ids(child, out); }
+fn collect_expanded_ids(node: &WidgetTreeNode, out: &mut HashSet<String>) {
+    if node.expanded && !node.value_id.is_empty() {
+        out.insert(node.value_id.clone());
+    }
+    for child in &node.children {
+        collect_expanded_ids(child, out);
+    }
 }
 
-fn restore_expanded_ids_mut(node: &mut WidgetTreeNode, expanded_ids: &std::collections::HashSet<String>) {
-    if expanded_ids.contains(&node.value_id) { node.expanded = true; }
-    for child in &mut node.children { restore_expanded_ids_mut(child, expanded_ids); }
+fn restore_expanded_ids_mut(node: &mut WidgetTreeNode, expanded_ids: &HashSet<String>) {
+    if expanded_ids.contains(&node.value_id) {
+        node.expanded = true;
+    }
+    for child in &mut node.children {
+        restore_expanded_ids_mut(child, expanded_ids);
+    }
 }
 
-fn attach_children_mut(node: &mut WidgetTreeNode, parent_id: &str, children: &mut Option<Vec<WidgetTreeNode>>) -> bool {
+fn attach_children_mut(
+    node: &mut WidgetTreeNode,
+    parent_id: &str,
+    children: &mut Option<Vec<WidgetTreeNode>>,
+) -> bool {
     if node.value_id == parent_id {
         node.children = children.take().unwrap_or_default();
         node.has_children = !node.children.is_empty();
         node.expanded = true;
         return true;
     }
-    node.children.iter_mut().any(|c| attach_children_mut(c, parent_id, children))
+    node.children
+        .iter_mut()
+        .any(|c| attach_children_mut(c, parent_id, children))
 }
 
 fn expand_path_to_node_mut(node: &mut WidgetTreeNode, target_id: &str) -> bool {
-    if node.value_id == target_id { return true; }
+    if node.value_id == target_id {
+        return true;
+    }
     for child in &mut node.children {
         if expand_path_to_node_mut(child, target_id) {
             node.expanded = true;
@@ -271,26 +402,44 @@ fn expand_path_to_node_mut(node: &mut WidgetTreeNode, target_id: &str) -> bool {
     false
 }
 
-fn toggle_node_expand_mut(node: &mut WidgetTreeNode, value_id: &str, needs_lazy_load: &mut bool) -> bool {
+fn toggle_node_expand_mut(
+    node: &mut WidgetTreeNode,
+    value_id: &str,
+    needs_lazy_load: &mut bool,
+) -> bool {
     if node.value_id == value_id {
         node.expanded = !node.expanded;
-        if node.expanded && node.has_children && node.children.is_empty() { *needs_lazy_load = true; }
+        if node.expanded && node.has_children && node.children.is_empty() {
+            *needs_lazy_load = true;
+        }
         return true;
     }
-    node.children.iter_mut().any(|c| toggle_node_expand_mut(c, value_id, needs_lazy_load))
+    node.children
+        .iter_mut()
+        .any(|c| toggle_node_expand_mut(c, value_id, needs_lazy_load))
 }
 
 fn set_all_expanded_mut(node: &mut WidgetTreeNode, expanded: bool) {
     node.expanded = expanded;
-    for child in &mut node.children { set_all_expanded_mut(child, expanded); }
+    for child in &mut node.children {
+        set_all_expanded_mut(child, expanded);
+    }
 }
 
 fn node_or_descendant_matches(node: &WidgetTreeNode, q: &str) -> bool {
-    if q.is_empty() { return true; }
+    if q.is_empty() {
+        return true;
+    }
     node.widget_runtime_type.to_ascii_lowercase().contains(q)
         || node.description.to_ascii_lowercase().contains(q)
-        || node.location.as_ref().is_some_and(|l| l.uri.to_ascii_lowercase().contains(q))
-        || node.children.iter().any(|c| node_or_descendant_matches(c, q))
+        || node
+            .location
+            .as_ref()
+            .is_some_and(|l| l.uri.to_ascii_lowercase().contains(q))
+        || node
+            .children
+            .iter()
+            .any(|c| node_or_descendant_matches(c, q))
 }
 
 fn flatten_node_rec(
@@ -330,6 +479,7 @@ impl RootView {
         let total_count = self.inspector.flattened_count();
         let select_mode_on = self.overlays.inspector;
         let auto_jump_on = self.inspector.auto_jump_to_source;
+        let show_impl_on = self.inspector.show_implementation_widgets;
         let selected_loc = self
             .inspector
             .selected_node()
@@ -353,9 +503,32 @@ impl RootView {
                                     .compact()
                                     .icon(Icon::new(IconName::RefreshCw))
                                     .label("Refresh Tree")
-                                    .tooltip("Fetch latest Flutter Widget Summary Tree")
+                                    .tooltip("Fetch latest Flutter Widget Tree")
                                     .on_click(cx.listener(|this, _, _, _| {
                                         this.send_cmd(BackendCommand::RefreshWidgetTree);
+                                    })),
+                            )
+                            .child(
+                                Button::new("insp-impl-widgets-btn")
+                                    .small()
+                                    .compact()
+                                    .selected(show_impl_on)
+                                    .icon(Icon::new(if show_impl_on {
+                                        IconName::Eye
+                                    } else {
+                                        IconName::EyeOff
+                                    }))
+                                    .label("Impl Widgets")
+                                    .tooltip("Toggle showing framework implementation widgets (Summary vs Full Widget Tree)")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.inspector.show_implementation_widgets =
+                                            !this.inspector.show_implementation_widgets;
+                                        this.send_cmd(
+                                            BackendCommand::SetShowImplementationWidgets(
+                                                this.inspector.show_implementation_widgets,
+                                            ),
+                                        );
+                                        cx.notify();
                                     })),
                             )
                             .child(
@@ -385,7 +558,7 @@ impl RootView {
                                     } else {
                                         "Auto-Jump: OFF"
                                     })
-                                    .tooltip("Automatically jump to Zed source location when a widget is selected on device")
+                                    .tooltip("Automatically jump to Zed source location ONLY when picking a widget on device while Select Widget mode is ON")
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.inspector.auto_jump_to_source =
                                             !this.inspector.auto_jump_to_source;
@@ -393,7 +566,7 @@ impl RootView {
                                     })),
                             )
                             .child(
-                                div().w(px(240.0)).child(
+                                div().w(px(220.0)).child(
                                     Input::new(&self.inspector.search_input)
                                         .id("insp-search-input")
                                         .small()
@@ -464,7 +637,7 @@ impl RootView {
                     h_resizable("inspector-split-pane")
                         .child(
                             resizable_panel()
-                                .size(px(640.0))
+                                .size(px(580.0))
                                 .size_range(px(320.0)..px(1050.0))
                                 .child(render_widget_tree_list(self, cx)),
                         )
@@ -489,7 +662,8 @@ mod tests {
                     "children": [{ "valueId": "inspector-btn", "widgetRuntimeType": "FilledButton", "description": "FilledButton" }]
                 }]
             }
-        })).unwrap();
+        }))
+        .unwrap();
         set_all_expanded_mut(&mut tree, false);
         assert!(expand_path_to_node_mut(&mut tree, "inspector-btn"));
         assert!(tree.expanded && tree.children[0].expanded);

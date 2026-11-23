@@ -12,9 +12,10 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::backend::error::DevToolsError;
 use crate::protocol::{
-    FrameTiming, HttpRequestDetail, HttpRequestRecord, LogEntry, LogKind, MemorySnapshot,
-    ParsedLogRecord, WidgetProperty, WidgetTreeNode, build_pub_root_directories_params,
-    parse_process_memory_rss, parse_widget_children_from_json, parse_widget_properties,
+    FrameTiming, HttpRequestDetail, HttpRequestRecord, LayoutExplorerNode, LogEntry, LogKind,
+    MemorySnapshot, ParsedLogRecord, WebSocketConnectionDetail, WidgetProperty, WidgetTreeNode,
+    build_pub_root_directories_params, parse_process_memory_rss, parse_widget_children_from_json,
+    parse_widget_properties,
 };
 
 #[derive(Debug, Clone)]
@@ -357,6 +358,112 @@ impl DartVmClient {
         }
     }
 
+    pub async fn poll_websocket_profile(
+        &self,
+        updated_since: Option<u64>,
+    ) -> Result<(u64, Vec<HttpRequestRecord>), DevToolsError> {
+        if !self
+            .has_extension_rpc("ext.dart.io.getWebSocketProfile")
+            .await
+        {
+            return Ok((0, Vec::new()));
+        }
+        let mut params = json!({});
+        if let Some(ts) = updated_since {
+            params["updatedSince"] = json!(ts.to_string());
+        }
+
+        let mut max_timestamp = 0u64;
+        let mut all_connections = Vec::new();
+        let mut any_ok = false;
+
+        for iso_id in self.candidate_isolate_ids(None).await {
+            if let Ok(resp) = self
+                .call_specific_isolate(&iso_id, "ext.dart.io.getWebSocketProfile", params.clone())
+                .await
+            {
+                any_ok = true;
+                let root = resp.get("result").filter(|r| r.is_object()).unwrap_or(&resp);
+                let ts = root
+                    .get("timestamp")
+                    .and_then(|v| {
+                        v.as_u64()
+                            .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+                    })
+                    .unwrap_or(0);
+                max_timestamp = max_timestamp.max(ts);
+
+                let arr = root
+                    .get("connections")
+                    .or_else(|| root.get("sockets"))
+                    .or_else(|| root.get("webSockets"))
+                    .or_else(|| root.get("requests"))
+                    .and_then(Value::as_array);
+                if let Some(entries) = arr {
+                    for entry in entries {
+                        if let Some(mut rec) =
+                            HttpRequestRecord::parse_from_websocket_profile_entry(entry)
+                        {
+                            if rec.isolate_id.is_none() {
+                                rec.isolate_id = Some(iso_id.clone());
+                            }
+                            all_connections.push(rec);
+                        }
+                    }
+                }
+            }
+        }
+
+        if !any_ok {
+            return Ok((0, Vec::new()));
+        }
+        Ok((max_timestamp, all_connections))
+    }
+
+    pub async fn get_websocket_connection(
+        &self,
+        id: &str,
+        preferred_isolate_id: Option<&str>,
+    ) -> Result<WebSocketConnectionDetail, DevToolsError> {
+        let raw_id = id.strip_prefix("ws:").unwrap_or(id);
+        let params = json!({ "id": raw_id });
+        let candidates = self.candidate_isolate_ids(preferred_isolate_id).await;
+        let mut last_err = None;
+
+        for iso_id in candidates {
+            match self
+                .call_specific_isolate(
+                    &iso_id,
+                    "ext.dart.io.getWebSocketConnection",
+                    params.clone(),
+                )
+                .await
+            {
+                Ok(resp) => return Ok(HttpRequestRecord::parse_websocket_detail_from_response(&resp)),
+                Err(err) => last_err = Some(err),
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| DevToolsError::Rpc {
+            method: "ext.dart.io.getWebSocketConnection".into(),
+            message: format!("Unable to find WebSocket connection `{raw_id}` in any active isolate"),
+        }))
+    }
+
+    pub async fn clear_websocket_profile(&self) {
+        if !self
+            .has_extension_rpc("ext.dart.io.clearWebSocketProfile")
+            .await
+        {
+            return;
+        }
+        for iso_id in self.candidate_isolate_ids(None).await {
+            let _ = self
+                .call_specific_isolate(&iso_id, "ext.dart.io.clearWebSocketProfile", json!({}))
+                .await;
+        }
+    }
+
     pub async fn set_pub_root_directories(&self, project_root: &Path) {
         let params = build_pub_root_directories_params(project_root);
         if self
@@ -376,18 +483,156 @@ impl DartVmClient {
         }
     }
 
-    pub async fn fetch_widget_summary_tree(&self, group_name: &str) -> Result<WidgetTreeNode, DevToolsError> {
-        let params = json!({ "groupName": group_name, "isSummaryTree": "true", "withPreviews": "true", "fullDetails": "false" });
-        let resp = match self.call_isolate("ext.flutter.inspector.getRootWidgetTree", params).await {
+    pub async fn fetch_widget_summary_tree(
+        &self,
+        group_name: &str,
+        is_summary_tree: bool,
+    ) -> Result<WidgetTreeNode, DevToolsError> {
+        let is_summary_str = if is_summary_tree { "true" } else { "false" };
+        let params = json!({
+            "groupName": group_name,
+            "isSummaryTree": is_summary_str,
+            "withPreviews": "true",
+            "fullDetails": "false"
+        });
+        let resp = match self
+            .call_isolate("ext.flutter.inspector.getRootWidgetTree", params)
+            .await
+        {
             Ok(v) if !v.get("result").unwrap_or(&Value::Null).is_null() => v,
-            _ => self.call_isolate("ext.flutter.inspector.getRootWidgetSummaryTree", json!({ "objectGroup": group_name })).await?,
+            _ => {
+                let fallback_method = if is_summary_tree {
+                    "ext.flutter.inspector.getRootWidgetSummaryTree"
+                } else {
+                    "ext.flutter.inspector.getRootWidget"
+                };
+                self.call_isolate(fallback_method, json!({ "objectGroup": group_name }))
+                    .await?
+            }
         };
-        WidgetTreeNode::parse_from_json(&resp).ok_or_else(|| DevToolsError::Protocol("Inspector returned empty widget tree".into()))
+        WidgetTreeNode::parse_from_json(&resp)
+            .ok_or_else(|| DevToolsError::Protocol("Inspector returned empty widget tree".into()))
     }
 
-    pub async fn fetch_widget_children(&self, value_id: &str, group_name: &str) -> Result<Vec<WidgetTreeNode>, DevToolsError> {
-        let resp = self.call_isolate("ext.flutter.inspector.getChildrenSummaryTree", json!({ "arg": value_id, "objectGroup": group_name })).await?;
+    pub async fn fetch_widget_children(
+        &self,
+        value_id: &str,
+        group_name: &str,
+        is_summary_tree: bool,
+    ) -> Result<Vec<WidgetTreeNode>, DevToolsError> {
+        let method = if is_summary_tree {
+            "ext.flutter.inspector.getChildrenSummaryTree"
+        } else {
+            "ext.flutter.inspector.getChildrenDetailsSubtree"
+        };
+        let resp = match self
+            .call_isolate(method, json!({ "arg": value_id, "objectGroup": group_name }))
+            .await
+        {
+            Ok(v) => v,
+            Err(_) => {
+                self.call_isolate(
+                    "ext.flutter.inspector.getChildrenSummaryTree",
+                    json!({ "arg": value_id, "objectGroup": group_name }),
+                )
+                .await?
+            }
+        };
         Ok(parse_widget_children_from_json(&resp))
+    }
+
+    pub async fn fetch_layout_explorer_node(
+        &self,
+        value_id: &str,
+        group_name: &str,
+    ) -> Result<LayoutExplorerNode, DevToolsError> {
+        if value_id.is_empty() {
+            return Err(DevToolsError::Protocol("Empty widget valueId".into()));
+        }
+        let resp = self
+            .call_isolate(
+                "ext.flutter.inspector.getLayoutExplorerNode",
+                json!({
+                    "id": value_id,
+                    "arg": value_id,
+                    "groupName": group_name,
+                    "objectGroup": group_name,
+                    "subtreeDepth": "1"
+                }),
+            )
+            .await?;
+        LayoutExplorerNode::parse_from_json(&resp).ok_or_else(|| {
+            DevToolsError::Protocol("Failed to parse LayoutExplorerNode response".into())
+        })
+    }
+
+    pub async fn fetch_details_subtree(
+        &self,
+        value_id: &str,
+        group_name: &str,
+    ) -> Result<WidgetTreeNode, DevToolsError> {
+        if value_id.is_empty() {
+            return Err(DevToolsError::Protocol("Empty widget valueId".into()));
+        }
+        let resp = self
+            .call_isolate(
+                "ext.flutter.inspector.getDetailsSubtree",
+                json!({
+                    "arg": value_id,
+                    "objectGroup": group_name,
+                    "subtreeDepth": "2"
+                }),
+            )
+            .await?;
+        WidgetTreeNode::parse_from_json(&resp).ok_or_else(|| {
+            DevToolsError::Protocol("Failed to parse getDetailsSubtree response".into())
+        })
+    }
+
+    pub async fn set_flex_properties(
+        &self,
+        value_id: &str,
+        main_axis_alignment: &str,
+        cross_axis_alignment: &str,
+    ) -> Result<(), DevToolsError> {
+        self.call_isolate(
+            "ext.flutter.inspector.setFlexProperties",
+            json!({
+                "id": value_id,
+                "mainAxisAlignment": main_axis_alignment,
+                "crossAxisAlignment": cross_axis_alignment
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn set_flex_fit(&self, value_id: &str, flex_fit: &str) -> Result<(), DevToolsError> {
+        self.call_isolate(
+            "ext.flutter.inspector.setFlexFit",
+            json!({
+                "id": value_id,
+                "flexFit": flex_fit
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn set_flex_factor(
+        &self,
+        value_id: &str,
+        flex_factor: u32,
+    ) -> Result<(), DevToolsError> {
+        self.call_isolate(
+            "ext.flutter.inspector.setFlexFactor",
+            json!({
+                "id": value_id,
+                "flexFactor": flex_factor.to_string()
+            }),
+        )
+        .await?;
+        Ok(())
     }
 
     pub async fn set_widget_selection_by_id(&self, value_id: &str, group_name: &str) {

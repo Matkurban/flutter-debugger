@@ -3,7 +3,47 @@ use std::io::Read as _;
 use flate2::read::{DeflateDecoder, GzDecoder, ZlibDecoder};
 use serde_json::Value;
 
-use crate::theme::{format_bytes, format_duration_ms, format_micros_local_hms};
+use crate::theme::{DevToolsTheme, format_bytes, format_duration_ms, format_micros_local_hms};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NetworkProtocolKind {
+    #[default]
+    Http,
+    WebSocket,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebSocketEventRecord {
+    pub timestamp_micros: u64,
+    pub timestamp_hms: String,
+    pub event_name: String,
+    pub frame_number: Option<u64>,
+    pub direction: Option<String>,
+    pub opcode: Option<String>,
+    pub payload_size: Option<u64>,
+    pub error_type: Option<String>,
+    pub error_message: Option<String>,
+    pub arguments_json: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WebSocketConnectionDetail {
+    pub state: String,
+    pub protocol: Option<String>,
+    pub connect_timestamp: u64,
+    pub open_timestamp: Option<u64>,
+    pub close_timestamp: Option<u64>,
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
+    pub frames_sent: u64,
+    pub frames_received: u64,
+    pub ping_count: u64,
+    pub pong_count: u64,
+    pub close_code: Option<u16>,
+    pub close_reason: Option<String>,
+    pub error: Option<String>,
+    pub events: Vec<WebSocketEventRecord>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpTimingEvent {
@@ -25,6 +65,7 @@ pub struct HttpRequestDetail {
 pub struct HttpRequestRecord {
     pub id: String,
     pub isolate_id: Option<String>,
+    pub protocol_kind: NetworkProtocolKind,
     pub method: String,
     pub uri: String,
     pub path_and_query: String,
@@ -43,20 +84,349 @@ pub struct HttpRequestRecord {
     pub error: Option<String>,
     pub events: Vec<HttpTimingEvent>,
     pub detail: Option<HttpRequestDetail>,
-    /// `true` only after `ext.dart.io.getHttpProfileRequest` (or explicit non-null `requestBody`/`responseBody`)
-    /// has been fetched, distinguishing summary headers from full body payloads.
+    pub ws_detail: Option<WebSocketConnectionDetail>,
+    /// `true` only after `ext.dart.io.getHttpProfileRequest` or `ext.dart.io.getWebSocketConnection`
+    /// has been fetched, distinguishing summary entries from full payloads.
     pub body_loaded: bool,
-    /// `true` only when `response.endTime` is present or an error occurred.
+    /// `true` only when `response.endTime` / `closeTimestamp` is present or an error occurred.
     pub response_complete: bool,
 }
 
 impl HttpRequestRecord {
+    pub fn is_websocket(&self) -> bool {
+        self.protocol_kind == NetworkProtocolKind::WebSocket
+    }
+
+    pub fn raw_ws_id(&self) -> &str {
+        self.id.strip_prefix("ws:").unwrap_or(&self.id)
+    }
+
     pub fn total_bytes(&self) -> u64 {
-        if self.response_bytes > 0 { self.response_bytes } else { self.request_bytes }
+        if self.is_websocket() {
+            self.request_bytes + self.response_bytes
+        } else if self.response_bytes > 0 {
+            self.response_bytes
+        } else {
+            self.request_bytes
+        }
     }
 
     pub fn is_pending(&self) -> bool {
-        self.end_time_micros.is_none() && self.error.is_none() && self.status_code.is_none()
+        if self.is_websocket() {
+            let state = self
+                .ws_detail
+                .as_ref()
+                .map(|d| d.state.as_str())
+                .or(self.reason_phrase.as_deref())
+                .unwrap_or("");
+            matches!(
+                state.to_ascii_lowercase().as_str(),
+                "connecting" | "open" | "closing"
+            )
+        } else {
+            self.end_time_micros.is_none() && self.error.is_none() && self.status_code.is_none()
+        }
+    }
+
+    pub fn status_badge_label_and_color(&self) -> (String, gpui_kit::Rgba) {
+        if self.is_websocket() {
+            let state = self
+                .ws_detail
+                .as_ref()
+                .map(|d| d.state.as_str())
+                .or(self.reason_phrase.as_deref())
+                .unwrap_or("open")
+                .to_ascii_lowercase();
+            if self.error.is_some() || state == "error" {
+                ("ERR".to_string(), DevToolsTheme::error_red())
+            } else if state == "open" {
+                ("OPEN".to_string(), DevToolsTheme::success_green())
+            } else if state == "connecting" || state == "closing" {
+                ("CONN".to_string(), DevToolsTheme::warning_yellow())
+            } else {
+                let code_label = self
+                    .ws_detail
+                    .as_ref()
+                    .and_then(|d| d.close_code)
+                    .or(self.status_code)
+                    .map_or_else(|| "CLOSED".to_string(), |c| c.to_string());
+                (code_label, DevToolsTheme::text_secondary())
+            }
+        } else {
+            let label = match self.status_code {
+                Some(code) => code.to_string(),
+                None if self.error.is_some() => "ERR".to_string(),
+                None => "...".to_string(),
+            };
+            let color = if self.error.is_some() && self.status_code.is_none() {
+                DevToolsTheme::error_red()
+            } else {
+                DevToolsTheme::status_color(self.status_code)
+            };
+            (label, color)
+        }
+    }
+
+    pub fn duration_display(&self) -> String {
+        if self.is_websocket() {
+            let state = self
+                .ws_detail
+                .as_ref()
+                .map(|d| d.state.as_str())
+                .or(self.reason_phrase.as_deref())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if state == "open" || state == "connecting" {
+                if let Some(ms) = self.duration_ms.filter(|&m| m > 0) {
+                    return format_duration_ms(Some(ms));
+                }
+                return "Live".to_string();
+            }
+        }
+        format_duration_ms(self.duration_ms)
+    }
+
+    /// Parses an entry from `ext.dart.io.getWebSocketProfile` or `ext.dart.io.getWebSocketConnection`.
+    pub fn parse_from_websocket_profile_entry(raw_v: &Value) -> Option<Self> {
+        let v = raw_v
+            .get("result")
+            .filter(|r| r.is_object())
+            .unwrap_or(raw_v);
+        let raw_id = match v.get("id") {
+            Some(Value::String(s)) => s.clone(),
+            Some(Value::Number(n)) => n.to_string(),
+            _ => return None,
+        };
+        let id = if raw_id.starts_with("ws:") {
+            raw_id
+        } else {
+            format!("ws:{raw_id}")
+        };
+        let isolate_id = v
+            .get("isolateId")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned);
+
+        let uri = v
+            .get("url")
+            .or_else(|| v.get("uri"))
+            .and_then(Value::as_str)?
+            .to_string();
+        let (host, path_and_query) = split_uri_host_and_path(&uri);
+        let mime_short = if uri.to_ascii_lowercase().starts_with("wss://") {
+            "wss".to_string()
+        } else {
+            "ws".to_string()
+        };
+
+        let ws_detail = Self::parse_websocket_detail_from_response(v);
+        let start_time_micros = ws_detail.connect_timestamp;
+        let end_time_micros = ws_detail.close_timestamp;
+        let duration_ms = end_time_micros
+            .or_else(|| ws_detail.events.last().map(|e| e.timestamp_micros))
+            .or(ws_detail.open_timestamp)
+            .and_then(|end| end.checked_sub(start_time_micros))
+            .map(|us| us / 1000);
+
+        let state_lower = ws_detail.state.to_ascii_lowercase();
+        let response_complete = matches!(state_lower.as_str(), "closed" | "error")
+            || ws_detail.close_timestamp.is_some()
+            || ws_detail.error.is_some();
+        let has_events_array = v.get("events").is_some_and(Value::is_array);
+        let is_full_type = v
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|t| t == "WebSocketConnection" || t == "WebSocketProfileConnection");
+        let body_loaded = has_events_array || is_full_type;
+
+        let status_code = ws_detail.close_code.or(if state_lower == "open" {
+            Some(101)
+        } else {
+            None
+        });
+
+        Some(Self {
+            id,
+            isolate_id,
+            protocol_kind: NetworkProtocolKind::WebSocket,
+            method: "WS".to_string(),
+            uri,
+            path_and_query,
+            host,
+            status_code,
+            reason_phrase: Some(ws_detail.state.to_ascii_uppercase()),
+            content_type: ws_detail.protocol.clone(),
+            mime_short,
+            start_time_micros,
+            end_time_micros,
+            duration_ms,
+            request_bytes: ws_detail.bytes_sent,
+            response_bytes: ws_detail.bytes_received,
+            timestamp_hms: format_micros_local_hms(start_time_micros),
+            is_json: false,
+            error: ws_detail.error.clone(),
+            events: Vec::new(),
+            detail: None,
+            ws_detail: Some(ws_detail),
+            body_loaded,
+            response_complete,
+        })
+    }
+
+    pub fn parse_websocket_detail_from_response(raw_v: &Value) -> WebSocketConnectionDetail {
+        let v = raw_v
+            .get("result")
+            .filter(|r| r.is_object())
+            .unwrap_or(raw_v);
+        let v = v
+            .get("connection")
+            .filter(|c| c.is_object())
+            .unwrap_or(v);
+
+        let state = v
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or("open")
+            .to_string();
+        let protocol = v
+            .get("protocol")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty() && *s != "null")
+            .map(ToOwned::to_owned);
+
+        let connect_timestamp = parse_u64_val(v.get("connectTimestamp"))
+            .or_else(|| parse_u64_val(v.get("startTime")))
+            .unwrap_or(0);
+        let open_timestamp = parse_u64_val(v.get("openTimestamp"));
+        let close_timestamp =
+            parse_u64_val(v.get("closeTimestamp")).or_else(|| parse_u64_val(v.get("endTime")));
+
+        let bytes_sent = parse_u64_val(v.get("bytesSent")).unwrap_or(0);
+        let bytes_received = parse_u64_val(v.get("bytesReceived")).unwrap_or(0);
+        let frames_sent = parse_u64_val(v.get("framesSent")).unwrap_or(0);
+        let frames_received = parse_u64_val(v.get("framesReceived")).unwrap_or(0);
+        let ping_count = parse_u64_val(v.get("pingCount")).unwrap_or(0);
+        let pong_count = parse_u64_val(v.get("pongCount")).unwrap_or(0);
+
+        let close_code = parse_u64_val(v.get("closeCode")).and_then(|c| u16::try_from(c).ok());
+        let close_reason = v
+            .get("closeReason")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty() && *s != "null")
+            .map(ToOwned::to_owned);
+
+        let error = match v.get("error") {
+            Some(Value::String(s)) if !s.is_empty() && s != "null" => Some(s.clone()),
+            Some(Value::Object(obj)) => {
+                let et = obj.get("type").and_then(Value::as_str).unwrap_or("");
+                let em = obj.get("message").and_then(Value::as_str).unwrap_or("");
+                if !et.is_empty() && !em.is_empty() {
+                    Some(format!("{et}: {em}"))
+                } else if !em.is_empty() {
+                    Some(em.to_string())
+                } else if !et.is_empty() {
+                    Some(et.to_string())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+
+        let mut events = Vec::new();
+        if let Some(ev_arr) = v.get("events").and_then(Value::as_array) {
+            for ev in ev_arr {
+                let ts = parse_u64_val(ev.get("timestamp")).unwrap_or(connect_timestamp);
+                let event_name = ev
+                    .get("event")
+                    .or_else(|| ev.get("name"))
+                    .or_else(|| ev.get("type"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("WebSocket.Event")
+                    .to_string();
+
+                let args = ev.get("arguments").filter(|a| a.is_object()).unwrap_or(ev);
+                let frame_number = parse_u64_val(args.get("frameNumber"))
+                    .or_else(|| parse_u64_val(ev.get("frameNumber")));
+
+                let direction = args
+                    .get("direction")
+                    .or_else(|| ev.get("direction"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .or_else(|| {
+                        let lower = event_name.to_ascii_lowercase();
+                        if lower.contains("send") || lower.contains("ping") {
+                            Some("out".to_string())
+                        } else if lower.contains("receive") || lower.contains("pong") {
+                            Some("in".to_string())
+                        } else {
+                            None
+                        }
+                    });
+
+                let opcode = args
+                    .get("opcode")
+                    .or_else(|| ev.get("opcode"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
+
+                let payload_size = parse_u64_val(args.get("payloadSize"))
+                    .or_else(|| parse_u64_val(args.get("size")))
+                    .or_else(|| parse_u64_val(args.get("bytes")))
+                    .or_else(|| parse_u64_val(ev.get("payloadSize")));
+
+                let error_type = args
+                    .get("errorType")
+                    .or_else(|| ev.get("errorType"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
+
+                let error_message = args
+                    .get("errorMessage")
+                    .or_else(|| ev.get("errorMessage"))
+                    .or_else(|| args.get("error"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
+
+                let arguments_json = ev
+                    .get("arguments")
+                    .filter(|a| !a.is_null())
+                    .and_then(|a| serde_json::to_string(a).ok());
+
+                events.push(WebSocketEventRecord {
+                    timestamp_micros: ts,
+                    timestamp_hms: format_micros_local_hms(ts),
+                    event_name,
+                    frame_number,
+                    direction,
+                    opcode,
+                    payload_size,
+                    error_type,
+                    error_message,
+                    arguments_json,
+                });
+            }
+        }
+
+        WebSocketConnectionDetail {
+            state,
+            protocol,
+            connect_timestamp,
+            open_timestamp,
+            close_timestamp,
+            bytes_sent,
+            bytes_received,
+            frames_sent,
+            frames_received,
+            ping_count,
+            pong_count,
+            close_code,
+            close_reason,
+            error,
+            events,
+        }
     }
 
     /// Parses an entry from `ext.dart.io.getHttpProfile` (`HttpProfileRequestRef` / `HttpProfileRequest`).
@@ -77,7 +447,11 @@ impl HttpRequestRecord {
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
             .map(ToOwned::to_owned);
-        let method = v.get("method").and_then(Value::as_str).unwrap_or("GET").to_ascii_uppercase();
+        let method = v
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or("GET")
+            .to_ascii_uppercase();
         let uri = v.get("uri").and_then(Value::as_str)?.to_string();
         let (host, path_and_query) = split_uri_host_and_path(&uri);
 
@@ -87,7 +461,11 @@ impl HttpRequestRecord {
         let start_time_micros = v
             .get("startTime")
             .and_then(Value::as_u64)
-            .or_else(|| req_obj.and_then(|r| r.get("startTime")).and_then(Value::as_u64))
+            .or_else(|| {
+                req_obj
+                    .and_then(|r| r.get("startTime"))
+                    .and_then(Value::as_u64)
+            })
             .unwrap_or(0);
 
         let end_time_micros = resp_obj
@@ -119,12 +497,19 @@ impl HttpRequestRecord {
         let resp_headers = extract_headers_map(resp_obj.and_then(|r| r.get("headers")));
 
         let content_type = find_header_ci(&resp_headers, "content-type")
-            .or_else(|| resp_obj.and_then(|r| r.get("mimeType")).and_then(Value::as_str).map(ToOwned::to_owned))
+            .or_else(|| {
+                resp_obj
+                    .and_then(|r| r.get("mimeType"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+            })
             .or_else(|| find_header_ci(&req_headers, "content-type"));
 
         let mime_short = shorten_mime_type(content_type.as_deref(), &path_and_query);
         let is_json = mime_short == "json"
-            || content_type.as_deref().is_some_and(|ct| ct.to_ascii_lowercase().contains("json"))
+            || content_type
+                .as_deref()
+                .is_some_and(|ct| ct.to_ascii_lowercase().contains("json"))
             || path_and_query.ends_with(".json");
 
         let request_bytes = req_obj
@@ -147,8 +532,14 @@ impl HttpRequestRecord {
         if let Some(ev_arr) = events_arr {
             for ev in ev_arr {
                 if let Some(name) = ev.get("event").and_then(Value::as_str) {
-                    let ts = ev.get("timestamp").and_then(Value::as_u64).unwrap_or(start_time_micros);
-                    events.push(HttpTimingEvent { name: name.to_string(), timestamp_micros: ts });
+                    let ts = ev
+                        .get("timestamp")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(start_time_micros);
+                    events.push(HttpTimingEvent {
+                        name: name.to_string(),
+                        timestamp_micros: ts,
+                    });
                 }
             }
         }
@@ -164,17 +555,24 @@ impl HttpRequestRecord {
         let final_req_bytes = if request_bytes > 0 {
             request_bytes
         } else {
-            detail.as_ref().and_then(|d| d.request_body.as_ref().map(|b| b.len() as u64)).unwrap_or(0)
+            detail
+                .as_ref()
+                .and_then(|d| d.request_body.as_ref().map(|b| b.len() as u64))
+                .unwrap_or(0)
         };
         let final_resp_bytes = if response_bytes > 0 {
             response_bytes
         } else {
-            detail.as_ref().and_then(|d| d.response_body.as_ref().map(|b| b.len() as u64)).unwrap_or(0)
+            detail
+                .as_ref()
+                .and_then(|d| d.response_body.as_ref().map(|b| b.len() as u64))
+                .unwrap_or(0)
         };
 
         Some(Self {
             id,
             isolate_id,
+            protocol_kind: NetworkProtocolKind::Http,
             method,
             uri,
             path_and_query,
@@ -193,6 +591,7 @@ impl HttpRequestRecord {
             error,
             events,
             detail,
+            ws_detail: None,
             body_loaded,
             response_complete,
         })
@@ -236,7 +635,9 @@ impl HttpRequestRecord {
             .and_then(|c| c.get("remoteAddress"))
             .and_then(Value::as_str)
             .map(ToOwned::to_owned);
-        let local_port = conn_info.and_then(|c| c.get("localPort")).and_then(Value::as_u64);
+        let local_port = conn_info
+            .and_then(|c| c.get("localPort"))
+            .and_then(Value::as_u64);
 
         HttpRequestDetail {
             request_headers,
@@ -274,9 +675,76 @@ impl HttpRequestRecord {
         parts.join(" ")
     }
 
-    /// Formats the complete HTTP request and response (General, Request Headers, Request Body,
-    /// Response Headers, Response Body) into a structured plain-text report for one-click copying.
+    /// Formats the complete HTTP request/response or WebSocket connection & frames
+    /// into a structured plain-text report for one-click copying (`Copy All`).
     pub fn to_full_text_report(&self) -> String {
+        if self.is_websocket() {
+            let ws = self.ws_detail.clone().unwrap_or_default();
+            let mut out = String::with_capacity(1024);
+            out.push_str("=== WebSocket Connection ===\n");
+            out.push_str(&format!("Connection ID: {}\n", self.raw_ws_id()));
+            out.push_str(&format!("URL: {}\n", self.uri));
+            out.push_str(&format!("State: {}\n", ws.state));
+            out.push_str(&format!(
+                "Protocol: {}\n",
+                ws.protocol.as_deref().unwrap_or("-")
+            ));
+            out.push_str(&format!("Duration: {}\n", self.duration_display()));
+            out.push_str(&format!("Connected At: {}\n", self.timestamp_hms));
+            out.push_str(&format!(
+                "Frames Sent / Received: {} / {}\n",
+                ws.frames_sent, ws.frames_received
+            ));
+            out.push_str(&format!(
+                "Bytes Sent / Received: {} / {} (Total: {})\n",
+                format_bytes(ws.bytes_sent),
+                format_bytes(ws.bytes_received),
+                format_bytes(self.total_bytes())
+            ));
+            out.push_str(&format!(
+                "Ping / Pong Count: {} / {}\n",
+                ws.ping_count, ws.pong_count
+            ));
+            if let Some(code) = ws.close_code {
+                out.push_str(&format!(
+                    "Close Code: {} ({})\n",
+                    code,
+                    ws.close_reason.as_deref().unwrap_or("none")
+                ));
+            }
+            if let Some(err) = ws.error.as_deref().or(self.error.as_deref()) {
+                out.push_str(&format!("Error: {err}\n"));
+            }
+
+            out.push_str("\n=== WebSocket Events & Frames ===\n");
+            if ws.events.is_empty() {
+                out.push_str("<none>\n");
+            } else {
+                for ev in &ws.events {
+                    let dir = ev.direction.as_deref().unwrap_or("-");
+                    let frame = ev
+                        .frame_number
+                        .map_or_else(|| "-".to_string(), |n| format!("#{n}"));
+                    let op = ev.opcode.as_deref().unwrap_or("-");
+                    let sz = ev
+                        .payload_size
+                        .map_or_else(|| "-".to_string(), format_bytes);
+                    out.push_str(&format!(
+                        "[{}] {} (dir={}, frame={}, opcode={}, size={})",
+                        ev.timestamp_hms, ev.event_name, dir, frame, op, sz
+                    ));
+                    if let Some(ref em) = ev.error_message {
+                        out.push_str(&format!(" error={em}"));
+                    }
+                    if let Some(ref args) = ev.arguments_json {
+                        out.push_str(&format!(" args={args}"));
+                    }
+                    out.push('\n');
+                }
+            }
+            return out;
+        }
+
         let status_text = match (self.status_code, self.reason_phrase.as_deref()) {
             (Some(code), Some(phrase)) if !phrase.is_empty() => format!("{code} {phrase}"),
             (Some(code), _) => code.to_string(),
@@ -359,6 +827,13 @@ impl HttpRequestRecord {
     }
 }
 
+fn parse_u64_val(val: Option<&Value>) -> Option<u64> {
+    let v = val?;
+    v.as_u64()
+        .or_else(|| v.as_i64().filter(|&n| n >= 0).map(|n| n as u64))
+        .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+}
+
 fn shell_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
@@ -405,7 +880,10 @@ fn extract_headers_map(headers_val: Option<&Value>) -> Vec<(String, String)> {
 }
 
 fn find_header_ci(headers: &[(String, String)], key: &str) -> Option<String> {
-    headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)).map(|(_, v)| v.clone())
+    headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(key))
+        .map(|(_, v)| v.clone())
 }
 
 fn shorten_mime_type(content_type: Option<&str>, path: &str) -> String {
@@ -520,9 +998,17 @@ fn maybe_decompress_bytes(raw: &[u8], content_encoding: Option<&str>) -> Vec<u8>
 
 fn format_binary_preview(bytes: &[u8]) -> String {
     let preview_len = bytes.len().min(64);
-    let hex: Vec<String> = bytes[..preview_len].iter().map(|b| format!("{b:02x}")).collect();
+    let hex: Vec<String> = bytes[..preview_len]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
     let suffix = if bytes.len() > preview_len { " ..." } else { "" };
-    format!("<Binary payload: {} bytes>\n{}{}", bytes.len(), hex.join(" "), suffix)
+    format!(
+        "<Binary payload: {} bytes>\n{}{}",
+        bytes.len(),
+        hex.join(" "),
+        suffix
+    )
 }
 
 #[cfg(test)]
@@ -582,7 +1068,10 @@ mod tests {
         });
 
         let detail = HttpRequestRecord::parse_detail_from_response(&full_json);
-        assert_eq!(detail.request_body.as_deref(), Some("{\"user\":\"flutter\"}"));
+        assert_eq!(
+            detail.request_body.as_deref(),
+            Some("{\"user\":\"flutter\"}")
+        );
         assert_eq!(detail.response_body.as_deref(), Some("{\"status\":\"ok\"}"));
         rec.detail = Some(detail);
         rec.body_loaded = true;
@@ -608,7 +1097,9 @@ mod tests {
 
         let raw_payload = r#"{"greeting":"hello from gzip","items":[1,2,3]}"#;
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(raw_payload.as_bytes()).expect("write gz");
+        encoder
+            .write_all(raw_payload.as_bytes())
+            .expect("write gz");
         let gz_bytes = encoder.finish().expect("finish gz");
 
         let full_json = json!({
@@ -646,5 +1137,97 @@ mod tests {
         assert!(report.contains("=== Request Headers ===\naccept-encoding: gzip"));
         assert!(report.contains("=== Request Body ===\n<empty>"));
         assert!(report.contains("=== Response Body ===\n{\"greeting\":\"hello from gzip\""));
+    }
+
+    #[test]
+    fn parses_dart_3_14_websocket_profile_and_connection_events() {
+        let ws_conn_json = json!({
+            "type": "WebSocketConnection",
+            "id": "7",
+            "isolateId": "isolates/101",
+            "url": "wss://stream.example.com/v1/live?token=abc",
+            "state": "closed",
+            "protocol": "chat.v1",
+            "connectTimestamp": 1_700_000_000_000_000u64,
+            "openTimestamp": 1_700_000_000_030_000u64,
+            "closeTimestamp": 1_700_000_001_530_000u64,
+            "bytesSent": 128,
+            "bytesReceived": 512,
+            "framesSent": 2,
+            "framesReceived": 3,
+            "pingCount": 1,
+            "pongCount": 1,
+            "closeCode": 1000,
+            "closeReason": "Normal closure",
+            "events": [
+                {
+                    "timestamp": 1_700_000_000_000_000u64,
+                    "event": "WebSocket.Connect",
+                    "arguments": { "url": "wss://stream.example.com/v1/live?token=abc" }
+                },
+                {
+                    "timestamp": 1_700_000_000_030_000u64,
+                    "event": "WebSocket.Open",
+                    "arguments": { "protocol": "chat.v1" }
+                },
+                {
+                    "timestamp": 1_700_000_000_100_000u64,
+                    "event": "WebSocket.Send",
+                    "arguments": {
+                        "frameNumber": 1,
+                        "direction": "out",
+                        "opcode": "TEXT",
+                        "payloadSize": 64
+                    }
+                },
+                {
+                    "timestamp": 1_700_000_000_250_000u64,
+                    "event": "WebSocket.Receive",
+                    "arguments": {
+                        "frameNumber": 2,
+                        "direction": "in",
+                        "opcode": "BINARY",
+                        "payloadSize": 512
+                    }
+                },
+                {
+                    "timestamp": 1_700_000_001_530_000u64,
+                    "event": "WebSocket.Close",
+                    "arguments": { "closeCode": 1000, "closeReason": "Normal closure" }
+                }
+            ]
+        });
+
+        let rec =
+            HttpRequestRecord::parse_from_websocket_profile_entry(&ws_conn_json).expect("parse ws");
+        assert!(rec.is_websocket());
+        assert_eq!(rec.id, "ws:7");
+        assert_eq!(rec.raw_ws_id(), "7");
+        assert_eq!(rec.method, "WS");
+        assert_eq!(rec.mime_short, "wss");
+        assert_eq!(rec.host, "stream.example.com");
+        assert_eq!(rec.path_and_query, "/v1/live?token=abc");
+        assert_eq!(rec.total_bytes(), 640);
+        assert_eq!(rec.duration_ms, Some(1530));
+        assert!(rec.body_loaded);
+        assert!(rec.response_complete);
+        let (badge, _) = rec.status_badge_label_and_color();
+        assert_eq!(badge, "1000");
+
+        let ws_detail = rec.ws_detail.as_ref().expect("ws_detail");
+        assert_eq!(ws_detail.protocol.as_deref(), Some("chat.v1"));
+        assert_eq!(ws_detail.frames_sent, 2);
+        assert_eq!(ws_detail.frames_received, 3);
+        assert_eq!(ws_detail.events.len(), 5);
+        assert_eq!(ws_detail.events[2].direction.as_deref(), Some("out"));
+        assert_eq!(ws_detail.events[2].opcode.as_deref(), Some("TEXT"));
+        assert_eq!(ws_detail.events[2].payload_size, Some(64));
+        assert_eq!(ws_detail.events[3].direction.as_deref(), Some("in"));
+        assert_eq!(ws_detail.events[3].opcode.as_deref(), Some("BINARY"));
+
+        let report = rec.to_full_text_report();
+        assert!(report.contains("=== WebSocket Connection ==="));
+        assert!(report.contains("Frames Sent / Received: 2 / 3"));
+        assert!(report.contains("WebSocket.Send (dir=out, frame=#1, opcode=TEXT, size=64 B)"));
     }
 }

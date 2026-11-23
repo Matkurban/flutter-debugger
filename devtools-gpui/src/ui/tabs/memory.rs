@@ -1,13 +1,14 @@
 use std::collections::VecDeque;
 
 use gpui_kit::{
-    Bounds, ContentMask, Context, IntoElement, ParentElement as _, PathBuilder, Pixels, Point,
-    Styled as _, Window,
+    Bounds, ContentMask, Context, InteractiveElement as _, IntoElement, ParentElement as _,
+    PathBuilder, Pixels, Point, Styled as _, Window,
     assets::IconName,
     canvas,
     component::{
         Icon, Selectable as _, Sizable as _,
         button::Button,
+        scroll::ScrollableElement as _,
     },
     div, point, px,
 };
@@ -145,6 +146,8 @@ impl RootView {
             )
             .child(
                 div()
+                    .id("memory-main-scroll")
+                    .relative()
                     .flex_1()
                     .min_h_0()
                     .w_full()
@@ -152,6 +155,7 @@ impl RootView {
                     .flex()
                     .flex_col()
                     .gap_4()
+                    .overflow_y_scrollbar()
                     .child(
                         div()
                             .w_full()

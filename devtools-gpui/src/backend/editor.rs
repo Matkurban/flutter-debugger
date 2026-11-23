@@ -1,100 +1,45 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 
-use serde::Deserialize;
+pub use flutter_debugger_protocol::resolve_dart_uri_to_local_path;
 
 use crate::backend::error::DevToolsError;
 use crate::protocol::SourceLocation;
 
-#[derive(Debug, Deserialize)]
-struct PackageConfigFile {
-    #[serde(default)]
-    packages: Vec<PackageConfigEntry>,
-}
+/// Builds Zed CLI arguments to open `resolved_file` at `line:col` inside an existing Zed window (`-e`):
+/// - When `resolved_file` is inside `project_root`, passes `["-e", "<project_root>", "<file>:<line>:<col>"]`
+///   so Zed activates the already-open workspace window for that Flutter project.
+/// - When `resolved_file` is outside `project_root` (e.g. `~/.pub-cache` or Flutter SDK) or `project_root` is `None`,
+///   passes `["-e", "<file>:<line>:<col>"]` so Zed opens a tab in the existing window without spawning a new window.
+pub fn build_zed_open_args(
+    resolved_file: &Path,
+    line: u32,
+    col: u32,
+    project_root: Option<&Path>,
+) -> Vec<String> {
+    let canon_file = fs::canonicalize(resolved_file).unwrap_or_else(|_| resolved_file.to_path_buf());
+    let canon_root = project_root.map(|r| fs::canonicalize(r).unwrap_or_else(|_| r.to_path_buf()));
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PackageConfigEntry {
-    name: String,
-    root_uri: String,
-    #[serde(default)]
-    package_uri: Option<String>,
-}
+    let target = format!(
+        "{}:{}:{}",
+        canon_file.display(),
+        line.max(1),
+        col.max(1)
+    );
 
-/// Resolves a Dart `file:///...` or `package:<pkg>/<rel>.dart` URI to a local disk path.
-/// For `package:` URIs, reads `<project_root>/.dart_tool/package_config.json` to map package roots.
-pub fn resolve_dart_uri_to_local_path(uri: &str, project_root: Option<&Path>) -> Option<PathBuf> {
-    let trimmed = uri.trim();
-    if trimmed.starts_with("file://") {
-        if let Ok(parsed) = url::Url::parse(trimmed)
-            && let Ok(path) = parsed.to_file_path()
-        {
-            return Some(path);
-        }
-        let stripped = trimmed.strip_prefix("file://")?;
-        return Some(PathBuf::from(stripped));
-    }
-
-    if let Some(pkg_spec) = trimmed.strip_prefix("package:") {
-        let (pkg_name, rel_path) = pkg_spec.split_once('/')?;
-        let root = project_root?;
-        let config_dir = root.join(".dart_tool");
-        let config_path = config_dir.join("package_config.json");
-        let bytes = fs::read(&config_path).ok()?;
-        let parsed: PackageConfigFile = serde_json::from_slice(&bytes).ok()?;
-
-        let entry = parsed.packages.iter().find(|p| p.name == pkg_name)?;
-        let pkg_root = resolve_package_root_uri(&entry.root_uri, &config_dir)?;
-        let package_sub = entry
-            .package_uri
-            .as_deref()
-            .unwrap_or("lib/")
-            .trim_end_matches('/');
-
-        let full_path = if package_sub.is_empty() || package_sub == "." {
-            pkg_root.join(rel_path)
-        } else {
-            pkg_root.join(package_sub).join(rel_path)
-        };
-
-        return Some(clean_relative_segments(&full_path));
-    }
-
-    let candidate = Path::new(trimmed);
-    if candidate.is_absolute() {
-        return Some(candidate.to_path_buf());
-    }
-    project_root.map(|r| r.join(candidate))
-}
-
-fn resolve_package_root_uri(root_uri: &str, config_dir: &Path) -> Option<PathBuf> {
-    if root_uri.starts_with("file://") {
-        if let Ok(parsed) = url::Url::parse(root_uri)
-            && let Ok(path) = parsed.to_file_path()
-        {
-            return Some(path);
-        }
-        return root_uri.strip_prefix("file://").map(PathBuf::from);
-    }
-    Some(clean_relative_segments(&config_dir.join(root_uri)))
-}
-
-fn clean_relative_segments(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for comp in path.components() {
-        match comp {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                out.pop();
-            }
-            other => out.push(other.as_os_str()),
+    if let Some(ref root) = canon_root {
+        let inside_canon = canon_file.starts_with(root);
+        let inside_raw = project_root.is_some_and(|raw_r| resolved_file.starts_with(raw_r));
+        if inside_canon || inside_raw {
+            return vec!["-e".to_string(), root.display().to_string(), target];
         }
     }
-    out
+
+    vec!["-e".to_string(), target]
 }
 
-/// Opens `<abs_path>:<line>:<col>` in Zed editor (`zed` in `$PATH` or `/Applications/Zed.app/Contents/MacOS/cli`).
+/// Opens `<abs_path>:<line>:<col>` in an existing Zed editor window (`zed -e`).
 pub fn open_source_in_zed(
     loc: &SourceLocation,
     project_root: Option<&Path>,
@@ -106,12 +51,16 @@ pub fn open_source_in_zed(
         ))
     })?;
 
-    let target = format!(
-        "{}:{}:{}",
-        resolved.display(),
-        loc.line.max(1),
-        loc.column.max(1)
-    );
+    let cli_args = build_zed_open_args(&resolved, loc.line, loc.column, project_root);
+    let target = cli_args.last().cloned().unwrap_or_else(|| {
+        format!(
+            "{}:{}:{}",
+            resolved.display(),
+            loc.line.max(1),
+            loc.column.max(1)
+        )
+    });
+
     let candidates = [
         "zed",
         "/Applications/Zed.app/Contents/MacOS/cli",
@@ -119,32 +68,62 @@ pub fn open_source_in_zed(
         "/usr/local/bin/zed",
     ];
 
-    for bin in candidates {
-        if bin.starts_with('/') && !Path::new(bin).exists() {
-            continue;
-        }
-        if let Ok(mut child) = Command::new(bin)
-            .arg(&target)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-        {
-            std::thread::spawn(move || {
-                let _ = child.wait();
-            });
-            return Ok(format!("Opened in Zed: {target}"));
-        }
-    }
+    let chosen_bin = candidates
+        .into_iter()
+        .find(|&bin| {
+            if bin.starts_with('/') {
+                Path::new(bin).exists()
+            } else {
+                command_exists_in_path(bin)
+            }
+        })
+        .map(ToOwned::to_owned);
 
-    Err(DevToolsError::Io(format!(
-        "Could not find `zed` CLI to open `{target}`. Run `zed: install cli` in Zed."
-    )))
+    let Some(bin) = chosen_bin else {
+        return Err(DevToolsError::Io(format!(
+            "Could not find `zed` CLI to open `{target}`. Run `zed: install cli` in Zed."
+        )));
+    };
+
+    std::thread::spawn(move || {
+        if let Ok(out) = Command::new(&bin)
+            .args(&cli_args)
+            .stdin(Stdio::null())
+            .output()
+            && !out.status.success()
+        {
+            let stderr_lower = String::from_utf8_lossy(&out.stderr).to_ascii_lowercase();
+            if stderr_lower.contains("unexpected argument")
+                || stderr_lower.contains("unrecognized")
+            {
+                let fallback_args: Vec<String> = cli_args
+                    .into_iter()
+                    .filter(|a| a != "-e")
+                    .collect();
+                let _ = Command::new(&bin)
+                    .args(&fallback_args)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+        }
+    });
+
+    Ok(format!("Opened in Zed: {target}"))
+}
+
+fn command_exists_in_path(cmd: &str) -> bool {
+    let Some(path_os) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path_os).any(|dir| dir.join(cmd).is_file())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn resolves_file_and_package_uris_via_package_config() {
@@ -202,6 +181,47 @@ mod tests {
         assert_eq!(
             file_resolved,
             PathBuf::from("/Users/dev/project/lib/main.dart")
+        );
+    }
+
+    #[test]
+    fn build_zed_open_args_handles_in_project_external_and_no_project_root() {
+        let project_root = Path::new("/Users/dev/my_flutter_app");
+        let in_project_file = Path::new("/Users/dev/my_flutter_app/lib/pages/home.dart");
+        let external_file =
+            Path::new("/Users/dev/.pub-cache/hosted/pub.dev/provider-6.1.0/lib/src/provider.dart");
+
+        // 1. In-project file -> ["-e", "<project_root>", "<file>:<line>:<col>"]
+        let args_in_project =
+            build_zed_open_args(in_project_file, 42, 12, Some(project_root));
+        assert_eq!(
+            args_in_project,
+            vec![
+                "-e".to_string(),
+                "/Users/dev/my_flutter_app".to_string(),
+                "/Users/dev/my_flutter_app/lib/pages/home.dart:42:12".to_string(),
+            ]
+        );
+
+        // 2. External pub-cache / SDK file -> ["-e", "<file>:<line>:<col>"]
+        let args_external = build_zed_open_args(external_file, 19, 7, Some(project_root));
+        assert_eq!(
+            args_external,
+            vec![
+                "-e".to_string(),
+                "/Users/dev/.pub-cache/hosted/pub.dev/provider-6.1.0/lib/src/provider.dart:19:7"
+                    .to_string(),
+            ]
+        );
+
+        // 3. No project_root -> ["-e", "<file>:<line>:<col>"]
+        let args_no_root = build_zed_open_args(in_project_file, 10, 1, None);
+        assert_eq!(
+            args_no_root,
+            vec![
+                "-e".to_string(),
+                "/Users/dev/my_flutter_app/lib/pages/home.dart:10:1".to_string(),
+            ]
         );
     }
 }

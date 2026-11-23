@@ -14,12 +14,15 @@ use gpui_kit::{
         input::{Input, InputState},
         resizable_panel,
     },
-    div, px,
+    div,
+    prelude::FluentBuilder as _,
+    px,
 };
 
 use crate::backend::BackendCommand;
 use crate::protocol::{
-    FormattedBody, HttpRequestDetail, HttpRequestRecord, format_and_tokenize_json,
+    FormattedBody, HttpRequestDetail, HttpRequestRecord, WebSocketConnectionDetail,
+    format_and_tokenize_json,
 };
 use crate::theme::DevToolsTheme;
 use crate::ui::app::RootView;
@@ -31,41 +34,93 @@ use table::render_requests_table;
 const MAX_NETWORK_REQUESTS: usize = 2000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NetworkFilterChip { All, Status2xx, Status4xx5xx, Pending, Json }
+pub enum NetworkFilterChip {
+    All,
+    Status2xx,
+    Status4xx5xx,
+    Pending,
+    Json,
+    WebSocket,
+}
 
 impl NetworkFilterChip {
-    pub const fn all() -> [Self; 5] {
-        [Self::All, Self::Status2xx, Self::Status4xx5xx, Self::Pending, Self::Json]
+    pub const fn all() -> [Self; 6] {
+        [
+            Self::All,
+            Self::Status2xx,
+            Self::Status4xx5xx,
+            Self::Pending,
+            Self::Json,
+            Self::WebSocket,
+        ]
     }
+
     pub fn label(self) -> &'static str {
         match self {
-            Self::All => "All", Self::Status2xx => "2xx", Self::Status4xx5xx => "4xx/5xx",
-            Self::Pending => "Pending", Self::Json => "JSON",
+            Self::All => "All",
+            Self::Status2xx => "2xx",
+            Self::Status4xx5xx => "4xx/5xx",
+            Self::Pending => "Pending",
+            Self::Json => "JSON",
+            Self::WebSocket => "WS",
         }
     }
+
     pub fn matches(self, rec: &HttpRequestRecord) -> bool {
         match self {
             Self::All => true,
-            Self::Status2xx => matches!(rec.status_code, Some(200..=299)),
-            Self::Status4xx5xx => matches!(rec.status_code, Some(400..=599)) || rec.error.is_some(),
+            Self::Status2xx => !rec.is_websocket() && matches!(rec.status_code, Some(200..=299)),
+            Self::Status4xx5xx => {
+                matches!(rec.status_code, Some(400..=599)) || rec.error.is_some()
+            }
             Self::Pending => rec.is_pending(),
             Self::Json => rec.is_json,
+            Self::WebSocket => rec.is_websocket(),
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NetworkSortColumn { Timestamp, Method, Address, Status, Type, Duration, Size }
+pub enum NetworkSortColumn {
+    Timestamp,
+    Method,
+    Address,
+    Status,
+    Type,
+    Duration,
+    Size,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NetworkDetailSubTab { Overview, Headers, Request, Response }
+pub enum SortDirection {
+    Ascending,
+    Descending,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkDetailSubTab {
+    Overview,
+    Headers,
+    Request,
+    Response,
+}
 
 impl NetworkDetailSubTab {
-    pub const fn all() -> [Self; 4] { [Self::Overview, Self::Headers, Self::Request, Self::Response] }
+    pub const fn all() -> [Self; 4] {
+        [
+            Self::Overview,
+            Self::Headers,
+            Self::Request,
+            Self::Response,
+        ]
+    }
+
     pub fn label(self) -> &'static str {
         match self {
-            Self::Overview => "Overview", Self::Headers => "Headers",
-            Self::Request => "Request", Self::Response => "Response",
+            Self::Overview => "Overview",
+            Self::Headers => "Headers",
+            Self::Request => "Request",
+            Self::Response => "Response",
         }
     }
 }
@@ -74,8 +129,7 @@ pub struct NetworkTabState {
     pub requests: VecDeque<HttpRequestRecord>,
     pub recording: bool,
     pub filter_chip: NetworkFilterChip,
-    pub sort_column: NetworkSortColumn,
-    pub sort_ascending: bool,
+    pub sort: Option<(NetworkSortColumn, SortDirection)>,
     pub selected_id: Option<String>,
     pub detail_tab: NetworkDetailSubTab,
     pub search_input: Entity<InputState>,
@@ -95,8 +149,7 @@ impl NetworkTabState {
             requests: VecDeque::with_capacity(256),
             recording: true,
             filter_chip: NetworkFilterChip::All,
-            sort_column: NetworkSortColumn::Timestamp,
-            sort_ascending: false,
+            sort: None,
             selected_id: None,
             detail_tab: NetworkDetailSubTab::Response,
             search_input,
@@ -125,18 +178,30 @@ impl NetworkTabState {
         }
     }
 
+    /// Cycles column sorting through three states:
+    /// 1. Not sorted by `col` (or `None`) -> `Some((col, SortDirection::Ascending))`
+    /// 2. `Some((col, SortDirection::Ascending))` -> `Some((col, SortDirection::Descending))`
+    /// 3. `Some((col, SortDirection::Descending))` -> `None` (restores default capture order)
     pub fn toggle_sort(&mut self, col: NetworkSortColumn) {
-        if self.sort_column == col {
-            self.sort_ascending = !self.sort_ascending;
-        } else {
-            self.sort_column = col;
-            self.sort_ascending = true;
-        }
+        self.sort = match self.sort {
+            Some((c, SortDirection::Ascending)) if c == col => {
+                Some((col, SortDirection::Descending))
+            }
+            Some((c, SortDirection::Descending)) if c == col => None,
+            _ => Some((col, SortDirection::Ascending)),
+        };
         self.rebuild_filtered_indices();
     }
 
-    /// Merges an incremental batch of HTTP profile requests, deduplicating by `id`
-    /// and preserving previously fetched request/response bodies.
+    pub fn reset_sort(&mut self) {
+        if self.sort.is_some() {
+            self.sort = None;
+            self.rebuild_filtered_indices();
+        }
+    }
+
+    /// Merges an incremental batch of HTTP & WebSocket profile entries, deduplicating by `id`
+    /// and preserving previously fetched request/response bodies or WebSocket event frames.
     pub fn merge_batch(
         &mut self,
         batch: Vec<HttpRequestRecord>,
@@ -162,6 +227,47 @@ impl NetworkTabState {
             self.detail_loading_id = None;
         }
         self.detail_errors.insert(request_id.to_string(), error);
+    }
+
+    pub fn apply_websocket_detail(
+        &mut self,
+        request_id: &str,
+        detail: WebSocketConnectionDetail,
+    ) {
+        if self.detail_loading_id.as_deref() == Some(request_id) {
+            self.detail_loading_id = None;
+        }
+        self.detail_errors.remove(request_id);
+
+        if let Some(rec) = self.requests.iter_mut().find(|r| r.id == request_id) {
+            rec.request_bytes = detail.bytes_sent;
+            rec.response_bytes = detail.bytes_received;
+            rec.reason_phrase = Some(detail.state.to_ascii_uppercase());
+            rec.content_type = detail.protocol.clone();
+            rec.end_time_micros = detail.close_timestamp;
+            rec.duration_ms = detail
+                .close_timestamp
+                .or_else(|| detail.events.last().map(|e| e.timestamp_micros))
+                .or(detail.open_timestamp)
+                .and_then(|end| end.checked_sub(rec.start_time_micros))
+                .map(|us| us / 1000);
+            rec.status_code = detail.close_code.or(
+                if detail.state.eq_ignore_ascii_case("open") {
+                    Some(101)
+                } else {
+                    None
+                },
+            );
+            if detail.error.is_some() {
+                rec.error = detail.error.clone();
+            }
+            rec.response_complete =
+                matches!(detail.state.to_ascii_lowercase().as_str(), "closed" | "error")
+                    || detail.close_timestamp.is_some()
+                    || detail.error.is_some();
+            rec.body_loaded = true;
+            rec.ws_detail = Some(detail);
+        }
     }
 
     pub fn apply_detail(&mut self, request_id: &str, mut detail: HttpRequestDetail) {
@@ -217,7 +323,12 @@ impl NetworkTabState {
         self.rebuild_selected_body_cache();
         let rec = self.requests.iter().find(|r| r.id == request_id)?;
         let has_error = self.detail_errors.contains_key(&request_id);
-        if !rec.body_loaded || has_error {
+        let should_fetch = if rec.is_websocket() {
+            !rec.body_loaded || !rec.response_complete || has_error
+        } else {
+            !rec.body_loaded || has_error
+        };
+        if should_fetch {
             let id = rec.id.clone();
             let iso = rec.isolate_id.clone();
             self.mark_detail_loading(&id);
@@ -244,7 +355,11 @@ impl NetworkTabState {
     }
 
     fn rebuild_selected_body_cache(&mut self) {
-        let Some(rec) = self.selected_id.as_deref().and_then(|id| self.requests.iter().find(|r| r.id == id)) else {
+        let Some(rec) = self
+            .selected_id
+            .as_deref()
+            .and_then(|id| self.requests.iter().find(|r| r.id == id))
+        else {
             self.cached_detail_id = None;
             self.cached_req_body = None;
             self.cached_resp_body = None;
@@ -252,8 +367,14 @@ impl NetworkTabState {
         };
         self.cached_detail_id = Some(rec.id.clone());
         let detail = rec.detail.as_ref();
-        self.cached_req_body = detail.and_then(|d| d.request_body.as_deref()).filter(|s| !s.trim().is_empty()).map(format_and_tokenize_json);
-        self.cached_resp_body = detail.and_then(|d| d.response_body.as_deref()).filter(|s| !s.trim().is_empty()).map(format_and_tokenize_json);
+        self.cached_req_body = detail
+            .and_then(|d| d.request_body.as_deref())
+            .filter(|s| !s.trim().is_empty())
+            .map(format_and_tokenize_json);
+        self.cached_resp_body = detail
+            .and_then(|d| d.response_body.as_deref())
+            .filter(|s| !s.trim().is_empty())
+            .map(format_and_tokenize_json);
     }
 
     pub fn rebuild_filtered_indices(&mut self) {
@@ -269,26 +390,58 @@ impl NetworkTabState {
                     || rec.uri.to_ascii_lowercase().contains(&q)
                     || rec.method.to_ascii_lowercase().contains(&q)
                     || rec.status_code.is_some_and(|s| s.to_string().contains(&q))
+                    || rec
+                        .reason_phrase
+                        .as_deref()
+                        .is_some_and(|r| r.to_ascii_lowercase().contains(&q))
                     || rec.mime_short.to_ascii_lowercase().contains(&q)
             })
             .map(|(idx, _)| idx)
             .collect();
 
-        let (sort_col, sort_asc, reqs) = (self.sort_column, self.sort_ascending, &self.requests);
-        indices.sort_by(|&ia, &ib| {
-            let (a, b) = (&reqs[ia], &reqs[ib]);
-            let ord = match sort_col {
-                NetworkSortColumn::Timestamp => a.start_time_micros.cmp(&b.start_time_micros),
-                NetworkSortColumn::Method => a.method.cmp(&b.method),
-                NetworkSortColumn::Address => a.path_and_query.cmp(&b.path_and_query),
-                NetworkSortColumn::Status => a.status_code.unwrap_or(0).cmp(&b.status_code.unwrap_or(0)),
-                NetworkSortColumn::Type => a.mime_short.cmp(&b.mime_short),
-                NetworkSortColumn::Duration => a.duration_ms.unwrap_or(0).cmp(&b.duration_ms.unwrap_or(0)),
-                NetworkSortColumn::Size => a.total_bytes().cmp(&b.total_bytes()),
-            };
-            if sort_asc { ord } else { ord.reverse() }
-        });
+        sort_filtered_request_indices(&mut indices, &self.requests, self.sort);
         self.filtered_indices = indices;
+    }
+}
+
+pub(crate) fn sort_filtered_request_indices(
+    indices: &mut [usize],
+    reqs: &VecDeque<HttpRequestRecord>,
+    sort: Option<(NetworkSortColumn, SortDirection)>,
+) {
+    match sort {
+        None => {
+            // Default order: newest first (reverse timestamp/capture order) with deterministic tie-breaker.
+            indices.sort_by(|&ia, &ib| {
+                let (a, b) = (&reqs[ia], &reqs[ib]);
+                b.start_time_micros
+                    .cmp(&a.start_time_micros)
+                    .then_with(|| ib.cmp(&ia))
+            });
+        }
+        Some((sort_col, dir)) => {
+            indices.sort_by(|&ia, &ib| {
+                let (a, b) = (&reqs[ia], &reqs[ib]);
+                let ord = match sort_col {
+                    NetworkSortColumn::Timestamp => a.start_time_micros.cmp(&b.start_time_micros),
+                    NetworkSortColumn::Method => a.method.cmp(&b.method),
+                    NetworkSortColumn::Address => a.path_and_query.cmp(&b.path_and_query),
+                    NetworkSortColumn::Status => {
+                        a.status_code.unwrap_or(0).cmp(&b.status_code.unwrap_or(0))
+                    }
+                    NetworkSortColumn::Type => a.mime_short.cmp(&b.mime_short),
+                    NetworkSortColumn::Duration => {
+                        a.duration_ms.unwrap_or(0).cmp(&b.duration_ms.unwrap_or(0))
+                    }
+                    NetworkSortColumn::Size => a.total_bytes().cmp(&b.total_bytes()),
+                }
+                .then_with(|| ia.cmp(&ib));
+                match dir {
+                    SortDirection::Ascending => ord,
+                    SortDirection::Descending => ord.reverse(),
+                }
+            });
+        }
     }
 }
 
@@ -300,8 +453,13 @@ impl RootView {
     ) -> impl IntoElement {
         let recording = self.network.recording;
         let current_chip = self.network.filter_chip;
+        let has_active_sort = self.network.sort.is_some();
         let filtered_count = self.network.filtered_indices.len();
         let total_count = self.network.requests.len();
+        let selected_is_ws = self
+            .network
+            .selected_record()
+            .is_some_and(HttpRequestRecord::is_websocket);
 
         div()
             .size_full()
@@ -330,7 +488,7 @@ impl RootView {
                                     } else {
                                         "Paused"
                                     })
-                                    .tooltip("Toggle HTTP traffic capture")
+                                    .tooltip("Toggle HTTP & WebSocket traffic capture")
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.network.recording = !this.network.recording;
                                         this.send_cmd(BackendCommand::SetNetworkRecording(
@@ -345,7 +503,7 @@ impl RootView {
                                     .compact()
                                     .icon(Icon::new(IconName::Trash))
                                     .label("Clear")
-                                    .tooltip("Clear captured HTTP requests")
+                                    .tooltip("Clear captured HTTP & WebSocket entries")
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.network.clear();
                                         this.send_cmd(BackendCommand::ClearNetworkProfile);
@@ -353,7 +511,7 @@ impl RootView {
                                     })),
                             )
                             .child(
-                                div().w(px(240.0)).child(
+                                div().w(px(220.0)).child(
                                     Input::new(&self.network.search_input)
                                         .id("net-search-input")
                                         .small()
@@ -374,7 +532,21 @@ impl RootView {
                                     this.network.set_filter_chip(chip);
                                     cx.notify();
                                 }))
-                            })),
+                            }))
+                            .when(has_active_sort, |el| {
+                                el.child(
+                                    Button::new("net-reset-sort-btn")
+                                        .small()
+                                        .compact()
+                                        .icon(Icon::new(IconName::RotateCcw))
+                                        .label("Reset Sort")
+                                        .tooltip("Restore default capture order (latest first)")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.network.reset_sort();
+                                            cx.notify();
+                                        })),
+                                )
+                            }),
                     )
                     .child(
                         div()
@@ -386,7 +558,7 @@ impl RootView {
                                     .font_family(DevToolsTheme::MONO_FONT)
                                     .text_xs()
                                     .text_color(DevToolsTheme::text_secondary())
-                                    .child(format!("{filtered_count} / {total_count} requests")),
+                                    .child(format!("{filtered_count} / {total_count} entries")),
                             )
                             .child(
                                 Button::new("net-copy-all-btn")
@@ -394,7 +566,7 @@ impl RootView {
                                     .compact()
                                     .icon(Icon::new(IconName::ClipboardCopy))
                                     .label("Copy All")
-                                    .tooltip("Copy complete request & response report (General, Headers, and Bodies)")
+                                    .tooltip("Copy complete HTTP request/response or WebSocket connection report")
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         if let Some(rec) = this.network.selected_record().cloned() {
                                             if !rec.body_loaded {
@@ -409,13 +581,13 @@ impl RootView {
                                             let report = rec.to_full_text_report();
                                             this.copy_to_clipboard(
                                                 report,
-                                                "Copied complete HTTP request & response info",
+                                                "Copied complete network record report",
                                                 window,
                                                 cx,
                                             );
                                         } else {
                                             this.show_toast(
-                                                "Select a request first to copy all details",
+                                                "Select a network entry first to copy all details",
                                                 true,
                                                 window,
                                                 cx,
@@ -423,32 +595,34 @@ impl RootView {
                                         }
                                     })),
                             )
-                            .child(
-                                Button::new("net-copy-curl-btn")
-                                    .small()
-                                    .compact()
-                                    .icon(Icon::new(IconName::Copy))
-                                    .label("Copy as cURL")
-                                    .tooltip("Copy selected HTTP request as a cURL command")
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        if let Some(rec) = this.network.selected_record() {
-                                            let curl = rec.to_curl_command();
-                                            this.copy_to_clipboard(
-                                                curl,
-                                                "Copied request as cURL command",
-                                                window,
-                                                cx,
-                                            );
-                                        } else {
-                                            this.show_toast(
-                                                "Select a request first to copy as cURL",
-                                                true,
-                                                window,
-                                                cx,
-                                            );
-                                        }
-                                    })),
-                            ),
+                            .when(!selected_is_ws, |el| {
+                                el.child(
+                                    Button::new("net-copy-curl-btn")
+                                        .small()
+                                        .compact()
+                                        .icon(Icon::new(IconName::Copy))
+                                        .label("Copy as cURL")
+                                        .tooltip("Copy selected HTTP request as a cURL command")
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            if let Some(rec) = this.network.selected_record() {
+                                                let curl = rec.to_curl_command();
+                                                this.copy_to_clipboard(
+                                                    curl,
+                                                    "Copied request as cURL command",
+                                                    window,
+                                                    cx,
+                                                );
+                                            } else {
+                                                this.show_toast(
+                                                    "Select a request first to copy as cURL",
+                                                    true,
+                                                    window,
+                                                    cx,
+                                                );
+                                            }
+                                        })),
+                                )
+                            }),
                     ),
             )
             .child(
@@ -474,6 +648,26 @@ pub(crate) fn merge_requests_into_deque(
     let mut refetch_selected = None;
     for incoming in batch {
         if let Some(existing) = requests.iter_mut().find(|r| r.id == incoming.id) {
+            if existing.is_websocket() {
+                let prev_ws_detail = existing.ws_detail.take();
+                let prev_body_loaded = existing.body_loaded;
+                let prev_iso = existing.isolate_id.take();
+                *existing = incoming;
+                if existing.isolate_id.is_none() {
+                    existing.isolate_id = prev_iso;
+                }
+                if let (Some(cur_ws), Some(prev_ws)) = (&mut existing.ws_detail, prev_ws_detail) {
+                    if cur_ws.events.is_empty() && !prev_ws.events.is_empty() {
+                        cur_ws.events = prev_ws.events;
+                    }
+                    existing.body_loaded = existing.body_loaded || prev_body_loaded;
+                }
+                if selected_id == Some(existing.id.as_str()) {
+                    refetch_selected = Some((existing.id.clone(), existing.isolate_id.clone()));
+                }
+                continue;
+            }
+
             let prev_complete = existing.response_complete;
             let prev_detail = existing.detail.take();
             let prev_body_loaded = existing.body_loaded;
@@ -525,7 +719,10 @@ mod tests {
         assert!(!partial.response_complete);
 
         let mut deque = VecDeque::new();
-        assert_eq!(merge_requests_into_deque(&mut deque, vec![partial], Some("req-stream-1")), None);
+        assert_eq!(
+            merge_requests_into_deque(&mut deque, vec![partial], Some("req-stream-1")),
+            None
+        );
         // Simulate premature detail load while streaming response was still incomplete
         deque[0].body_loaded = true;
         deque[0].detail = Some(HttpRequestDetail::default());
@@ -544,5 +741,59 @@ mod tests {
             Some("req-stream-1")
         );
         assert!(!deque[0].body_loaded);
+    }
+
+    #[test]
+    fn tri_state_column_sort_cycles_asc_desc_and_restores_default_order() {
+        let r1 = HttpRequestRecord::parse_from_profile_entry(&json!({
+            "id": "1", "method": "POST", "uri": "https://api.example.com/b",
+            "startTime": 1_000_000,
+            "response": { "statusCode": 201, "contentLength": 300, "endTime": 1_050_000 }
+        }))
+        .unwrap();
+        let r2 = HttpRequestRecord::parse_from_profile_entry(&json!({
+            "id": "2", "method": "GET", "uri": "https://api.example.com/a",
+            "startTime": 2_000_000,
+            "response": { "statusCode": 200, "contentLength": 100, "endTime": 2_010_000 }
+        }))
+        .unwrap();
+        let r3 = HttpRequestRecord::parse_from_profile_entry(&json!({
+            "id": "3", "method": "DELETE", "uri": "https://api.example.com/c",
+            "startTime": 3_000_000,
+            "response": { "statusCode": 204, "contentLength": 50, "endTime": 3_020_000 }
+        }))
+        .unwrap();
+
+        let mut reqs = VecDeque::from(vec![r1, r2, r3]);
+        let mut indices = vec![0, 1, 2];
+
+        // Initial default sort (`None`): newest request (index 2, then 1, then 0) at top
+        let mut sort: Option<(NetworkSortColumn, SortDirection)> = None;
+        sort_filtered_request_indices(&mut indices, &reqs, sort);
+        assert_eq!(indices, vec![2, 1, 0]);
+
+        // Click 1 on Size -> Ascending (50B -> 100B -> 300B => indices [2, 1, 0])
+        sort = Some((NetworkSortColumn::Size, SortDirection::Ascending));
+        sort_filtered_request_indices(&mut indices, &reqs, sort);
+        assert_eq!(indices, vec![2, 1, 0]);
+
+        // Click 2 on Size -> Descending (300B -> 100B -> 50B => indices [0, 1, 2])
+        sort = Some((NetworkSortColumn::Size, SortDirection::Descending));
+        sort_filtered_request_indices(&mut indices, &reqs, sort);
+        assert_eq!(indices, vec![0, 1, 2]);
+
+        // Click 3 on Size -> None (restores default reverse capture order [2, 1, 0])
+        sort = None;
+        sort_filtered_request_indices(&mut indices, &reqs, sort);
+        assert_eq!(indices, vec![2, 1, 0]);
+
+        // Verify WebSocket filter chip matches only WS entries
+        let ws = HttpRequestRecord::parse_from_websocket_profile_entry(&json!({
+            "id": "99", "url": "wss://echo.example.com/ws", "state": "open", "connectTimestamp": 4_000_000
+        }))
+        .unwrap();
+        reqs.push_back(ws);
+        assert!(NetworkFilterChip::WebSocket.matches(&reqs[3]));
+        assert!(!NetworkFilterChip::WebSocket.matches(&reqs[0]));
     }
 }

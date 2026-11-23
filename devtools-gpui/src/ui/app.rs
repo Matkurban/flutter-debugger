@@ -247,13 +247,19 @@ impl RootView {
             BackendEvent::HttpRequestDetailLoaded { request_id, detail } => {
                 self.network.apply_detail(&request_id, detail);
             }
+            BackendEvent::WebSocketDetailLoaded { request_id, detail } => {
+                self.network.apply_websocket_detail(&request_id, detail);
+            }
             BackendEvent::HttpRequestDetailFailed { request_id, error } => {
                 self.network.apply_detail_error(&request_id, error);
             }
             BackendEvent::WidgetTreeLoaded(root) => {
                 let first_id = self.inspector.set_root_tree(root);
                 if let Some(id) = first_id {
-                    self.send_cmd(BackendCommand::SelectWidgetNode { value_id: id });
+                    self.send_cmd(BackendCommand::SelectWidgetNode {
+                        value_id: id,
+                        highlight_on_device: false,
+                    });
                 }
             }
             BackendEvent::WidgetChildrenLoaded {
@@ -266,14 +272,19 @@ impl RootView {
                 tree,
                 selected_node,
                 properties,
+                layout_node,
+                details_subtree,
             } => {
                 self.inspector.apply_device_selection(
                     tree,
                     selected_node.clone(),
                     properties,
+                    layout_node,
+                    details_subtree,
                 );
                 self.active_page = DevToolsPage::Inspector;
-                if self.inspector.auto_jump_to_source
+                if self.overlays.inspector
+                    && self.inspector.auto_jump_to_source
                     && let Some(loc) = self.inspector.resolve_jump_location(&selected_node)
                 {
                     self.jump_to_zed(loc);
@@ -282,8 +293,21 @@ impl RootView {
             BackendEvent::WidgetPropertiesLoaded {
                 value_id,
                 properties,
+                layout_node,
+                details_subtree,
             } => {
-                self.inspector.apply_properties(&value_id, properties);
+                self.inspector.apply_properties(
+                    &value_id,
+                    properties,
+                    layout_node,
+                    details_subtree,
+                );
+            }
+            BackendEvent::WidgetLayoutUpdated {
+                value_id,
+                layout_node,
+            } => {
+                self.inspector.apply_layout_update(&value_id, layout_node);
             }
             BackendEvent::LogAppended(entry) => {
                 self.logging.push_entry(entry);

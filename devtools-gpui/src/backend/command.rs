@@ -3,8 +3,8 @@ use flutter_debugger_protocol::{
 };
 
 use crate::protocol::{
-    FrameTiming, HttpRequestDetail, HttpRequestRecord, LogEntry, MemorySnapshot, SourceLocation,
-    WidgetProperty, WidgetTreeNode,
+    FrameTiming, HttpRequestDetail, HttpRequestRecord, LayoutExplorerNode, LogEntry,
+    MemorySnapshot, SourceLocation, WebSocketConnectionDetail, WidgetProperty, WidgetTreeNode,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,12 +48,27 @@ pub enum BackendCommand {
         request_id: String,
         isolate_id: Option<String>,
     },
+    SetShowImplementationWidgets(bool),
     RefreshWidgetTree,
     SelectWidgetNode {
         value_id: String,
+        highlight_on_device: bool,
     },
     ExpandWidgetChildren {
         value_id: String,
+    },
+    SetFlexProperties {
+        value_id: String,
+        main_axis_alignment: String,
+        cross_axis_alignment: String,
+    },
+    SetFlexFit {
+        value_id: String,
+        flex_fit: String,
+    },
+    SetFlexFactor {
+        value_id: String,
+        flex_factor: u32,
     },
     SetMemoryPolling(bool),
     ForceGc,
@@ -62,6 +77,7 @@ pub enum BackendCommand {
 }
 
 /// Events pushed from the background Tokio worker to the GPUI main thread.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum BackendEvent {
     SessionsUpdated {
@@ -83,6 +99,10 @@ pub enum BackendEvent {
         request_id: String,
         detail: HttpRequestDetail,
     },
+    WebSocketDetailLoaded {
+        request_id: String,
+        detail: WebSocketConnectionDetail,
+    },
     HttpRequestDetailFailed {
         request_id: String,
         error: String,
@@ -96,10 +116,18 @@ pub enum BackendEvent {
         tree: Option<WidgetTreeNode>,
         selected_node: WidgetTreeNode,
         properties: Vec<WidgetProperty>,
+        layout_node: Option<LayoutExplorerNode>,
+        details_subtree: Option<WidgetTreeNode>,
     },
     WidgetPropertiesLoaded {
         value_id: String,
         properties: Vec<WidgetProperty>,
+        layout_node: Option<LayoutExplorerNode>,
+        details_subtree: Option<WidgetTreeNode>,
+    },
+    WidgetLayoutUpdated {
+        value_id: String,
+        layout_node: LayoutExplorerNode,
     },
     LogAppended(LogEntry),
     LogUpdated(LogEntry),

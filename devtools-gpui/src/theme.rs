@@ -93,6 +93,7 @@ impl DevToolsTheme {
             "POST" => Self::success_green(),
             "PUT" | "PATCH" => Self::warning_yellow(),
             "DELETE" => Self::error_red(),
+            "WS" | "WSS" => Self::accent_cyan(),
             _ => Self::accent_purple(),
         }
     }

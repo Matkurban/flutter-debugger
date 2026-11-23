@@ -16,10 +16,13 @@ use gpui_kit::{
 use crate::backend::BackendCommand;
 use crate::protocol::{
     FormattedBody, HttpRequestDetail, HttpRequestRecord, JsonTokenKind,
+    WebSocketConnectionDetail,
 };
-use crate::theme::{DevToolsTheme, format_bytes, format_duration_ms};
+use crate::theme::{
+    DevToolsTheme, format_bytes, format_duration_ms, format_micros_local_hms,
+};
 use crate::ui::app::RootView;
-use crate::ui::components::{empty_placeholder, kv_row};
+use crate::ui::components::{empty_placeholder, kv_row, pill_badge};
 use crate::ui::tabs::network::NetworkDetailSubTab;
 
 pub fn render_request_detail_pane(
@@ -27,8 +30,13 @@ pub fn render_request_detail_pane(
     cx: &mut Context<RootView>,
 ) -> impl IntoElement {
     let Some(rec) = view.network.selected_record().cloned() else {
-        return empty_placeholder("No request selected").into_any_element();
+        return empty_placeholder("Select an HTTP request or WebSocket connection to inspect")
+            .into_any_element();
     };
+
+    if rec.is_websocket() {
+        return render_websocket_detail_pane(view, &rec, cx).into_any_element();
+    }
 
     let active_sub_tab = view.network.detail_tab;
     let detail = rec.detail.clone().unwrap_or_default();
@@ -156,6 +164,7 @@ pub fn render_request_detail_pane(
         .child(
             div()
                 .id("net-detail-body-scroll")
+                .relative()
                 .flex_1()
                 .min_h_0()
                 .w_full()
@@ -189,6 +198,409 @@ pub fn render_request_detail_pane(
                 }),
         )
         .into_any_element()
+}
+
+fn render_websocket_detail_pane(
+    view: &RootView,
+    rec: &HttpRequestRecord,
+    cx: &mut Context<RootView>,
+) -> impl IntoElement {
+    let ws = rec.ws_detail.clone().unwrap_or_default();
+    let is_overview = view.network.detail_tab == NetworkDetailSubTab::Overview;
+    let (status_badge, status_color) = rec.status_badge_label_and_color();
+    let rec_for_copy = rec.clone();
+    let req_id_refresh = rec.id.clone();
+    let iso_refresh = rec.isolate_id.clone();
+    let events_count = ws.events.len();
+
+    div()
+        .size_full()
+        .bg(DevToolsTheme::bg_panel())
+        .flex()
+        .flex_col()
+        .child(
+            div()
+                .w_full()
+                .h(px(32.0))
+                .px_3()
+                .bg(DevToolsTheme::bg_toolbar())
+                .border_b_1()
+                .border_color(DevToolsTheme::border())
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .h_full()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(
+                            div()
+                                .id("ws-detail-tab-overview")
+                                .h_full()
+                                .px_2p5()
+                                .cursor_pointer()
+                                .flex()
+                                .items_center()
+                                .border_b_2()
+                                .text_xs()
+                                .when(is_overview, |el| {
+                                    el.border_color(DevToolsTheme::accent_blue())
+                                        .text_color(DevToolsTheme::text_primary())
+                                        .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                })
+                                .when(!is_overview, |el| {
+                                    el.border_color(gpui_kit::transparent_black())
+                                        .text_color(DevToolsTheme::text_secondary())
+                                        .hover(|h| h.text_color(DevToolsTheme::text_primary()))
+                                })
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.network.detail_tab = NetworkDetailSubTab::Overview;
+                                    cx.notify();
+                                }))
+                                .child("Overview"),
+                        )
+                        .child(
+                            div()
+                                .id("ws-detail-tab-messages")
+                                .h_full()
+                                .px_2p5()
+                                .cursor_pointer()
+                                .flex()
+                                .items_center()
+                                .border_b_2()
+                                .text_xs()
+                                .when(!is_overview, |el| {
+                                    el.border_color(DevToolsTheme::accent_blue())
+                                        .text_color(DevToolsTheme::text_primary())
+                                        .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                })
+                                .when(is_overview, |el| {
+                                    el.border_color(gpui_kit::transparent_black())
+                                        .text_color(DevToolsTheme::text_secondary())
+                                        .hover(|h| h.text_color(DevToolsTheme::text_primary()))
+                                })
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.network.detail_tab = NetworkDetailSubTab::Response;
+                                    cx.notify();
+                                }))
+                                .child(format!("Messages & Events ({events_count})")),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            Button::new("ws-detail-refresh-btn")
+                                .small()
+                                .compact()
+                                .icon(Icon::new(IconName::RefreshCw))
+                                .label("Refresh")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.network.mark_detail_loading(&req_id_refresh);
+                                    this.send_cmd(BackendCommand::FetchHttpRequestDetail {
+                                        request_id: req_id_refresh.clone(),
+                                        isolate_id: iso_refresh.clone(),
+                                    });
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            Button::new("ws-detail-copy-all-btn")
+                                .small()
+                                .compact()
+                                .icon(Icon::new(IconName::ClipboardCopy))
+                                .label("Copy All")
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    let latest = this
+                                        .network
+                                        .selected_record()
+                                        .cloned()
+                                        .unwrap_or_else(|| rec_for_copy.clone());
+                                    this.copy_to_clipboard(
+                                        latest.to_full_text_report(),
+                                        "Copied WebSocket connection & events report",
+                                        window,
+                                        cx,
+                                    );
+                                })),
+                        )
+                        .child(pill_badge(&format!("WS {status_badge}"), status_color, 0.2)),
+                ),
+        )
+        .child(
+            div()
+                .id("ws-detail-body-scroll")
+                .relative()
+                .flex_1()
+                .min_h_0()
+                .w_full()
+                .p_3()
+                .overflow_y_scrollbar()
+                .child(if is_overview {
+                    render_websocket_overview_subtab(rec, &ws).into_any_element()
+                } else {
+                    render_websocket_messages_subtab(rec, &ws).into_any_element()
+                }),
+        )
+}
+
+fn render_websocket_overview_subtab(
+    rec: &HttpRequestRecord,
+    ws: &WebSocketConnectionDetail,
+) -> impl IntoElement + use<> {
+    let open_ts_str = ws
+        .open_timestamp
+        .map(format_micros_local_hms)
+        .unwrap_or_else(|| "-".to_string());
+    let close_ts_str = ws
+        .close_timestamp
+        .map(format_micros_local_hms)
+        .unwrap_or_else(|| "-".to_string());
+
+    div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap_3()
+        .child(
+            div()
+                .p_3()
+                .rounded(px(6.0))
+                .bg(DevToolsTheme::bg_main())
+                .border_1()
+                .border_color(DevToolsTheme::border())
+                .flex()
+                .flex_col()
+                .gap_1p5()
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                        .text_color(DevToolsTheme::accent_cyan())
+                        .child("WebSocket Connection"),
+                )
+                .child(kv_row("WebSocket URL", &rec.uri))
+                .child(kv_row("State", &ws.state))
+                .child(kv_row("Protocol", ws.protocol.as_deref().unwrap_or("-")))
+                .child(kv_row("Duration", &rec.duration_display()))
+                .child(kv_row("Connect Timestamp", &rec.timestamp_hms))
+                .child(kv_row("Open Timestamp", &open_ts_str))
+                .child(kv_row("Close Timestamp", &close_ts_str))
+                .when_some(ws.close_code, |el, code| {
+                    el.child(kv_row("Close Code", &code.to_string()))
+                })
+                .when_some(ws.close_reason.as_deref(), |el, reason| {
+                    el.child(kv_row("Close Reason", reason))
+                })
+                .when_some(
+                    ws.error.as_deref().or(rec.error.as_deref()),
+                    |el, err| el.child(kv_row("Error", err)),
+                ),
+        )
+        .child(
+            div()
+                .p_3()
+                .rounded(px(6.0))
+                .bg(DevToolsTheme::bg_main())
+                .border_1()
+                .border_color(DevToolsTheme::border())
+                .flex()
+                .flex_col()
+                .gap_1p5()
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                        .text_color(DevToolsTheme::accent_purple())
+                        .child("Frames & Traffic Metrics"),
+                )
+                .child(kv_row("Frames Sent", &ws.frames_sent.to_string()))
+                .child(kv_row("Frames Received", &ws.frames_received.to_string()))
+                .child(kv_row("Bytes Sent", &format_bytes(ws.bytes_sent)))
+                .child(kv_row("Bytes Received", &format_bytes(ws.bytes_received)))
+                .child(kv_row("Total Traffic", &format_bytes(rec.total_bytes())))
+                .child(kv_row("Ping Count", &ws.ping_count.to_string()))
+                .child(kv_row("Pong Count", &ws.pong_count.to_string())),
+        )
+}
+
+fn render_websocket_messages_subtab(
+    rec: &HttpRequestRecord,
+    ws: &WebSocketConnectionDetail,
+) -> impl IntoElement + use<> {
+    let connect_ts = ws.connect_timestamp;
+    let events = ws.events.clone();
+    let rec_id = rec.id.clone();
+
+    div()
+        .w_full()
+        .p_3()
+        .rounded(px(6.0))
+        .bg(DevToolsTheme::bg_main())
+        .border_1()
+        .border_color(DevToolsTheme::border())
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                        .text_color(DevToolsTheme::accent_cyan())
+                        .child(format!(
+                            "WebSocket Timeline Events & Frames ({})",
+                            events.len()
+                        )),
+                )
+                .child(
+                    div()
+                        .font_family(DevToolsTheme::MONO_FONT)
+                        .text_xs()
+                        .text_color(DevToolsTheme::text_secondary())
+                        .child(format!(
+                            "Sent: {} ({} frames) · Received: {} ({} frames)",
+                            format_bytes(ws.bytes_sent),
+                            ws.frames_sent,
+                            format_bytes(ws.bytes_received),
+                            ws.frames_received
+                        )),
+                ),
+        )
+        .when(events.is_empty(), |el| {
+            el.child(
+                div()
+                    .py_6()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_xs()
+                    .text_color(DevToolsTheme::text_muted())
+                    .child("No WebSocket events or frames recorded yet."),
+            )
+        })
+        .children(events.into_iter().enumerate().map(|(idx, ev)| {
+            let is_out = ev.direction.as_deref() == Some("out");
+            let is_in = ev.direction.as_deref() == Some("in");
+            let is_err = ev.event_name.contains("Error") || ev.error_message.is_some();
+            let dir_color = if is_err {
+                DevToolsTheme::error_red()
+            } else if is_out {
+                DevToolsTheme::accent_cyan()
+            } else if is_in {
+                DevToolsTheme::success_green()
+            } else {
+                DevToolsTheme::accent_purple()
+            };
+            let dir_icon = if is_out {
+                IconName::ArrowUp
+            } else if is_in {
+                IconName::ArrowDown
+            } else {
+                IconName::CircleDot
+            };
+            let rel_ms = ev.timestamp_micros.saturating_sub(connect_ts) / 1000;
+
+            div()
+                .w_full()
+                .p_2()
+                .rounded(px(4.0))
+                .bg(DevToolsTheme::bg_panel())
+                .border_1()
+                .border_color(DevToolsTheme::border())
+                .font_family(DevToolsTheme::MONO_FONT)
+                .text_xs()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(Icon::new(dir_icon).xsmall().text_color(dir_color))
+                                .child(
+                                    div()
+                                        .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                        .text_color(dir_color)
+                                        .child(SelectableText::new(
+                                            SharedString::from(format!(
+                                                "ws-ev-name-{rec_id}-{idx}"
+                                            )),
+                                            ev.event_name.clone(),
+                                        )),
+                                )
+                                .when_some(ev.frame_number, |el, fnum| {
+                                    el.child(pill_badge(
+                                        &format!("Frame #{fnum}"),
+                                        DevToolsTheme::accent_blue(),
+                                        0.18,
+                                    ))
+                                })
+                                .when_some(ev.opcode.as_deref(), |el, op| {
+                                    el.child(pill_badge(op, dir_color, 0.18))
+                                })
+                                .when_some(ev.payload_size, |el, sz| {
+                                    el.child(
+                                        div()
+                                            .text_color(DevToolsTheme::text_primary())
+                                            .child(SelectableText::new(
+                                                SharedString::from(format!(
+                                                    "ws-ev-sz-{rec_id}-{idx}"
+                                                )),
+                                                format_bytes(sz),
+                                            )),
+                                    )
+                                }),
+                        )
+                        .child(
+                            div()
+                                .text_color(DevToolsTheme::text_muted())
+                                .child(SelectableText::new(
+                                    SharedString::from(format!("ws-ev-ts-{rec_id}-{idx}")),
+                                    format!("{} (+{rel_ms} ms)", ev.timestamp_hms),
+                                )),
+                        ),
+                )
+                .when_some(ev.error_message.clone(), |el, err_msg| {
+                    let full_err = match &ev.error_type {
+                        Some(et) => format!("{et}: {err_msg}"),
+                        None => err_msg,
+                    };
+                    el.child(
+                        div()
+                            .text_color(DevToolsTheme::error_red())
+                            .child(SelectableText::new(
+                                SharedString::from(format!("ws-ev-err-{rec_id}-{idx}")),
+                                full_err,
+                            )),
+                    )
+                })
+                .when_some(ev.arguments_json.clone(), |el, args_str| {
+                    el.child(
+                        div()
+                            .text_color(DevToolsTheme::text_secondary())
+                            .child(SelectableText::new(
+                                SharedString::from(format!("ws-ev-args-{rec_id}-{idx}")),
+                                args_str,
+                            )),
+                    )
+                })
+        }))
 }
 
 fn render_overview_subtab(

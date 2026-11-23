@@ -12,31 +12,27 @@ use gpui_kit::{
 
 use crate::backend::BackendCommand;
 use crate::protocol::HttpRequestRecord;
-use crate::theme::{DevToolsTheme, format_bytes, format_duration_ms};
+use crate::theme::{DevToolsTheme, format_bytes};
 use crate::ui::app::RootView;
-use crate::ui::tabs::network::NetworkSortColumn;
+use crate::ui::tabs::network::{NetworkSortColumn, SortDirection};
 
 pub fn render_requests_table(
     view: &RootView,
     cx: &mut Context<RootView>,
 ) -> impl IntoElement {
-    let sort_col = view.network.sort_column;
-    let sort_asc = view.network.sort_ascending;
+    let active_sort = view.network.sort;
     let row_count = view.network.filtered_indices.len();
     let scroll_handle = view.network.scroll_handle.clone();
 
     let sort_icon = |col: NetworkSortColumn| -> Option<Icon> {
-        if sort_col == col {
-            Some(
-                Icon::new(if sort_asc {
-                    IconName::ArrowUp
-                } else {
-                    IconName::ArrowDown
-                })
-                .xsmall(),
-            )
-        } else {
-            None
+        match active_sort {
+            Some((c, SortDirection::Ascending)) if c == col => {
+                Some(Icon::new(IconName::ArrowUp).xsmall())
+            }
+            Some((c, SortDirection::Descending)) if c == col => {
+                Some(Icon::new(IconName::ArrowDown).xsmall())
+            }
+            _ => None,
         }
     };
 
@@ -133,7 +129,9 @@ pub fn render_requests_table(
                             cx.notify();
                         }))
                         .child("Duration")
-                        .when_some(sort_icon(NetworkSortColumn::Duration), |el, ic| el.child(ic)),
+                        .when_some(sort_icon(NetworkSortColumn::Duration), |el, ic| {
+                            el.child(ic)
+                        }),
                 )
                 .child(
                     div()
@@ -163,7 +161,9 @@ pub fn render_requests_table(
                             cx.notify();
                         }))
                         .child("Time")
-                        .when_some(sort_icon(NetworkSortColumn::Timestamp), |el, ic| el.child(ic)),
+                        .when_some(sort_icon(NetworkSortColumn::Timestamp), |el, ic| {
+                            el.child(ic)
+                        }),
                 ),
         )
         .child(if row_count == 0 {
@@ -175,7 +175,7 @@ pub fn render_requests_table(
                 .justify_center()
                 .text_xs()
                 .text_color(DevToolsTheme::text_muted())
-                .child("No HTTP requests matching current filter.")
+                .child("No HTTP or WebSocket traffic matching current filter.")
                 .into_any_element()
         } else {
             div()
@@ -225,12 +225,8 @@ fn render_single_request_row(
 ) -> impl IntoElement + use<> {
     let req_id = rec.id.clone();
     let method_color = DevToolsTheme::method_color(&rec.method);
-    let status_color = DevToolsTheme::status_color(rec.status_code);
-    let status_label = match rec.status_code {
-        Some(code) => code.to_string(),
-        None if rec.error.is_some() => "ERR".to_string(),
-        None => "...".to_string(),
-    };
+    let (status_label, status_color) = rec.status_badge_label_and_color();
+    let duration_label = rec.duration_display();
 
     div()
         .id(SharedString::from(format!("net-row-{}", rec.id)))
@@ -309,12 +305,12 @@ fn render_single_request_row(
         .child(
             div()
                 .w(px(82.0))
-                .text_color(if rec.duration_ms.unwrap_or(0) > 1000 {
+                .text_color(if !rec.is_websocket() && rec.duration_ms.unwrap_or(0) > 1000 {
                     DevToolsTheme::warning_yellow()
                 } else {
                     DevToolsTheme::text_primary()
                 })
-                .child(format_duration_ms(rec.duration_ms)),
+                .child(duration_label),
         )
         .child(
             div()
