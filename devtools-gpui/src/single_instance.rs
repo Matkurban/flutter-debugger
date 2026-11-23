@@ -5,9 +5,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use async_channel::Receiver;
+use flutter_debugger_protocol::{default_cache_dir, is_pid_alive};
 use serde::{Deserialize, Serialize};
-
-use crate::backend::session::is_pid_alive;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SingleInstanceRecord {
@@ -28,25 +27,40 @@ pub struct SingleInstanceFocusCommand {
     pub vm_uri: Option<String>,
 }
 
-pub fn default_instance_lock_path() -> PathBuf {
-    let base = dirs::cache_dir().unwrap_or_else(std::env::temp_dir);
-    base.join("flutter-devtools-gpui.json")
+/// Automatically removes the lock file on drop if it still belongs to this process.
+pub struct SingleInstanceGuard {
+    lock_path: PathBuf,
+    pid: u32,
 }
 
-/// Checks if a live instance is already running at `lock_path`.
-/// If alive and reachable via TCP, sends `cmd` and returns `Ok(None)`.
-/// Otherwise binds a new control port, writes `lock_path`, spawns a listener thread,
-/// and returns `Ok(Some(receiver))`.
+impl Drop for SingleInstanceGuard {
+    fn drop(&mut self) {
+        if let Ok(bytes) = fs::read(&self.lock_path)
+            && let Ok(rec) = serde_json::from_slice::<SingleInstanceRecord>(&bytes)
+            && rec.pid == self.pid
+        {
+            let _ = fs::remove_file(&self.lock_path);
+        }
+    }
+}
+
+pub fn default_instance_lock_path() -> PathBuf {
+    default_cache_dir().join("devtools-gpui.json")
+}
+
+/// Checks if a live instance is already running at `<cache>/flutter-debugger/devtools-gpui.json`.
+/// If alive and reachable via TCP, forwards `cmd` and returns `Ok(None)`.
+/// Otherwise binds a new control port, writes the lock file, and returns `Ok(Some((rx, guard)))`.
 pub fn try_forward_or_bind_single_instance(
     cmd: &SingleInstanceFocusCommand,
-) -> Result<Option<Receiver<SingleInstanceFocusCommand>>, String> {
+) -> Result<Option<(Receiver<SingleInstanceFocusCommand>, SingleInstanceGuard)>, String> {
     try_forward_or_bind_with_path(&default_instance_lock_path(), cmd)
 }
 
 pub fn try_forward_or_bind_with_path(
     lock_path: &Path,
     cmd: &SingleInstanceFocusCommand,
-) -> Result<Option<Receiver<SingleInstanceFocusCommand>>, String> {
+) -> Result<Option<(Receiver<SingleInstanceFocusCommand>, SingleInstanceGuard)>, String> {
     if let Ok(bytes) = fs::read(lock_path)
         && let Ok(record) = serde_json::from_slice::<SingleInstanceRecord>(&bytes)
     {
@@ -77,10 +91,8 @@ pub fn try_forward_or_bind_with_path(
     if let Some(parent) = lock_path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    let rec = SingleInstanceRecord {
-        pid: std::process::id(),
-        port,
-    };
+    let pid = std::process::id();
+    let rec = SingleInstanceRecord { pid, port };
     if let Ok(data) = serde_json::to_vec_pretty(&rec) {
         let tmp = lock_path.with_extension("json.tmp");
         if fs::write(&tmp, data).is_ok() {
@@ -105,7 +117,11 @@ pub fn try_forward_or_bind_with_path(
         })
         .map_err(|e| format!("spawn single-instance listener: {e}"))?;
 
-    Ok(Some(rx))
+    let guard = SingleInstanceGuard {
+        lock_path: lock_path.to_path_buf(),
+        pid,
+    };
+    Ok(Some((rx, guard)))
 }
 
 #[cfg(test)]
@@ -113,11 +129,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn single_instance_binds_and_forwards_focus_command() {
+    fn single_instance_binds_forwards_and_cleans_up_on_drop() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let lock_path = dir.path().join("flutter-devtools-gpui.json");
+        let lock_path = dir.path().join("devtools-gpui.json");
 
-        // Write a dead PID first to verify stale lock cleanup
         let stale = SingleInstanceRecord {
             pid: 999_999_999,
             port: 65000,
@@ -132,11 +147,10 @@ mod tests {
             vm_uri: None,
         };
 
-        let rx = try_forward_or_bind_with_path(&lock_path, &initial_cmd)
+        let (rx, guard) = try_forward_or_bind_with_path(&lock_path, &initial_cmd)
             .expect("bind ok")
             .expect("should become primary instance");
 
-        // Now simulate a second process reading the lock file and connecting to its port
         let saved: SingleInstanceRecord =
             serde_json::from_slice(&fs::read(&lock_path).unwrap()).unwrap();
         assert_eq!(saved.pid, std::process::id());
@@ -155,5 +169,8 @@ mod tests {
         assert_eq!(received.page.as_deref(), Some("inspector"));
         assert_eq!(received.project.as_deref(), Some("/tmp/my_app"));
         assert_eq!(received.session_id.as_deref(), Some("s-123"));
+
+        drop(guard);
+        assert!(!lock_path.exists());
     }
 }

@@ -147,12 +147,7 @@ pub fn is_fresh(fetched_at_unix: u64, ttl_secs: u64) -> bool {
     now_unix().saturating_sub(fetched_at_unix) < ttl_secs
 }
 
-pub fn normalize_project_key(path: &Path) -> String {
-    fs::canonicalize(path)
-        .unwrap_or_else(|_| path.to_path_buf())
-        .to_string_lossy()
-        .into_owned()
-}
+pub use flutter_debugger_protocol::normalize_project_key;
 
 /// Result of resolving which Flutter device a DAP or `ctl run` session should target.
 #[derive(Debug, Clone, PartialEq, Eq)]

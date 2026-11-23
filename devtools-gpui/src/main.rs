@@ -1,15 +1,21 @@
+#![cfg_attr(not(test), deny(clippy::unwrap_used))]
+
 mod backend;
+mod cli;
+mod protocol;
 mod single_instance;
 mod theme;
 mod ui;
 
-use backend::{BackendCommand, CliLaunchArgs, DevToolsPage, spawn_backend_worker};
+use backend::{BackendCommand, spawn_backend_worker};
+use cli::{CliLaunchArgs, print_usage};
 use gpui_kit::{
     AppContext as _, Bounds, KeyBinding, WindowBounds, WindowOptions,
     assets::Assets,
     component::{Theme, ThemeMode},
     px, size,
 };
+use protocol::DevToolsPage;
 use single_instance::{SingleInstanceFocusCommand, try_forward_or_bind_single_instance};
 use ui::app::{
     HotReloadAction, HotRestartAction, RootView, SwitchTabInspector, SwitchTabLogging,
@@ -29,25 +35,22 @@ fn main() {
 
     let launch_args = CliLaunchArgs::parse(&args);
 
-    // Single-instance check: if an existing instance is alive, send focus/page/session command and exit.
-    let single_instance_rx = match try_forward_or_bind_single_instance(&SingleInstanceFocusCommand {
-        action: "focus".to_string(),
-        page: launch_args.page.map(|p| p.as_slug().to_string()),
-        project: launch_args.project.clone(),
-        session_id: launch_args.session_id.clone(),
-        vm_uri: launch_args.vm_uri.clone(),
-    }) {
-        Ok(Some(rx)) => rx,
-        Ok(None) => {
-            // Existing instance handled the focus request.
-            return;
-        }
-        Err(err) => {
-            eprintln!("[flutter-devtools-gpui] single-instance warning: {err}");
-            let (_, rx) = async_channel::unbounded();
-            rx
-        }
-    };
+    let (single_instance_rx, _instance_guard) =
+        match try_forward_or_bind_single_instance(&SingleInstanceFocusCommand {
+            action: "focus".to_string(),
+            page: launch_args.page.map(|p| p.as_slug().to_string()),
+            project: launch_args.project.clone(),
+            session_id: launch_args.session_id.clone(),
+            vm_uri: launch_args.vm_uri.clone(),
+        }) {
+            Ok(Some((rx, guard))) => (rx, Some(guard)),
+            Ok(None) => return,
+            Err(err) => {
+                eprintln!("[flutter-devtools-gpui] single-instance warning: {err}");
+                let (_, rx) = async_channel::unbounded();
+                (rx, None)
+            }
+        };
 
     let (cmd_tx, event_rx) = spawn_backend_worker(launch_args.clone());
 
@@ -97,23 +100,4 @@ fn main() {
                 let _ = cmd_tx.try_send(BackendCommand::Shutdown);
             }
         });
-}
-
-fn print_usage() {
-    println!(
-        "flutter-devtools-gpui {}
-Native GPUI Flutter DevTools companion application for Zed
-
-USAGE:
-  flutter-devtools-gpui [OPTIONS]
-
-OPTIONS:
-  --project <dir>       Attach to active Flutter session for project directory
-  --session <id>        Attach to a specific session ID
-  --vm-uri <ws://...>   Directly connect to a Dart VM Service URI
-  --page <tab>          Initial tab: inspector | network | logging | performance | memory
-  -h, --help            Print help
-  -V, --version         Print version",
-        env!("CARGO_PKG_VERSION")
-    );
 }

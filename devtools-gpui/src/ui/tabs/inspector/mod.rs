@@ -1,0 +1,427 @@
+pub mod properties;
+pub mod tree;
+
+use flutter_debugger_protocol::ServiceOverlay;
+use gpui_kit::{
+    Context, Entity, IntoElement, ParentElement as _, Styled as _, UniformListScrollHandle, Window,
+    component::{
+        Selectable as _, Sizable as _,
+        button::Button,
+        h_resizable,
+        input::{Input, InputState},
+        resizable_panel,
+    },
+    div, px,
+};
+
+use crate::backend::BackendCommand;
+use crate::protocol::{SourceLocation, WidgetProperty, WidgetTreeNode};
+use crate::theme::DevToolsTheme;
+use crate::ui::app::RootView;
+use crate::ui::components::subtoolbar_container;
+
+use properties::render_widget_properties_pane;
+use tree::render_widget_tree_list;
+
+#[derive(Debug, Clone)]
+pub struct FlatWidgetRow {
+    pub depth: usize,
+    pub value_id: String,
+    pub widget_runtime_type: String,
+    pub description: String,
+    pub has_children: bool,
+    pub expanded: bool,
+    pub created_by_local_project: bool,
+    pub location: Option<SourceLocation>,
+}
+
+pub struct InspectorTabState {
+    pub root: Option<WidgetTreeNode>,
+    pub selected_value_id: Option<String>,
+    pub selected_properties: Vec<WidgetProperty>,
+    pub search_input: Entity<InputState>,
+    pub search_query: String,
+    pub flat_rows: Vec<FlatWidgetRow>,
+    pub scroll_handle: UniformListScrollHandle,
+}
+
+impl InspectorTabState {
+    pub fn new(search_input: Entity<InputState>) -> Self {
+        Self {
+            root: None,
+            selected_value_id: None,
+            selected_properties: Vec::new(),
+            search_input,
+            search_query: String::new(),
+            flat_rows: Vec::new(),
+            scroll_handle: UniformListScrollHandle::new(),
+        }
+    }
+
+    pub fn set_search_query(&mut self, query: String) {
+        if self.search_query != query {
+            self.search_query = query;
+            self.rebuild_flat_rows();
+        }
+    }
+
+    pub fn set_root_tree(&mut self, root: WidgetTreeNode) -> Option<String> {
+        let keep_existing = self
+            .selected_value_id
+            .as_deref()
+            .and_then(|id| find_node_by_id(&root, id))
+            .map(|n| (n.value_id.clone(), n.properties.clone()));
+
+        let chosen_id = if let Some((id, props)) = keep_existing {
+            if !props.is_empty() {
+                self.selected_properties = props;
+            }
+            self.root = Some(root);
+            Some(id)
+        } else {
+            let id = root.value_id.clone();
+            self.selected_value_id = Some(id.clone());
+            self.selected_properties = root.properties.clone();
+            self.root = Some(root);
+            Some(id)
+        };
+        self.rebuild_flat_rows();
+        chosen_id
+    }
+
+    pub fn apply_children(&mut self, parent_value_id: &str, children: Vec<WidgetTreeNode>) {
+        if let Some(ref mut root) = self.root
+            && attach_children_mut(root, parent_value_id, children)
+        {
+            self.rebuild_flat_rows();
+        }
+    }
+
+    pub fn apply_device_selection(
+        &mut self,
+        selected_node: WidgetTreeNode,
+        properties: Vec<WidgetProperty>,
+    ) {
+        let target_id = selected_node.value_id.clone();
+        if let Some(ref mut root) = self.root {
+            if !expand_path_to_node_mut(root, &target_id) {
+                root.children.push(selected_node.clone());
+                root.expanded = true;
+            }
+        } else {
+            self.root = Some(selected_node.clone());
+        }
+        self.selected_value_id = Some(target_id);
+        self.selected_properties = if !properties.is_empty() {
+            properties
+        } else {
+            selected_node.properties
+        };
+        self.rebuild_flat_rows();
+    }
+
+    pub fn apply_properties(&mut self, value_id: &str, props: Vec<WidgetProperty>) {
+        if self.selected_value_id.as_deref() == Some(value_id) && !props.is_empty() {
+            self.selected_properties = props;
+        }
+    }
+
+    pub fn select_node(&mut self, value_id: &str) -> Option<SourceLocation> {
+        self.selected_value_id = Some(value_id.to_string());
+        if let Some(ref root) = self.root
+            && let Some(node) = find_node_by_id(root, value_id)
+        {
+            self.selected_properties = node.properties.clone();
+            return node.location.clone();
+        }
+        None
+    }
+
+    /// Toggles expansion of `value_id`. Returns `true` if the node was expanded and has
+    /// `has_children && children.is_empty()` so lazy child loading should be triggered.
+    pub fn toggle_expand(&mut self, value_id: &str) -> bool {
+        let mut needs_lazy_load = false;
+        if let Some(ref mut root) = self.root {
+            toggle_node_expand_mut(root, value_id, &mut needs_lazy_load);
+            self.rebuild_flat_rows();
+        }
+        needs_lazy_load
+    }
+
+    pub fn set_all_expanded(&mut self, expanded: bool) {
+        if let Some(ref mut root) = self.root {
+            set_all_expanded_mut(root, expanded);
+            self.rebuild_flat_rows();
+        }
+    }
+
+    pub fn selected_node(&self) -> Option<&WidgetTreeNode> {
+        let id = self.selected_value_id.as_deref()?;
+        let root = self.root.as_ref()?;
+        find_node_by_id(root, id)
+    }
+
+    pub fn flattened_count(&self) -> usize {
+        fn count_nodes(n: &WidgetTreeNode) -> usize {
+            1 + n.children.iter().map(count_nodes).sum::<usize>()
+        }
+        self.root.as_ref().map_or(0, count_nodes)
+    }
+
+    pub fn rebuild_flat_rows(&mut self) {
+        self.flat_rows.clear();
+        let Some(ref root) = self.root else {
+            return;
+        };
+        let q = self.search_query.trim().to_ascii_lowercase();
+        flatten_node_rec(root, 0, &q, &mut self.flat_rows);
+    }
+}
+
+fn find_node_by_id<'a>(node: &'a WidgetTreeNode, value_id: &str) -> Option<&'a WidgetTreeNode> {
+    if node.value_id == value_id {
+        return Some(node);
+    }
+    for child in &node.children {
+        if let Some(found) = find_node_by_id(child, value_id) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn attach_children_mut(
+    node: &mut WidgetTreeNode,
+    parent_id: &str,
+    children: Vec<WidgetTreeNode>,
+) -> bool {
+    if node.value_id == parent_id {
+        node.children = children;
+        node.has_children = !node.children.is_empty();
+        node.expanded = true;
+        return true;
+    }
+    for child in &mut node.children {
+        if attach_children_mut(child, parent_id, children.clone()) {
+            return true;
+        }
+    }
+    false
+}
+
+fn expand_path_to_node_mut(node: &mut WidgetTreeNode, target_id: &str) -> bool {
+    if node.value_id == target_id {
+        return true;
+    }
+    for child in &mut node.children {
+        if expand_path_to_node_mut(child, target_id) {
+            node.expanded = true;
+            return true;
+        }
+    }
+    false
+}
+
+fn toggle_node_expand_mut(
+    node: &mut WidgetTreeNode,
+    value_id: &str,
+    needs_lazy_load: &mut bool,
+) -> bool {
+    if node.value_id == value_id {
+        node.expanded = !node.expanded;
+        if node.expanded && node.has_children && node.children.is_empty() {
+            *needs_lazy_load = true;
+        }
+        return true;
+    }
+    for child in &mut node.children {
+        if toggle_node_expand_mut(child, value_id, needs_lazy_load) {
+            return true;
+        }
+    }
+    false
+}
+
+fn set_all_expanded_mut(node: &mut WidgetTreeNode, expanded: bool) {
+    node.expanded = expanded;
+    for child in &mut node.children {
+        set_all_expanded_mut(child, expanded);
+    }
+}
+
+fn node_or_descendant_matches(node: &WidgetTreeNode, q: &str) -> bool {
+    if q.is_empty() {
+        return true;
+    }
+    if node.widget_runtime_type.to_ascii_lowercase().contains(q)
+        || node.description.to_ascii_lowercase().contains(q)
+        || node
+            .location
+            .as_ref()
+            .is_some_and(|l| l.uri.to_ascii_lowercase().contains(q))
+    {
+        return true;
+    }
+    node.children
+        .iter()
+        .any(|c| node_or_descendant_matches(c, q))
+}
+
+fn flatten_node_rec(
+    node: &WidgetTreeNode,
+    depth: usize,
+    q: &str,
+    out: &mut Vec<FlatWidgetRow>,
+) {
+    if !node_or_descendant_matches(node, q) {
+        return;
+    }
+    out.push(FlatWidgetRow {
+        depth,
+        value_id: node.value_id.clone(),
+        widget_runtime_type: node.widget_runtime_type.clone(),
+        description: node.description.clone(),
+        has_children: !node.children.is_empty() || node.has_children,
+        expanded: node.expanded || !q.is_empty(),
+        created_by_local_project: node.created_by_local_project,
+        location: node.location.clone(),
+    });
+
+    if node.expanded || !q.is_empty() {
+        for child in &node.children {
+            flatten_node_rec(child, depth + 1, q, out);
+        }
+    }
+}
+
+impl RootView {
+    pub fn render_inspector_tab(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let visible_count = self.inspector.flat_rows.len();
+        let total_count = self.inspector.flattened_count();
+        let select_mode_on = self.overlays.inspector;
+        let selected_loc = self
+            .inspector
+            .selected_node()
+            .and_then(|n| n.location.clone());
+
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(DevToolsTheme::bg_main())
+            .child(
+                subtoolbar_container()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1p5()
+                            .child(
+                                Button::new("insp-refresh-btn")
+                                    .small()
+                                    .compact()
+                                    .label("↻ Refresh Tree")
+                                    .tooltip("Fetch latest Flutter Widget Summary Tree")
+                                    .on_click(cx.listener(|this, _, _, _| {
+                                        this.send_cmd(BackendCommand::RefreshWidgetTree);
+                                    })),
+                            )
+                            .child(
+                                Button::new("insp-select-mode-btn")
+                                    .small()
+                                    .compact()
+                                    .selected(select_mode_on)
+                                    .label(if select_mode_on {
+                                        "🎯 Select Widget: ON"
+                                    } else {
+                                        "🎯 Select Widget: OFF"
+                                    })
+                                    .tooltip("Toggle device on-screen widget selection mode")
+                                    .on_click(cx.listener(|this, _, _, _| {
+                                        this.toggle_overlay(ServiceOverlay::Inspector);
+                                    })),
+                            )
+                            .child(
+                                div().w(px(240.0)).child(
+                                    Input::new(&self.inspector.search_input)
+                                        .id("insp-search-input")
+                                        .small()
+                                        .cleanable(true),
+                                ),
+                            )
+                            .child(
+                                Button::new("insp-expand-all-btn")
+                                    .small()
+                                    .compact()
+                                    .label("Expand All")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.inspector.set_all_expanded(true);
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new("insp-collapse-all-btn")
+                                    .small()
+                                    .compact()
+                                    .label("Collapse All")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.inspector.set_all_expanded(false);
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .font_family(DevToolsTheme::MONO_FONT)
+                                    .text_xs()
+                                    .text_color(DevToolsTheme::text_secondary())
+                                    .child(format!(
+                                        "{visible_count} visible / {total_count} total widgets"
+                                    )),
+                            )
+                            .child(
+                                Button::new("insp-jump-source-btn")
+                                    .small()
+                                    .compact()
+                                    .label("↗ Jump to Source")
+                                    .tooltip(
+                                        "Open selected Widget creation location in Zed Editor",
+                                    )
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        if let Some(ref loc) = selected_loc {
+                                            this.jump_to_zed(loc.clone());
+                                        } else {
+                                            this.show_toast(
+                                                "Selected widget has no local source location",
+                                                true,
+                                                window,
+                                                cx,
+                                            );
+                                        }
+                                    })),
+                            ),
+                    ),
+            )
+            .child(
+                div().flex_1().min_h_0().w_full().child(
+                    h_resizable("inspector-split-pane")
+                        .child(
+                            resizable_panel()
+                                .size(px(640.0))
+                                .size_range(px(320.0)..px(1050.0))
+                                .child(render_widget_tree_list(self, cx)),
+                        )
+                        .child(resizable_panel().child(render_widget_properties_pane(self, cx))),
+                ),
+            )
+    }
+}

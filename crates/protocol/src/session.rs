@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-/// Persistent metadata for a single active Flutter/Dart session (1:1 compatible with `server/src/ipc.rs`).
+/// Persistent metadata for a single active Flutter/Dart session (DAP or `ctl run`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActiveSessionRecord {
     pub session_id: String,
@@ -46,13 +46,17 @@ impl ActiveSessionRecord {
     }
 }
 
-pub fn default_sessions_dir() -> PathBuf {
+pub fn default_cache_dir() -> PathBuf {
     let base = dirs::cache_dir().unwrap_or_else(std::env::temp_dir);
-    base.join("flutter-debugger").join("sessions")
+    base.join("flutter-debugger")
 }
 
-/// Lists all live active sessions under `sessions_dir`, pruning dead PIDs and sorting
-/// newest-first (`started_at` descending).
+pub fn default_sessions_dir() -> PathBuf {
+    default_cache_dir().join("sessions")
+}
+
+/// Lists all live active sessions under `sessions_dir`, automatically pruning dead PIDs
+/// and corrupt session files. Sorted newest-first (`started_at` descending).
 pub fn list_active_sessions_in(sessions_dir: &Path) -> Vec<ActiveSessionRecord> {
     let Ok(entries) = fs::read_dir(sessions_dir) else {
         return Vec::new();
@@ -108,7 +112,7 @@ pub fn select_best_session<'a>(
 }
 
 pub fn normalize_project_key(path: &Path) -> String {
-    fs::canonicalize(path)
+    path.canonicalize()
         .unwrap_or_else(|_| path.to_path_buf())
         .to_string_lossy()
         .into_owned()

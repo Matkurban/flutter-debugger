@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 
+use flutter_debugger_protocol::ServiceOverlay;
 use gpui_kit::{
     Context, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
     StatefulInteractiveElement as _, Styled as _, Window,
@@ -12,9 +13,10 @@ use gpui_kit::{
     px,
 };
 
-use crate::backend::{FrameTiming, ServiceOverlay};
+use crate::protocol::FrameTiming;
 use crate::theme::DevToolsTheme;
 use crate::ui::app::RootView;
+use crate::ui::components::{legend_swatch, metric_card, pill_badge, subtoolbar_container};
 
 const MAX_FRAMES: usize = 120;
 
@@ -77,7 +79,11 @@ impl PerformanceTabState {
         if self.frames.is_empty() {
             return 0.0;
         }
-        let mut totals: Vec<f64> = self.frames.iter().map(|f| f.total_ms()).collect();
+        let mut totals: Vec<f64> = self
+            .frames
+            .iter()
+            .map(|f| f.build_ms().max(f.raster_ms()))
+            .collect();
         totals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let idx = ((totals.len() as f64) * 0.95).floor() as usize;
         totals[idx.min(totals.len() - 1)]
@@ -94,11 +100,7 @@ impl PerformanceTabState {
 }
 
 impl RootView {
-    pub fn render_performance_tab(
-        &mut self,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    pub fn render_performance_tab(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let recording = self.performance.recording;
         let is_120 = self.performance.target_fps_120;
         let budget_ms = self.performance.budget_ms();
@@ -107,30 +109,25 @@ impl RootView {
 
         let avg_ui = self.performance.avg_ui_ms();
         let avg_raster = self.performance.avg_raster_ms();
-        let p95_total = self.performance.p95_total_ms();
+        let p95_peak = self.performance.p95_total_ms();
         let jank_count = self.performance.jank_count();
         let total_frames = self.performance.frames.len();
         let selected_frame = self.performance.selected_frame();
         let frames_snapshot: Vec<FrameTiming> = self.performance.frames.iter().copied().collect();
+
+        let jank_subtitle = if total_frames > 0 {
+            format!("{:.1}% dropped frames", (jank_count as f64) * 100.0 / (total_frames as f64))
+        } else {
+            "Waiting for Flutter.Frame events".to_string()
+        };
 
         div()
             .size_full()
             .flex()
             .flex_col()
             .bg(DevToolsTheme::bg_main())
-            // Sub-toolbar
             .child(
-                div()
-                    .w_full()
-                    .h(px(36.0))
-                    .px_3()
-                    .bg(DevToolsTheme::bg_panel())
-                    .border_b_1()
-                    .border_color(DevToolsTheme::border())
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_2()
+                subtoolbar_container()
                     .child(
                         div()
                             .flex()
@@ -141,26 +138,20 @@ impl RootView {
                                     .small()
                                     .compact()
                                     .selected(recording)
-                                    .label(if recording {
-                                        "● Recording"
-                                    } else {
-                                        "⏸ Paused"
-                                    })
+                                    .label(if recording { "● Recording" } else { "⏸ Paused" })
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.performance.recording = !this.performance.recording;
                                         cx.notify();
                                     })),
                             )
                             .child(
-                                Button::new("perf-clear-btn")
-                                    .small()
-                                    .compact()
-                                    .label("Clear")
-                                    .on_click(cx.listener(|this, _, _, cx| {
+                                Button::new("perf-clear-btn").small().compact().label("Clear").on_click(
+                                    cx.listener(|this, _, _, cx| {
                                         this.performance.frames.clear();
                                         this.performance.selected_frame_number = None;
                                         cx.notify();
-                                    })),
+                                    }),
+                                ),
                             )
                             .child(
                                 Button::new("perf-60fps-btn")
@@ -212,7 +203,6 @@ impl RootView {
                             ),
                     ),
             )
-            // Body
             .child(
                 div()
                     .flex_1()
@@ -222,113 +212,45 @@ impl RootView {
                     .flex()
                     .flex_col()
                     .gap_4()
-                    // Top 4 Metric Cards
                     .child(
                         div()
                             .w_full()
                             .flex()
                             .items_center()
                             .gap_3()
-                            .child(perf_metric_card(
+                            .child(metric_card(
                                 "Avg UI (Build)",
                                 &format!("{avg_ui:.2} ms"),
-                                format!("Budget: {budget_ms:.1} ms"),
-                                if avg_ui > budget_ms {
-                                    DevToolsTheme::error_red()
-                                } else {
-                                    DevToolsTheme::accent_blue()
-                                },
+                                &format!("Budget: {budget_ms:.1} ms"),
+                                if avg_ui > budget_ms { DevToolsTheme::error_red() } else { DevToolsTheme::accent_blue() },
                             ))
-                            .child(perf_metric_card(
+                            .child(metric_card(
                                 "Avg Raster",
                                 &format!("{avg_raster:.2} ms"),
-                                "GPU Rasterizer Thread".to_string(),
-                                if avg_raster > budget_ms {
-                                    DevToolsTheme::error_red()
-                                } else {
-                                    DevToolsTheme::accent_purple()
-                                },
+                                "GPU Rasterizer Thread",
+                                if avg_raster > budget_ms { DevToolsTheme::error_red() } else { DevToolsTheme::accent_purple() },
                             ))
-                            .child(perf_metric_card(
-                                "P95 Total Frame",
-                                &format!("{p95_total:.2} ms"),
-                                "95th Percentile Latency".to_string(),
-                                if p95_total > budget_ms * 1.5 {
-                                    DevToolsTheme::warning_yellow()
-                                } else {
-                                    DevToolsTheme::success_green()
-                                },
+                            .child(metric_card(
+                                "P95 Max Thread",
+                                &format!("{p95_peak:.2} ms"),
+                                "95th Percentile max(UI, Raster)",
+                                if p95_peak > budget_ms { DevToolsTheme::warning_yellow() } else { DevToolsTheme::success_green() },
                             ))
-                            .child(perf_metric_card(
+                            .child(metric_card(
                                 "Jank Frames",
                                 &format!("{jank_count} / {total_frames}"),
-                                if total_frames > 0 {
-                                    format!(
-                                        "{:.1}% dropped frames",
-                                        (jank_count as f64) * 100.0 / (total_frames as f64)
-                                    )
-                                } else {
-                                    "Waiting for Flutter.Frame events".to_string()
-                                },
-                                if jank_count > 0 {
-                                    DevToolsTheme::error_red()
-                                } else {
-                                    DevToolsTheme::success_green()
-                                },
+                                &jank_subtitle,
+                                if jank_count > 0 { DevToolsTheme::error_red() } else { DevToolsTheme::success_green() },
                             )),
                     )
-                    // Native GPUI Dual-Color Frame Bar Chart
-                    .child(render_frame_bar_chart(
-                        frames_snapshot,
-                        budget_ms,
-                        selected_frame.map(|f| f.number),
-                        cx,
-                    ))
-                    // Selected Frame Breakdown Card
+                    .child(render_frame_bar_chart(frames_snapshot, budget_ms, selected_frame.map(|f| f.number), cx))
                     .child(render_selected_frame_card(selected_frame, budget_ms)),
             )
     }
 }
 
-fn perf_metric_card(
-    title: &str,
-    value: &str,
-    subtitle: String,
-    accent: gpui_kit::Rgba,
-) -> impl IntoElement + use<> {
-    div()
-        .flex_1()
-        .p_3()
-        .rounded(px(6.0))
-        .bg(DevToolsTheme::bg_panel())
-        .border_1()
-        .border_color(DevToolsTheme::border())
-        .flex()
-        .flex_col()
-        .gap_1()
-        .child(
-            div()
-                .text_xs()
-                .text_color(DevToolsTheme::text_secondary())
-                .child(title.to_string()),
-        )
-        .child(
-            div()
-                .font_family(DevToolsTheme::MONO_FONT)
-                .text_lg()
-                .font_weight(gpui_kit::FontWeight::BOLD)
-                .text_color(accent)
-                .child(value.to_string()),
-        )
-        .child(
-            div()
-                .font_family(DevToolsTheme::MONO_FONT)
-                .text_xs()
-                .text_color(DevToolsTheme::text_muted())
-                .child(subtitle),
-        )
-}
-
+/// Official side-by-side paired UI/Raster bar chart: each frame column displays
+/// Left bar = UI Build (blue or red if > budget), Right bar = Raster (purple or red if > budget).
 fn render_frame_bar_chart(
     frames: Vec<FrameTiming>,
     budget_ms: f64,
@@ -336,10 +258,10 @@ fn render_frame_bar_chart(
     cx: &mut Context<RootView>,
 ) -> impl IntoElement {
     let chart_height_px: f32 = 240.0;
-    let max_scale_ms = (budget_ms * 2.2).max(
+    let max_scale_ms = (budget_ms * 2.0).max(
         frames
             .iter()
-            .map(|f| f.build_ms() + f.raster_ms())
+            .map(|f| f.build_ms().max(f.raster_ms()))
             .fold(budget_ms * 2.0, f64::max),
     );
     let budget_line_bottom_px =
@@ -357,7 +279,6 @@ fn render_frame_bar_chart(
         .flex()
         .flex_col()
         .justify_between()
-        // Header + Legend
         .child(
             div()
                 .w_full()
@@ -369,7 +290,7 @@ fn render_frame_bar_chart(
                         .text_xs()
                         .font_weight(gpui_kit::FontWeight::SEMIBOLD)
                         .text_color(DevToolsTheme::text_primary())
-                        .child("Flutter.Frame Timeline (Last 120 Frames — Click any bar to inspect)"),
+                        .child("Flutter.Frame Timeline (Side-by-Side UI & Raster Bars — Last 120 Frames)"),
                 )
                 .child(
                     div()
@@ -378,12 +299,11 @@ fn render_frame_bar_chart(
                         .flex()
                         .items_center()
                         .gap_4()
-                        .child(legend_item(DevToolsTheme::accent_blue(), "UI (Build)"))
-                        .child(legend_item(DevToolsTheme::accent_purple(), "Raster"))
-                        .child(legend_item(DevToolsTheme::error_red(), "Jank (> Budget)")),
+                        .child(legend_swatch(DevToolsTheme::accent_blue(), "UI (Build)"))
+                        .child(legend_swatch(DevToolsTheme::accent_purple(), "Raster"))
+                        .child(legend_swatch(DevToolsTheme::error_red(), "Jank (> Budget)")),
                 ),
         )
-        // Bars Container with Budget Reference Line
         .child(
             div()
                 .relative()
@@ -398,7 +318,6 @@ fn render_frame_bar_chart(
                 .flex()
                 .items_end()
                 .gap(px(2.0))
-                // Budget Reference Line
                 .child(
                     div()
                         .absolute()
@@ -435,64 +354,31 @@ fn render_frame_bar_chart(
                     )
                 })
                 .children(frames.into_iter().map(|frame| {
-                    let is_jank = frame.is_jank(budget_ms);
                     let is_selected = selected_num == Some(frame.number);
-                    let ui_h = ((frame.build_ms() / max_scale_ms) as f32 * chart_height_px)
-                        .clamp(2.0, chart_height_px * 0.92);
-                    let raster_h = ((frame.raster_ms() / max_scale_ms) as f32 * chart_height_px)
-                        .clamp(2.0, chart_height_px - ui_h);
+                    let ui_h = ((frame.build_ms() / max_scale_ms) as f32 * chart_height_px).clamp(2.0, chart_height_px);
+                    let raster_h = ((frame.raster_ms() / max_scale_ms) as f32 * chart_height_px).clamp(2.0, chart_height_px);
                     let frame_num = frame.number;
-
-                    let ui_color = if is_jank && frame.build_ms() > budget_ms {
-                        DevToolsTheme::error_red()
-                    } else {
-                        DevToolsTheme::accent_blue()
-                    };
-                    let raster_color = if is_jank && frame.raster_ms() > budget_ms {
-                        DevToolsTheme::error_red()
-                    } else {
-                        DevToolsTheme::accent_purple()
-                    };
+                    let ui_color = if frame.build_ms() > budget_ms { DevToolsTheme::error_red() } else { DevToolsTheme::accent_blue() };
+                    let raster_color = if frame.raster_ms() > budget_ms { DevToolsTheme::error_red() } else { DevToolsTheme::accent_purple() };
 
                     div()
                         .id(SharedString::from(format!("frame-bar-{frame_num}")))
                         .flex_1()
-                        .max_w(px(14.0))
+                        .max_w(px(16.0))
                         .h_full()
                         .cursor_pointer()
                         .flex()
-                        .flex_col()
-                        .justify_end()
-                        .when(is_selected, |el| {
-                            el.bg(DevToolsTheme::to_hsla(DevToolsTheme::accent_blue(), 0.14))
-                        })
+                        .items_end()
+                        .gap(px(1.0))
+                        .when(is_selected, |el| el.bg(DevToolsTheme::to_hsla(DevToolsTheme::accent_blue(), 0.16)))
                         .hover(|h| h.bg(DevToolsTheme::bg_hover()))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.performance.selected_frame_number = Some(frame_num);
                             cx.notify();
                         }))
-                        .child(
-                            div()
-                                .w_full()
-                                .h(px(raster_h))
-                                .rounded_t(px(2.0))
-                                .bg(raster_color),
-                        )
-                        .child(div().w_full().h(px(ui_h)).bg(ui_color))
+                        .child(div().flex_1().h(px(ui_h)).rounded_t(px(1.5)).bg(ui_color))
+                        .child(div().flex_1().h(px(raster_h)).rounded_t(px(1.5)).bg(raster_color))
                 })),
-        )
-}
-
-fn legend_item(color: gpui_kit::Rgba, label: &str) -> impl IntoElement + use<> {
-    div()
-        .flex()
-        .items_center()
-        .gap_1p5()
-        .child(div().w(px(10.0)).h(px(10.0)).rounded(px(2.0)).bg(color))
-        .child(
-            div()
-                .text_color(DevToolsTheme::text_secondary())
-                .child(label.to_string()),
         )
 }
 
@@ -512,11 +398,7 @@ fn render_selected_frame_card(selected: Option<FrameTiming>, budget_ms: f64) -> 
     };
 
     let jank = frame.is_jank(budget_ms);
-    let badge_color = if jank {
-        DevToolsTheme::error_red()
-    } else {
-        DevToolsTheme::success_green()
-    };
+    let badge_color = if jank { DevToolsTheme::error_red() } else { DevToolsTheme::success_green() };
 
     div()
         .w_full()
@@ -535,49 +417,24 @@ fn render_selected_frame_card(selected: Option<FrameTiming>, budget_ms: f64) -> 
                 .flex()
                 .items_center()
                 .gap_4()
+                .child(div().font_weight(gpui_kit::FontWeight::BOLD).text_color(DevToolsTheme::text_primary()).child(format!("Frame #{}", frame.number)))
+                .child(pill_badge(if jank { "JANK" } else { "SMOOTH" }, badge_color, 0.18))
                 .child(
                     div()
-                        .font_weight(gpui_kit::FontWeight::BOLD)
-                        .text_color(DevToolsTheme::text_primary())
-                        .child(format!("Frame #{}", frame.number)),
-                )
-                .child(
-                    div()
-                        .px_1p5()
-                        .py(px(1.0))
-                        .rounded(px(3.0))
-                        .bg(DevToolsTheme::to_hsla(badge_color, 0.18))
-                        .text_color(badge_color)
-                        .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                        .child(if jank { "JANK" } else { "SMOOTH" }),
-                )
-                .child(
-                    div()
-                        .text_color(DevToolsTheme::accent_blue())
+                        .text_color(if frame.build_ms() > budget_ms { DevToolsTheme::error_red() } else { DevToolsTheme::accent_blue() })
                         .child(format!("UI Build: {:.2} ms", frame.build_ms())),
                 )
                 .child(
                     div()
-                        .text_color(DevToolsTheme::accent_purple())
+                        .text_color(if frame.raster_ms() > budget_ms { DevToolsTheme::error_red() } else { DevToolsTheme::accent_purple() })
                         .child(format!("Raster: {:.2} ms", frame.raster_ms())),
                 )
-                .child(
-                    div()
-                        .text_color(DevToolsTheme::text_primary())
-                        .child(format!("Total Elapsed: {:.2} ms", frame.total_ms())),
-                )
+                .child(div().text_color(DevToolsTheme::text_primary()).child(format!("Pipeline Elapsed: {:.2} ms", frame.total_ms())))
                 .child(
                     div()
                         .text_color(DevToolsTheme::text_secondary())
-                        .child(format!(
-                            "Vsync Overhead: {:.2} ms",
-                            (frame.vsync_overhead_micros as f64) / 1000.0
-                        )),
+                        .child(format!("Vsync Overhead: {:.2} ms", (frame.vsync_overhead_micros as f64) / 1000.0)),
                 ),
         )
-        .child(
-            div()
-                .text_color(DevToolsTheme::text_muted())
-                .child(format!("Target Budget: {budget_ms:.2} ms")),
-        )
+        .child(div().text_color(DevToolsTheme::text_muted()).child(format!("Target Budget: {budget_ms:.2} ms/thread")))
 }

@@ -2,7 +2,8 @@ use gpui_kit::{
     Context, IntoElement, ParentElement as _, Styled as _, div, prelude::FluentBuilder as _, px,
 };
 
-use crate::backend::{ConnectionStatus, DevToolsPage};
+use crate::backend::ConnectionStatus;
+use crate::protocol::DevToolsPage;
 use crate::theme::{DevToolsTheme, format_bytes};
 use crate::ui::app::RootView;
 
@@ -63,8 +64,9 @@ pub fn render_statusbar(view: &RootView, _cx: &mut Context<RootView>) -> impl In
         ),
         DevToolsPage::Memory => {
             if let Some(latest) = view.memory.snapshots.back() {
+                let rss_tag = if latest.rss_is_estimated { "Est." } else { "RSS" };
                 format!(
-                    "Heap: {} / {} (RSS {})",
+                    "Heap: {} / {} ({rss_tag} {})",
                     format_bytes(latest.heap_usage_bytes),
                     format_bytes(latest.heap_capacity_bytes),
                     format_bytes(latest.rss_bytes)
@@ -124,21 +126,18 @@ pub fn render_statusbar(view: &RootView, _cx: &mut Context<RootView>) -> impl In
                 .flex()
                 .items_center()
                 .gap_3()
-                .when_some(
-                    view.toast_banner.as_ref(),
-                    |el, (toast_msg, is_error)| {
-                        el.child(
-                            div()
-                                .text_color(if *is_error {
-                                    DevToolsTheme::error_red()
-                                } else {
-                                    DevToolsTheme::accent_cyan()
-                                })
-                                .child(toast_msg.clone()),
-                        )
-                        .child(div().text_color(DevToolsTheme::border()).child("|"))
-                    },
-                )
+                .when_some(view.toast_banner.as_ref(), |el, (toast_msg, is_error)| {
+                    el.child(
+                        div()
+                            .text_color(if *is_error {
+                                DevToolsTheme::error_red()
+                            } else {
+                                DevToolsTheme::accent_cyan()
+                            })
+                            .child(toast_msg.clone()),
+                    )
+                    .child(div().text_color(DevToolsTheme::border()).child("|"))
+                })
                 .when_some(session_meta, |el, meta| el.child(div().child(meta))),
         )
 }

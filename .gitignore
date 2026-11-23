@@ -4,3 +4,4 @@
 *.wasm
 .DS_Store
 devtools-gpui/target
+crates/protocol/target

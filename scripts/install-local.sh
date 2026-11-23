@@ -15,17 +15,22 @@ for arg in "$@"; do
   esac
 done
 
-echo "==> [1/5] Checking & building WASM extension (wasm32-wasip2)..."
+echo "==> [1/6] Checking & building WASM extension (wasm32-wasip2)..."
 cd "$REPO_ROOT"
 cargo clippy --target wasm32-wasip2 --all-targets -- -D warnings
 cargo build --release --target wasm32-wasip2
 
-echo "==> [2/5] Running server clippy & unit tests..."
+echo "==> [2/6] Running shared protocol crate clippy & unit tests..."
+cd "$REPO_ROOT/crates/protocol"
+cargo clippy --all-targets -- -D warnings
+cargo test --all-targets
+
+echo "==> [3/6] Running server clippy & unit tests..."
 cd "$REPO_ROOT/server"
 cargo clippy --all-targets -- -D warnings
 cargo test --all-targets
 
-echo "==> [3/5] Building release flutter-debugger-server..."
+echo "==> [4/6] Building release flutter-debugger-server..."
 cargo build --release
 
 mkdir -p "$INSTALL_DIR"
@@ -33,7 +38,7 @@ cp "$REPO_ROOT/server/target/release/flutter-debugger-server" "$INSTALLED_SERVER
 chmod +x "$INSTALLED_SERVER_BIN"
 
 if [[ "$SERVER_ONLY" -eq 0 ]]; then
-  echo "==> [4/5] Running devtools-gpui clippy, unit tests & release build..."
+  echo "==> [5/6] Running devtools-gpui clippy, unit tests & release build..."
   cd "$REPO_ROOT/devtools-gpui"
   cargo clippy --all-targets -- -D warnings
   cargo test --all-targets
@@ -41,10 +46,10 @@ if [[ "$SERVER_ONLY" -eq 0 ]]; then
   cp "$REPO_ROOT/devtools-gpui/target/release/flutter-devtools-gpui" "$INSTALLED_GUI_BIN"
   chmod +x "$INSTALLED_GUI_BIN"
 else
-  echo "==> [4/5] Skipping devtools-gpui build (--server-only)"
+  echo "==> [5/6] Skipping devtools-gpui build (--server-only)"
 fi
 
-echo "==> [5/5] Installation Summary:"
+echo "==> [6/6] Installation Summary:"
 echo "  Server: $INSTALLED_SERVER_BIN ($("$INSTALLED_SERVER_BIN" --version))"
 if [[ -x "$INSTALLED_GUI_BIN" ]]; then
   echo "  GPUI DevTools: $INSTALLED_GUI_BIN ($("$INSTALLED_GUI_BIN" --version))"

@@ -1,3 +1,4 @@
+use flutter_debugger_protocol::{ServiceOverlay, default_sessions_dir};
 use gpui_kit::{
     Anchor, Context, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
     StatefulInteractiveElement as _, Styled as _, Window,
@@ -11,7 +12,8 @@ use gpui_kit::{
     px,
 };
 
-use crate::backend::{BackendCommand, DevToolsPage, ServiceOverlay};
+use crate::backend::BackendCommand;
+use crate::protocol::DevToolsPage;
 use crate::theme::DevToolsTheme;
 use crate::ui::app::RootView;
 
@@ -45,7 +47,6 @@ pub fn render_topbar(
         .items_center()
         .justify_between()
         .gap_2()
-        // Left: Brand + 5 main Tabs
         .child(
             div()
                 .h_full()
@@ -147,13 +148,11 @@ pub fn render_topbar(
                         })
                 })),
         )
-        // Right: Session Picker + Action Toolbar
         .child(
             div()
                 .flex()
                 .items_center()
                 .gap_1p5()
-                // Session selector popover
                 .child(
                     Popover::new("session-picker-popover")
                         .anchor(Anchor::TopRight)
@@ -171,7 +170,7 @@ pub fn render_topbar(
                             let current_id = active_session_id.clone();
 
                             div()
-                                .w(px(340.0))
+                                .w(px(360.0))
                                 .p_1p5()
                                 .flex()
                                 .flex_col()
@@ -192,7 +191,10 @@ pub fn render_topbar(
                                             .py_2()
                                             .text_xs()
                                             .text_color(DevToolsTheme::text_muted())
-                                            .child("No active sessions found in ~/.cache/flutter-debugger/sessions"),
+                                            .child(format!(
+                                                "No active sessions found in {}",
+                                                default_sessions_dir().display()
+                                            )),
                                     )
                                 })
                                 .children(sessions.into_iter().map(|sess| {
@@ -289,7 +291,6 @@ pub fn render_topbar(
                             this.toggle_overlay(ServiceOverlay::Inspector);
                         })),
                 )
-                // Overlays Popover Menu (all 10 Flutter Service Extensions)
                 .child(
                     Popover::new("overlays-menu-popover")
                         .anchor(Anchor::TopRight)

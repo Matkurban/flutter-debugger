@@ -128,11 +128,62 @@ pub fn format_bytes(bytes: u64) -> String {
     }
 }
 
-/// Formats a millisecond or microsecond duration nicely.
+/// Formats a millisecond duration nicely.
 pub fn format_duration_ms(duration_ms: Option<u64>) -> String {
     match duration_ms {
         Some(ms) if ms >= 1000 => format!("{:.2} s", (ms as f64) / 1000.0),
         Some(ms) => format!("{ms} ms"),
         None => "Pending".to_string(),
+    }
+}
+
+/// Formats current system time into the user's local timezone `HH:MM:SS`.
+pub fn current_local_hms() -> String {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    format_epoch_millis_local_hms(millis, false)
+}
+
+/// Formats a microsecond epoch timestamp into the user's local timezone `HH:MM:SS.mmm`.
+pub fn format_micros_local_hms(micros: u64) -> String {
+    if micros == 0 {
+        return current_local_hms();
+    }
+    // Dart VM timeline timestamps can be either monotonic microseconds since boot or epoch microseconds.
+    let millis = micros / 1000;
+    format_epoch_millis_local_hms(millis, true)
+}
+
+/// Converts an epoch millisecond timestamp to local timezone `HH:MM:SS` or `HH:MM:SS.mmm`.
+pub fn format_epoch_millis_local_hms(millis: u64, include_millis: bool) -> String {
+    let secs = (millis / 1000) as i64;
+    let ms = millis % 1000;
+
+    #[cfg(unix)]
+    {
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        let time_t_val = secs as libc::time_t;
+        let ptr = unsafe { libc::localtime_r(&time_t_val, &mut tm) };
+        if !ptr.is_null() {
+            let h = tm.tm_hour.clamp(0, 23);
+            let m = tm.tm_min.clamp(0, 59);
+            let s = tm.tm_sec.clamp(0, 60);
+            return if include_millis {
+                format!("{h:02}:{m:02}:{s:02}.{ms:03}")
+            } else {
+                format!("{h:02}:{m:02}:{s:02}")
+            };
+        }
+    }
+
+    let s = (secs.rem_euclid(60)) as u64;
+    let m = ((secs / 60).rem_euclid(60)) as u64;
+    let h = ((secs / 3600).rem_euclid(24)) as u64;
+    if include_millis {
+        format!("{h:02}:{m:02}:{s:02}.{ms:03}")
+    } else {
+        format!("{h:02}:{m:02}:{s:02}")
     }
 }

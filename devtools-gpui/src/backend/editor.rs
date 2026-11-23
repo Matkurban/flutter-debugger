@@ -4,7 +4,8 @@ use std::process::{Command, Stdio};
 
 use serde::Deserialize;
 
-use crate::backend::models::SourceLocation;
+use crate::backend::error::DevToolsError;
+use crate::protocol::SourceLocation;
 
 #[derive(Debug, Deserialize)]
 struct PackageConfigFile {
@@ -97,11 +98,20 @@ fn clean_relative_segments(path: &Path) -> PathBuf {
 pub fn open_source_in_zed(
     loc: &SourceLocation,
     project_root: Option<&Path>,
-) -> Result<String, String> {
-    let resolved = resolve_dart_uri_to_local_path(&loc.uri, project_root)
-        .ok_or_else(|| format!("Could not resolve URI `{}` to a local file", loc.uri))?;
+) -> Result<String, DevToolsError> {
+    let resolved = resolve_dart_uri_to_local_path(&loc.uri, project_root).ok_or_else(|| {
+        DevToolsError::Io(format!(
+            "Could not resolve URI `{}` to a local file",
+            loc.uri
+        ))
+    })?;
 
-    let target = format!("{}:{}:{}", resolved.display(), loc.line.max(1), loc.column.max(1));
+    let target = format!(
+        "{}:{}:{}",
+        resolved.display(),
+        loc.line.max(1),
+        loc.column.max(1)
+    );
     let candidates = [
         "zed",
         "/Applications/Zed.app/Contents/MacOS/cli",
@@ -127,9 +137,9 @@ pub fn open_source_in_zed(
         }
     }
 
-    Err(format!(
+    Err(DevToolsError::Io(format!(
         "Could not find `zed` CLI to open `{target}`. Run `zed: install cli` in Zed."
-    ))
+    )))
 }
 
 #[cfg(test)]

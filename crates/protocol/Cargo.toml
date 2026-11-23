@@ -1,0 +1,18 @@
+[package]
+name = "flutter-debugger-protocol"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Shared session, overlay, and IPC protocol definitions for Flutter Debugger Server and GPUI DevTools"
+
+[dependencies]
+dirs = "6.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[dev-dependencies]
+tempfile = "3.23"
+
+[lints.clippy]
+dbg_macro = "deny"
+todo = "deny"

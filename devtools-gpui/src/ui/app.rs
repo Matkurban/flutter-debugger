@@ -1,4 +1,7 @@
 use async_channel::{Receiver, Sender};
+use flutter_debugger_protocol::{
+    ActiveSessionRecord, OverlayState, ServiceOverlay, default_sessions_dir,
+};
 use gpui_kit::{
     AppContext as _, ClipboardItem, Context, FocusHandle, InteractiveElement as _, IntoElement,
     ParentElement as _, Render, SharedString, Styled as _, Window, actions,
@@ -12,16 +15,14 @@ use gpui_kit::{
     px,
 };
 
-use crate::backend::{
-    ActiveSessionRecord, BackendCommand, BackendEvent, ConnectionStatus, DevToolsPage,
-    OverlayState, ServiceOverlay, SourceLocation,
-};
+use crate::backend::{BackendCommand, BackendEvent, ConnectionStatus};
+use crate::protocol::{DevToolsPage, SourceLocation};
 use crate::single_instance::SingleInstanceFocusCommand;
 use crate::theme::DevToolsTheme;
-use crate::ui::{
-    inspector_tab::InspectorTabState, logging_tab::LoggingTabState, memory_tab::MemoryTabState,
-    network_tab::NetworkTabState, performance_tab::PerformanceTabState,
-    statusbar::render_statusbar, topbar::render_topbar,
+use crate::ui::chrome::{render_statusbar, render_topbar};
+use crate::ui::tabs::{
+    inspector::InspectorTabState, logging::LoggingTabState, memory::MemoryTabState,
+    network::NetworkTabState, performance::PerformanceTabState,
 };
 
 actions!(
@@ -65,25 +66,30 @@ impl RootView {
         let net_search = cx.new(|cx| {
             InputState::new(window, cx).placeholder("Filter URL, method, or status...")
         });
-        let insp_search =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Filter widgets by name or key..."));
+        let insp_search = cx
+            .new(|cx| InputState::new(window, cx).placeholder("Filter widgets by name or key..."));
         let log_search =
             cx.new(|cx| InputState::new(window, cx).placeholder("Search logs or stack traces..."));
 
-        cx.subscribe(&net_search, |_, _, _: &InputEvent, cx| {
+        cx.subscribe(&net_search, |this, state, _: &InputEvent, cx| {
+            let q = state.read(cx).value().to_string();
+            this.network.set_search_query(q);
             cx.notify();
         })
         .detach();
-        cx.subscribe(&insp_search, |_, _, _: &InputEvent, cx| {
+        cx.subscribe(&insp_search, |this, state, _: &InputEvent, cx| {
+            let q = state.read(cx).value().to_string();
+            this.inspector.set_search_query(q);
             cx.notify();
         })
         .detach();
-        cx.subscribe(&log_search, |_, _, _: &InputEvent, cx| {
+        cx.subscribe(&log_search, |this, state, _: &InputEvent, cx| {
+            let q = state.read(cx).value().to_string();
+            this.logging.set_search_query(q);
             cx.notify();
         })
         .detach();
 
-        // Background event stream consumer
         cx.spawn_in(window, async move |this, cx| {
             while let Ok(ev) = event_rx.recv().await {
                 let cont = this.update_in(cx, |this, window, cx| {
@@ -97,7 +103,6 @@ impl RootView {
         })
         .detach();
 
-        // Single-instance wakeup & tab/session switch consumer
         cx.spawn_in(window, async move |this, cx| {
             while let Ok(focus_cmd) = single_instance_rx.recv().await {
                 let cont = this.update_in(cx, |this, window, cx| {
@@ -155,7 +160,13 @@ impl RootView {
         let _ = self.cmd_tx.try_send(cmd);
     }
 
-    pub fn show_toast(&mut self, message: impl Into<String>, is_error: bool, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn show_toast(
+        &mut self,
+        message: impl Into<String>,
+        is_error: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let msg = message.into();
         self.toast_banner = Some((msg.clone(), is_error));
         let kind = if is_error {
@@ -226,6 +237,20 @@ impl RootView {
                     self.send_cmd(BackendCommand::SelectWidgetNode { value_id: id });
                 }
             }
+            BackendEvent::WidgetChildrenLoaded {
+                parent_value_id,
+                children,
+            } => {
+                self.inspector.apply_children(&parent_value_id, children);
+            }
+            BackendEvent::WidgetSelectedFromDevice {
+                selected_node,
+                properties,
+            } => {
+                self.inspector
+                    .apply_device_selection(selected_node, properties);
+                self.active_page = DevToolsPage::Inspector;
+            }
             BackendEvent::WidgetPropertiesLoaded {
                 value_id,
                 properties,
@@ -234,6 +259,9 @@ impl RootView {
             }
             BackendEvent::LogAppended(entry) => {
                 self.logging.push_entry(entry);
+            }
+            BackendEvent::LogUpdated(entry) => {
+                self.logging.update_entry(entry);
             }
             BackendEvent::FrameAppended(frame) => {
                 self.performance.push_frame(frame);
@@ -259,17 +287,16 @@ impl RootView {
 
 impl Render for RootView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let is_waiting_with_no_snapshot = matches!(
-            self.connection,
-            ConnectionStatus::WaitingForSession
-        ) && self.network.requests.is_empty()
-            && self.logging.entries.is_empty()
-            && self.inspector.root.is_none()
-            && self.performance.frames.is_empty()
-            && self.memory.snapshots.is_empty();
+        let is_waiting_with_no_snapshot =
+            matches!(self.connection, ConnectionStatus::WaitingForSession)
+                && self.network.requests.is_empty()
+                && self.logging.entries.is_empty()
+                && self.inspector.root.is_none()
+                && self.performance.frames.is_empty()
+                && self.memory.snapshots.is_empty();
 
         let main_content = if is_waiting_with_no_snapshot {
-            render_waiting_placeholder(self, cx).into_any_element()
+            render_waiting_placeholder(self).into_any_element()
         } else {
             match self.active_page {
                 DevToolsPage::Inspector => self.render_inspector_tab(window, cx).into_any_element(),
@@ -324,8 +351,10 @@ impl Render for RootView {
     }
 }
 
-fn render_waiting_placeholder(view: &RootView, _cx: &mut Context<RootView>) -> impl IntoElement {
+fn render_waiting_placeholder(view: &RootView) -> impl IntoElement + use<> {
     let sessions_count = view.sessions.len();
+    let sessions_dir_display = default_sessions_dir().display().to_string();
+
     div()
         .size_full()
         .flex()
@@ -336,7 +365,7 @@ fn render_waiting_placeholder(view: &RootView, _cx: &mut Context<RootView>) -> i
         .p_6()
         .child(
             div()
-                .w(px(520.0))
+                .w(px(540.0))
                 .p_6()
                 .rounded(px(8.0))
                 .bg(DevToolsTheme::bg_panel())
@@ -369,7 +398,10 @@ fn render_waiting_placeholder(view: &RootView, _cx: &mut Context<RootView>) -> i
                     div()
                         .text_sm()
                         .text_color(DevToolsTheme::text_secondary())
-                        .child("This window monitors ~/.cache/flutter-debugger/sessions/*.json every second and attaches automatically as soon as your Flutter app starts — no restart required."),
+                        .child(format!(
+                            "Monitoring {}/*.json every second and attaching automatically as soon as your Flutter app starts — no restart required.",
+                            sessions_dir_display
+                        )),
                 )
                 .child(
                     div()

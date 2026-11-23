@@ -241,11 +241,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "flutter-debugger-protocol"
+version = "0.1.0"
+dependencies = [
+ "dirs",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "flutter-debugger-server"
 version = "0.1.0"
 dependencies = [
  "dashmap",
  "dirs",
+ "flutter-debugger-protocol",
  "regex",
  "reqwest",
  "serde",

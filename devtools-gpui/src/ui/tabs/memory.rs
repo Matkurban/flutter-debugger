@@ -10,9 +10,11 @@ use gpui_kit::{
     div, point, px,
 };
 
-use crate::backend::{BackendCommand, MemorySnapshot};
+use crate::backend::BackendCommand;
+use crate::protocol::MemorySnapshot;
 use crate::theme::{DevToolsTheme, format_bytes};
 use crate::ui::app::RootView;
+use crate::ui::components::{legend_swatch, metric_card, subtoolbar_container};
 
 const MAX_MEMORY_SAMPLES: usize = 180;
 
@@ -48,18 +50,24 @@ impl RootView {
         let samples: Vec<MemorySnapshot> = self.memory.snapshots.iter().cloned().collect();
         let gc_count = samples.iter().filter(|s| s.is_gc_event).count();
 
-        let (heap_used, heap_cap, ext_used, rss_total) = match &latest {
+        let (heap_used, heap_cap, ext_used, rss_total, rss_subtitle) = match &latest {
             Some(s) => (
                 format_bytes(s.heap_usage_bytes),
                 format_bytes(s.heap_capacity_bytes),
                 format_bytes(s.external_usage_bytes),
                 format_bytes(s.rss_bytes),
+                if s.rss_is_estimated {
+                    "Estimated (Heap Capacity + External)"
+                } else {
+                    "Process Resident Set Size (getProcessMemoryUsage)"
+                },
             ),
             None => (
                 "-".to_string(),
                 "-".to_string(),
                 "-".to_string(),
                 "-".to_string(),
+                "Process Resident Set Size",
             ),
         };
 
@@ -68,19 +76,8 @@ impl RootView {
             .flex()
             .flex_col()
             .bg(DevToolsTheme::bg_main())
-            // Sub-toolbar
             .child(
-                div()
-                    .w_full()
-                    .h(px(36.0))
-                    .px_3()
-                    .bg(DevToolsTheme::bg_panel())
-                    .border_b_1()
-                    .border_color(DevToolsTheme::border())
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_2()
+                subtoolbar_container()
                     .child(
                         div()
                             .flex()
@@ -137,7 +134,6 @@ impl RootView {
                             )),
                     ),
             )
-            // Main body
             .child(
                 div()
                     .flex_1()
@@ -147,81 +143,40 @@ impl RootView {
                     .flex()
                     .flex_col()
                     .gap_4()
-                    // Top 4 Metric Cards
                     .child(
                         div()
                             .w_full()
                             .flex()
                             .items_center()
                             .gap_3()
-                            .child(mem_metric_card(
+                            .child(metric_card(
                                 "Heap Used",
                                 &heap_used,
                                 "Active Dart Objects",
                                 DevToolsTheme::accent_blue(),
                             ))
-                            .child(mem_metric_card(
+                            .child(metric_card(
                                 "Heap Capacity",
                                 &heap_cap,
                                 "Allocated Isolate Heap",
                                 DevToolsTheme::accent_cyan(),
                             ))
-                            .child(mem_metric_card(
+                            .child(metric_card(
                                 "External",
                                 &ext_used,
                                 "Native / TypedData Buffers",
                                 DevToolsTheme::accent_purple(),
                             ))
-                            .child(mem_metric_card(
+                            .child(metric_card(
                                 "RSS / Total",
                                 &rss_total,
-                                "Process Resident Set Size",
+                                rss_subtitle,
                                 DevToolsTheme::success_green(),
                             )),
                     )
-                    // Native GPUI Area/Line Chart
                     .child(render_memory_area_chart(samples)),
             )
     }
-}
-
-fn mem_metric_card(
-    title: &str,
-    value: &str,
-    subtitle: &str,
-    accent: gpui_kit::Rgba,
-) -> impl IntoElement + use<> {
-    div()
-        .flex_1()
-        .p_3()
-        .rounded(px(6.0))
-        .bg(DevToolsTheme::bg_panel())
-        .border_1()
-        .border_color(DevToolsTheme::border())
-        .flex()
-        .flex_col()
-        .gap_1()
-        .child(
-            div()
-                .text_xs()
-                .text_color(DevToolsTheme::text_secondary())
-                .child(title.to_string()),
-        )
-        .child(
-            div()
-                .font_family(DevToolsTheme::MONO_FONT)
-                .text_lg()
-                .font_weight(gpui_kit::FontWeight::BOLD)
-                .text_color(accent)
-                .child(value.to_string()),
-        )
-        .child(
-            div()
-                .font_family(DevToolsTheme::MONO_FONT)
-                .text_xs()
-                .text_color(DevToolsTheme::text_muted())
-                .child(subtitle.to_string()),
-        )
 }
 
 fn render_memory_area_chart(samples: Vec<MemorySnapshot>) -> impl IntoElement {
@@ -250,7 +205,6 @@ fn render_memory_area_chart(samples: Vec<MemorySnapshot>) -> impl IntoElement {
         .flex()
         .flex_col()
         .gap_2()
-        // Header + Legend
         .child(
             div()
                 .w_full()
@@ -271,13 +225,12 @@ fn render_memory_area_chart(samples: Vec<MemorySnapshot>) -> impl IntoElement {
                         .flex()
                         .items_center()
                         .gap_4()
-                        .child(mem_legend(DevToolsTheme::accent_blue(), "Heap Used"))
-                        .child(mem_legend(DevToolsTheme::accent_cyan(), "Heap Capacity"))
-                        .child(mem_legend(DevToolsTheme::accent_purple(), "External"))
-                        .child(mem_legend(DevToolsTheme::warning_yellow(), "GC Event")),
+                        .child(legend_swatch(DevToolsTheme::accent_blue(), "Heap Used"))
+                        .child(legend_swatch(DevToolsTheme::accent_cyan(), "Heap Capacity"))
+                        .child(legend_swatch(DevToolsTheme::accent_purple(), "External"))
+                        .child(legend_swatch(DevToolsTheme::warning_yellow(), "GC Event")),
                 ),
         )
-        // Chart Canvas + Y-axis labels
         .child(
             div()
                 .relative()
@@ -298,7 +251,6 @@ fn render_memory_area_chart(samples: Vec<MemorySnapshot>) -> impl IntoElement {
                     )
                     .size_full(),
                 )
-                // Y-axis overlay labels
                 .child(
                     div()
                         .absolute()
@@ -322,19 +274,6 @@ fn render_memory_area_chart(samples: Vec<MemorySnapshot>) -> impl IntoElement {
         )
 }
 
-fn mem_legend(color: gpui_kit::Rgba, label: &str) -> impl IntoElement + use<> {
-    div()
-        .flex()
-        .items_center()
-        .gap_1p5()
-        .child(div().w(px(10.0)).h(px(10.0)).rounded(px(2.0)).bg(color))
-        .child(
-            div()
-                .text_color(DevToolsTheme::text_secondary())
-                .child(label.to_string()),
-        )
-}
-
 fn paint_memory_canvas(
     bounds: Bounds<Pixels>,
     samples: &[MemorySnapshot],
@@ -353,7 +292,6 @@ fn paint_memory_canvas(
     let max_f = (max_bytes as f32).max(1.0);
 
     window.with_content_mask(Some(ContentMask { bounds }), |window| {
-        // Draw 3 horizontal guide lines
         let grid_color = DevToolsTheme::to_hsla(DevToolsTheme::border(), 0.7);
         for frac in [0.25f32, 0.5, 0.75] {
             let y = top + height * frac;
@@ -378,15 +316,17 @@ fn paint_memory_canvas(
             bottom - ratio * height
         };
 
-        // 1. Heap Capacity stroke curve
         let cap_points: Vec<Point<Pixels>> = samples
             .iter()
             .enumerate()
             .map(|(i, s)| point(px(x_for(i)), px(y_for(s.heap_capacity_bytes))))
             .collect();
-        paint_line_series(&cap_points, DevToolsTheme::to_hsla(DevToolsTheme::accent_cyan(), 0.75), window);
+        paint_line_series(
+            &cap_points,
+            DevToolsTheme::to_hsla(DevToolsTheme::accent_cyan(), 0.75),
+            window,
+        );
 
-        // 2. Heap Used filled area + stroke curve
         let used_points: Vec<Point<Pixels>> = samples
             .iter()
             .enumerate()
@@ -400,7 +340,6 @@ fn paint_memory_canvas(
         );
         paint_line_series(&used_points, DevToolsTheme::accent_blue().into(), window);
 
-        // 3. External usage stroke curve
         let ext_points: Vec<Point<Pixels>> = samples
             .iter()
             .enumerate()
@@ -408,7 +347,6 @@ fn paint_memory_canvas(
             .collect();
         paint_line_series(&ext_points, DevToolsTheme::accent_purple().into(), window);
 
-        // 4. GC Event vertical markers
         let gc_color = DevToolsTheme::to_hsla(DevToolsTheme::warning_yellow(), 0.85);
         for (i, s) in samples.iter().enumerate() {
             if s.is_gc_event {
