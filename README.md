@@ -1,101 +1,88 @@
-# Flutter Debugger for Zed
+# Flutter Debugger for Zed (Personal Dev Extension Suite)
 
-[简体中文](README.zh-CN.md)
+A personal Zed Dev Extension suite that brings a VS Code Flutter (`Dart-Code`) daily development and debugging experience to Zed — designed for zero-conflict coexistence with Zed's official `dart` extension and `pubgrade`.
 
-Flutter debugging, quick Debug/Profile/Release launching, automatic DevTools Performance view, Hot Reload, target device switching, visual debug overlays, test runner, project creation wizard, and Pub dependency workflows for the [Zed](https://zed.dev) editor. Designed to work alongside Zed's official **Dart** extension without interfering with Dart syntax highlighting, diagnostics, completion, or formatting.
+> [中文文档](./README.zh-CN.md)
 
-## Features
+## Architecture & Coexistence Boundaries
 
-- **Quick `main()` Launchers (`Debug` / `Profile` / `Release`)**: In Flutter projects, `main()` displays clean CodeLens buttons (`Debug`, `Profile`, `Release`) modeled after VS Code's Flutter extension:
-  - **Debug**: Launches `flutter run --debug --machine` with live log streaming, automatic Hot Reload on save, `Hot Reload`, `Hot Restart`, `DevTools`, and `Stop`.
-  - **Profile**: Launches `flutter run --profile --machine` and automatically opens the official **Flutter DevTools Performance** view once the VM Service is ready.
-  - **Release**: Launches `flutter run --release --machine` with live log streaming.
-- **Live Run Log Control Bar & Reliable Stop**: While a Flutter app is running, line 1 of the live run log tab displays `Hot Reload`, `Hot Restart`, `DevTools` / `Performance`, and `Stop`, and every `.dart` file exposes `Flutter: Stop App` at the top of Code Actions (`Cmd+.` / `Ctrl+.`). Stopping gracefully requests `app.stop` and terminates the full process tree on timeout or LSP shutdown.
-- **Full Breakpoint Debugging (DAP)**: Full `.zed/debug.json` schema support (`deviceId`, `flutterMode`, `flavor`, `dartDefineFromFile`, `toolArgs`, `env`), one-click `.zed/debug.json` generation (`Flutter: Generate .zed/debug.json`), plus automatic task-to-debug conversion for `flutter run`, `flutter test`, `dart run`, and `dart test`. Launching with `flutterMode: "profile"` via `F4` also opens Flutter DevTools Performance automatically.
-- **Visual Debug Overlays & Screenshots**: While an app is running in Debug or Profile mode, toggle `Performance Overlay`, `Debug Paint`, `Repaint Rainbow`, `Slow Animations`, `Debug Banner`, and `Target Platform` (`ext.flutter.platformOverride`), or capture a device screenshot (`Flutter: Save Screenshot`) directly from Code Actions (`Cmd+.` / `Ctrl+.`).
-- **Test Runner & File Navigation**: Clean CodeLens (`Run Test` / `Run Group`) on `test()`, `testWidgets()`, and `group()` in `*_test.dart` files (automatically invoking `flutter test` or `dart test`), plus `Dart: Go to Test File` / `Dart: Go to Implementation File` in Code Actions.
-- **Pub Dependency Workflow (`pubspec.yaml` / `pubspec_overrides.yaml`)**:
-  - Top-of-file actions stay strictly dependency-focused: `Pub Get`, `Pub Upgrade`, and `Pub Outdated`.
-  - `Cmd+Click` (macOS) / `Ctrl+Click` (Windows/Linux) any hosted package name to open its page on `pub.dev`.
-  - Cached version hints (`latest: x.y.z`) and one-click upgrade Code Actions.
-- **Devices, Emulators, Clean, Doctor & Project Wizard**:
-  - Cycle target devices from `main()` (`Device: ...` / `Refresh Devices`) or Dart Code Actions (`Flutter: Switch Target Device`), persisted per project and automatically injected into both quick runs and DAP launches.
-  - Trigger `Flutter: Launch Emulator`, `Flutter: Clean Project`, `Flutter: Run Doctor`, or `Flutter: New Project Wizard` from Dart Code Actions (`Cmd+.` / `Ctrl+.`).
-- **FVM & Monorepo Aware**: Automatically detects `.fvm/flutter_sdk` and resolves the nearest `pubspec.yaml` per file (including `pubspec_overrides.yaml`), distinguishing Flutter apps/plugins from pure Dart packages.
+| Layer | Responsibility | Zero-Conflict Boundary |
+|---|---|---|
+| **Official `dart` Extension** | Syntax highlighting, completions, hover, go-to-definition, formatting, rename, Dart Analysis diagnostics | Never duplicated by `flutter-debugger` |
+| **`pubgrade` Extension** | `pubspec.yaml` dependency version hints, outdated checks & upgrades | `enablePubVersionHints` defaults to `false` so there is zero duplicate hint/CodeLens |
+| **`flutter-debugger` LSP** (`["Dart", "YAML"]`) | **Widget Closing Labels** (`inlayHint`), **Color Previews** (`documentColor`/`colorPresentation`), **Streaming `--machine` Test Runner** with nested `group` paths & failure diagnostics, **Debounced Auto Hot Reload on Save**, `pubspec.yaml` **asset/font validation & local path links**, and clean `Cmd+.` Code Actions | Scoped strictly to Dart & YAML; zero background processes outside Dart/Flutter workspaces |
+| **`flutter-debugger` DAP + `ctl` CLI** | Delayed Monorepo/FVM/`--test` DAP proxy, multi-session registry with PID liveness checks, real-time `flutter daemon` hotplug, full **Service Extensions** (Widget Inspector, Overlays, Brightness, Platform Override), page-targeted **DevTools**, **Screenshots**, native terminal `ctl run`, and lossless `init-zed` | Works identically across `F4` breakpoint debugging, `attach`, and native terminal `ctl run` |
 
-## Prerequisites
+## One-Command Local Install
 
-- [Flutter SDK](https://docs.flutter.dev/get-started/install) and/or [Dart SDK](https://dart.dev/get-dart) available on `PATH` (or configured via FVM / `settings.json`).
-- Zed's official **Dart** extension installed for Dart syntax highlighting and Dart Analysis Server LSP.
+```bash
+./scripts/install-local.sh
+```
 
-## Installation
+Then in Zed:
+1. Open Command Palette -> `zed: install dev extension` -> select this repository directory.
+2. Make sure `~/.local/bin` is on your `PATH` (or set `lsp.flutter-debugger.binary.path` in `settings.json`).
+3. Inside any Flutter project, run:
 
-1. Open Zed Extensions (`Cmd+Shift+X` on macOS or `Ctrl+Shift+X` on Linux/Windows).
-2. Search for **Flutter Debugger** and click **Install**.
+```bash
+flutter-debugger-server init-zed
+```
 
-On first activation, the extension automatically downloads the matching `flutter-debugger-server` binary for your platform from GitHub Releases if it is not already on your `PATH`.
+This losslessly creates/merges `.zed/debug.json` (auto-detecting Gradle/iOS flavors, `lib/main*.dart`, and `--test` breakpoint configs) and `.zed/tasks.json` (complete `ctl` task suite).
 
-## Recommended Configuration
+## Recommended Zed Configuration
 
-Add the following to your Zed `settings.json` (`Cmd+,` / `Ctrl+,`) to enable Inlay Hints and configure Flutter Debugger alongside the official Dart extension:
+Run `flutter-debugger-server ctl print-zed-config` anytime to print these snippets.
+
+### `~/.config/zed/settings.json`
 
 ```json
 {
+  "lsp_document_colors": "inlay",
   "inlay_hints": {
     "enabled": true
   },
-  "languages": {
-    "Dart": {
-      "format_on_save": "on",
-      "language_servers": ["dart", "flutter-debugger"]
-    },
-    "YAML": {
-      "language_servers": ["flutter-debugger", "..."]
-    },
-    "JSON": {
-      "language_servers": ["flutter-debugger", "..."]
-    },
-    "Log": {
-      "language_servers": ["flutter-debugger", "..."]
-    },
-    "Plain Text": {
-      "language_servers": ["flutter-debugger", "..."]
-    }
-  },
   "lsp": {
     "flutter-debugger": {
-      "settings": {
+      "initialization_options": {
         "autoHotReloadOnSave": true,
-        "flutterSdkPath": null,
-        "deviceCacheTtlSecs": 3600,
-        "pubCacheTtlSecs": 43200
+        "hotReloadDebounceMs": 250,
+        "closingLabels": true,
+        "closingLabelsMinLines": 2,
+        "colorPreviews": true,
+        "enablePubVersionHints": false,
+        "exposeGlobalCodeActions": false
       }
     }
   }
 }
 ```
 
-### Example `.zed/debug.json`
+### `~/.config/zed/keymap.json` (VS Code-style Flutter Shortcuts)
 
 ```json
 [
   {
-    "adapter": "Flutter",
-    "label": "Flutter Debug (Staging)",
-    "request": "launch",
-    "program": "lib/main.dart",
-    "flutterMode": "debug",
-    "flavor": "staging",
-    "dartDefineFromFile": "env/staging.json"
-  },
-  {
-    "adapter": "Flutter",
-    "label": "Flutter Attach",
-    "request": "attach"
+    "context": "Workspace",
+    "bindings": {
+      "cmd-alt-r": ["task::Spawn", { "task_name": "Flutter: Hot Reload" }],
+      "cmd-shift-alt-r": ["task::Spawn", { "task_name": "Flutter: Hot Restart" }],
+      "cmd-alt-d": ["task::Spawn", { "task_name": "Flutter: Select Device" }],
+      "cmd-alt-e": ["task::Spawn", { "task_name": "Flutter: Launch Emulator" }],
+      "cmd-alt-i": ["task::Spawn", { "task_name": "Flutter: Toggle Widget Inspector" }],
+      "cmd-alt-p": ["task::Spawn", { "task_name": "Flutter: Open DevTools (Inspector)" }],
+      "cmd-alt-b": ["task::Spawn", { "task_name": "Flutter: Toggle Brightness" }],
+      "cmd-alt-s": ["task::Spawn", { "task_name": "Flutter: Stop App" }]
+    }
   }
 ]
 ```
 
-## License
+## Daily Workflow Cheatsheet
 
-Apache 2.0 — see [LICENSE](LICENSE).
+- **Breakpoint Debugging (App or `*_test.dart`)**: Press `F4` -> pick `Flutter: Debug` or `Flutter: Current Test (Breakpoints)` (automatically passes `--test` to `flutter debug_adapter`).
+- **Native Terminal Run (ANSI logs + Hot Reload)**: Run task `Flutter: Run (Debug)` (`flutter-debugger-server ctl run --mode debug`). Saving any non-test `.dart` file triggers debounced Hot Reload with elapsed ms in status progress.
+- **Select Device / Launch Emulator**: `cmd-alt-d` / `cmd-alt-e` opens an interactive numbered selector in Zed's terminal.
+- **Widget Inspector / Overlays / Brightness**: `cmd-alt-i`, `cmd-alt-b`, or `flutter-debugger-server ctl overlay <inspector|performance|debug-paint|baselines|repaint|slow-anim|banner|oversized|platform|brightness>`.
+- **DevTools**: `cmd-alt-p` or `flutter-debugger-server ctl devtools --page <inspector|performance|memory|network|logging|cpu-profiler>`.
+- **Build Runner**: Run task `Flutter: Build Runner Watch` or `flutter-debugger-server ctl build-runner watch`.

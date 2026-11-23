@@ -12,21 +12,26 @@
     "program": {
       "type": "string",
       "default": "lib/main.dart",
-      "description": "Path to the Dart entry point or test file (e.g. lib/main.dart or test/widget_test.dart)."
+      "description": "Path to the Dart entry point or test file (e.g. lib/main.dart, test/widget_test.dart, or $ZED_RELATIVE_FILE)."
+    },
+    "isTest": {
+      "type": "boolean",
+      "default": false,
+      "description": "Force running the Flutter/Dart debug adapter in --test mode for breakpoint debugging of unit, widget, or integration tests. Auto-detected for *_test.dart and test/ paths."
     },
     "cwd": {
       "type": "string",
-      "description": "Working directory of the Flutter or Dart project containing pubspec.yaml."
+      "description": "Working directory of the Flutter or Dart project containing pubspec.yaml (Monorepo subpackages are auto-resolved from program)."
     },
     "deviceId": {
       "type": "string",
-      "description": "Target Flutter device ID (e.g. macos, chrome, emulator-5554). If omitted, uses the device selected via Flutter Debugger."
+      "description": "Target Flutter device ID (e.g. macos, chrome, emulator-5554). If omitted, uses the device selected via `flutter-debugger-server ctl select-device`."
     },
     "flutterMode": {
       "type": "string",
       "enum": ["debug", "profile", "release"],
       "default": "debug",
-      "description": "Flutter build mode. Hot Reload is available in debug mode."
+      "description": "Flutter build mode. Hot Reload and Service Extensions are available in debug mode."
     },
     "flavor": {
       "type": "string",

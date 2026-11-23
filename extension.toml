@@ -1,14 +1,14 @@
 id = "flutter-debugger"
 name = "Flutter Debugger"
-version = "0.0.2"
+version = "0.1.0"
 schema_version = 1
 authors = ["Matkurban <https://github.com/Matkurban>"]
-description = "Flutter debugging, Hot Reload, Profile DevTools, device switching, test runner, project wizard, and Pub dependency workflow for Zed"
+description = "Personal VS Code-grade Flutter workflow suite for Zed: DAP debugging (with --test & Monorepo/FVM), Closing Labels, Color Previews, live flutter daemon, VM Service overlays, and ctl CLI"
 repository = "https://github.com/Matkurban/flutter-debugger"
 
 [language_servers.flutter-debugger]
 name = "Flutter Debugger"
-languages = ["Dart", "YAML", "JSON", "Log", "Plain Text"]
+languages = ["Dart", "YAML"]
 
 [debug_adapters.Flutter]
 schema_path = "debug_adapter_schemas/Flutter.json"

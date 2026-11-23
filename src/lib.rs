@@ -120,15 +120,18 @@ impl zed::Extension for FlutterDebuggerExtension {
         let payload = match config.request {
             DebugRequest::Launch(launch) => {
                 let mut map = serde_json::Map::new();
+                let program = if launch.program.is_empty() {
+                    "lib/main.dart".to_string()
+                } else {
+                    launch.program
+                };
+                let is_test = looks_like_test_target(&program);
+
                 map.insert("request".to_string(), serde_json::json!("launch"));
-                map.insert(
-                    "program".to_string(),
-                    serde_json::json!(if launch.program.is_empty() {
-                        "lib/main.dart".to_string()
-                    } else {
-                        launch.program
-                    }),
-                );
+                map.insert("program".to_string(), serde_json::json!(program));
+                if is_test {
+                    map.insert("isTest".to_string(), serde_json::json!(true));
+                }
                 if let Some(cwd) = launch.cwd {
                     map.insert("cwd".to_string(), serde_json::json!(cwd));
                 }
@@ -178,26 +181,42 @@ impl zed::Extension for FlutterDebuggerExtension {
         let is_flutter =
             cmd == "flutter" || cmd.ends_with("/flutter") || cmd.ends_with("\\flutter.bat");
         let is_dart = cmd == "dart" || cmd.ends_with("/dart") || cmd.ends_with("\\dart.bat");
+        let is_ctl = cmd == "flutter-debugger-server"
+            || cmd.ends_with("/flutter-debugger-server")
+            || cmd.ends_with("\\flutter-debugger-server.exe");
 
-        if !is_flutter && !is_dart {
+        if !is_flutter && !is_dart && !is_ctl {
             return None;
         }
 
-        let subcommand = build_task.args.first().map(String::as_str)?;
-        if subcommand != "run" && subcommand != "test" {
-            return None;
-        }
+        let (is_test_subcmd, arg_slice): (bool, &[String]) = if is_ctl {
+            if build_task.args.first().map(String::as_str) == Some("ctl")
+                && build_task.args.get(1).map(String::as_str) == Some("run")
+            {
+                (false, &build_task.args[2..])
+            } else {
+                return None;
+            }
+        } else {
+            let subcommand = build_task.args.first().map(String::as_str)?;
+            if subcommand != "run" && subcommand != "test" {
+                return None;
+            }
+            (subcommand == "test", &build_task.args[1..])
+        };
 
-        let mut program = if subcommand == "test" {
+        let mut program = if is_test_subcmd {
             "test".to_string()
         } else {
             "lib/main.dart".to_string()
         };
         let mut device_id: Option<String> = None;
         let mut flavor: Option<String> = None;
+        let mut dart_define_from_file: Option<String> = None;
+        let mut flutter_mode = "debug".to_string();
         let mut tool_args: Vec<String> = Vec::new();
 
-        let mut iter = build_task.args.iter().skip(1).peekable();
+        let mut iter = arg_slice.iter().peekable();
         while let Some(arg) = iter.next() {
             match arg.as_str() {
                 "-t" | "--target" => {
@@ -205,7 +224,7 @@ impl zed::Extension for FlutterDebuggerExtension {
                         program = target.clone();
                     }
                 }
-                "-d" | "--device-id" => {
+                "-d" | "--device-id" | "--device" => {
                     if let Some(dev) = iter.next() {
                         device_id = Some(dev.clone());
                     }
@@ -214,6 +233,23 @@ impl zed::Extension for FlutterDebuggerExtension {
                     if let Some(flav) = iter.next() {
                         flavor = Some(flav.clone());
                     }
+                }
+                "--dart-define-from-file" => {
+                    if let Some(file) = iter.next() {
+                        dart_define_from_file = Some(file.clone());
+                    }
+                }
+                "-m" | "--mode" => {
+                    if let Some(m) = iter.next() {
+                        flutter_mode = m.clone();
+                    }
+                }
+                "--profile" => flutter_mode = "profile".to_string(),
+                "--release" => flutter_mode = "release".to_string(),
+                "--debug" => flutter_mode = "debug".to_string(),
+                value if value.starts_with("--dart-define-from-file=") => {
+                    dart_define_from_file =
+                        Some(value.trim_start_matches("--dart-define-from-file=").to_string());
                 }
                 value if !value.starts_with('-') && value.ends_with(".dart") => {
                     program = value.to_string();
@@ -224,9 +260,15 @@ impl zed::Extension for FlutterDebuggerExtension {
             }
         }
 
+        let is_test = is_test_subcmd || looks_like_test_target(&program);
+
         let mut map = serde_json::Map::new();
         map.insert("request".to_string(), serde_json::json!("launch"));
         map.insert("program".to_string(), serde_json::json!(program));
+        map.insert("flutterMode".to_string(), serde_json::json!(flutter_mode));
+        if is_test {
+            map.insert("isTest".to_string(), serde_json::json!(true));
+        }
         if let Some(cwd) = build_task.cwd {
             map.insert("cwd".to_string(), serde_json::json!(cwd));
         }
@@ -235,6 +277,12 @@ impl zed::Extension for FlutterDebuggerExtension {
         }
         if let Some(flav) = flavor {
             map.insert("flavor".to_string(), serde_json::json!(flav));
+        }
+        if let Some(define_file) = dart_define_from_file {
+            map.insert(
+                "dartDefineFromFile".to_string(),
+                serde_json::json!(define_file),
+            );
         }
         if !tool_args.is_empty() {
             map.insert("toolArgs".to_string(), serde_json::json!(tool_args));
@@ -258,6 +306,18 @@ impl zed::Extension for FlutterDebuggerExtension {
             build: None,
         })
     }
+}
+
+fn looks_like_test_target(program: &str) -> bool {
+    let norm = program.replace('\\', "/");
+    norm == "test"
+        || norm == "integration_test"
+        || norm.starts_with("test/")
+        || norm.starts_with("integration_test/")
+        || norm.starts_with("test_driver/")
+        || norm.contains("/test/")
+        || norm.contains("/integration_test/")
+        || norm.ends_with("_test.dart")
 }
 
 fn parse_request_kind(

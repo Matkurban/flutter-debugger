@@ -1,13 +1,15 @@
-mod app_runner;
 mod cache;
+mod ctl;
+mod daemon;
 mod dap;
 mod debug_config;
+mod devtools;
 mod emulators;
 mod ipc;
 mod lsp;
 mod project;
 mod runner;
-mod wizard;
+mod vm_service;
 
 use tracing_subscriber::EnvFilter;
 
@@ -32,12 +34,26 @@ async fn main() {
                 std::process::exit(1);
             }
         }
+        Some("ctl") => {
+            let rest: Vec<String> = args.collect();
+            if let Err(err) = ctl::run_ctl(rest).await {
+                eprintln!("{err}");
+                std::process::exit(1);
+            }
+        }
+        Some("init-zed") => {
+            let rest: Vec<String> = args.collect();
+            if let Err(err) = debug_config::run_init_zed(&rest) {
+                eprintln!("{err}");
+                std::process::exit(1);
+            }
+        }
         Some("--version" | "-V") => {
             println!("flutter-debugger-server {}", env!("CARGO_PKG_VERSION"));
         }
         other => {
             eprintln!(
-                "flutter-debugger-server {}\nUsage: flutter-debugger-server <lsp|dap|--version>\nUnknown argument: {:?}",
+                "flutter-debugger-server {}\nUsage: flutter-debugger-server <lsp|dap|ctl|init-zed|--version>\nUnknown argument: {:?}",
                 env!("CARGO_PKG_VERSION"),
                 other
             );

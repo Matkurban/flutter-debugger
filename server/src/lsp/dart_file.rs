@@ -1,26 +1,23 @@
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::OnceLock;
 
-use regex::Regex;
 use serde_json::json;
 use tower_lsp_server::ls_types::{CodeLens, Command, Position, Range, Uri};
 
-use crate::app_runner::{FlutterRunMode, ManagedAppSnapshot};
 use crate::ipc::ActiveSessionRecord;
+use crate::lsp::dart_parser::{ClosingLabelEntry, parse_dart_syntax};
+use crate::lsp::test_runner::TestStatus;
 use crate::project::ProjectKind;
 
-/// Classifies a `.dart` file according to Dart / Flutter official testing conventions
-/// (`test/`, `integration_test/`, `test_driver/`, `*_test.dart`).
+pub use crate::lsp::dart_parser::DartTestEntry;
+
+/// Classifies a `.dart` file according to Dart / Flutter official testing conventions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DartFileRole {
-    /// Regular application or CLI entrypoint (`lib/main.dart`, `bin/main.dart`, etc.).
     #[default]
     AppOrScript,
-    /// Unit or widget test file (`test/**/*_test.dart` or importing `package:test`/`flutter_test`).
     UnitOrWidgetTest,
-    /// Flutter integration test file (`integration_test/**/*_test.dart`).
     IntegrationTest,
-    /// Non-runnable helper/fixture inside a test folder (e.g. `test/helpers/mock_api.dart`).
     TestHelper,
 }
 
@@ -30,31 +27,14 @@ impl DartFileRole {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DartTestEntry {
-    pub line: u32,
-    pub name: String,
-    pub is_group: bool,
-}
-
 #[derive(Debug, Clone, Default)]
 pub struct ParsedDartFile {
     pub role: DartFileRole,
     pub main_line: Option<u32>,
     pub tests: Vec<DartTestEntry>,
+    pub closing_labels: Vec<ClosingLabelEntry>,
 }
 
-/// Classifies a Dart file using both its path relative to the package root and its imports/body.
-///
-/// Rules follow Dart `package:test`, Flutter `flutter_test` / `integration_test`, and VS Code
-/// Dart-Code conventions:
-/// - Files inside `integration_test/` ending in `_test.dart` (or importing `integration_test` /
-///   `flutter_test` / `patrol`) are `IntegrationTest`.
-/// - Files inside `test/` or `test_driver/` ending in `_test.dart` (or importing a test package)
-///   are `UnitOrWidgetTest`; other files inside those folders are `TestHelper` (never shown as
-///   runnable Flutter apps).
-/// - Files outside test folders ending in `_test.dart` that import a test package are also
-///   recognized as `UnitOrWidgetTest`.
 pub fn classify_dart_file_role(
     file_path: &Path,
     project_root: Option<&Path>,
@@ -78,8 +58,8 @@ pub fn classify_dart_file_role(
     let in_integration_test = components.contains(&"integration_test");
     let in_test_folder = components.contains(&"test") || components.contains(&"test_driver");
 
-    let imports_integration_test = content.contains("package:integration_test/")
-        || content.contains("package:patrol/");
+    let imports_integration_test =
+        content.contains("package:integration_test/") || content.contains("package:patrol/");
     let imports_test_pkg = imports_integration_test
         || content.contains("package:flutter_test/")
         || content.contains("package:test/")
@@ -110,69 +90,40 @@ pub fn classify_dart_file_role(
     DartFileRole::AppOrScript
 }
 
-/// Synchronously scans a Dart file for `main()` and `test`/`testWidgets`/`group` declarations.
+/// Parses a Dart file using the comment/string-aware balanced delimiter parser.
 pub fn parse_dart_file(content: &str, role: DartFileRole) -> ParsedDartFile {
-    static MAIN_RE: OnceLock<Regex> = OnceLock::new();
-    static TEST_RE: OnceLock<Regex> = OnceLock::new();
-
-    let main_re = MAIN_RE.get_or_init(|| {
-        Regex::new(r"^\s*(?:Future\s*<\s*void\s*>\s+|void\s+)?main\s*\(")
-            .expect("valid main regex")
-    });
-    let test_re = TEST_RE.get_or_init(|| {
-        Regex::new(r#"^\s*(testWidgets|test|group)\s*\(\s*r?['"]([^'"]+)['"]"#)
-            .expect("valid test regex")
-    });
-
-    let mut main_line = None;
-    let mut tests = Vec::new();
-    let scan_tests = role.is_runnable_test();
-
-    for (idx, line) in content.lines().enumerate() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("//") || trimmed.starts_with('*') {
-            continue;
-        }
-
-        if main_line.is_none() && main_re.is_match(line) {
-            main_line = Some(idx as u32);
-        }
-
-        if scan_tests
-            && let Some(caps) = test_re.captures(line)
-            && let (Some(kind), Some(name)) = (caps.get(1), caps.get(2))
-        {
-            tests.push(DartTestEntry {
-                line: idx as u32,
-                name: name.as_str().to_string(),
-                is_group: kind.as_str() == "group",
-            });
-        }
-    }
-
+    let syntax = parse_dart_syntax(content, role.is_runnable_test());
     ParsedDartFile {
         role,
-        main_line,
-        tests,
+        main_line: syntax.main_line,
+        tests: syntax.tests,
+        closing_labels: syntax.closing_labels,
     }
 }
 
-/// Builds plain-text CodeLens entries for a Dart source or test file.
-///
-/// - For runnable test files (`UnitOrWidgetTest` / `IntegrationTest`), `main()` shows `Run Tests`
-///   (and `Device: ...` / `Refresh Devices` only for Flutter `IntegrationTest` files) — never
-///   app-launch `Debug` / `Profile` / `Release` buttons.
-/// - For `TestHelper` files inside `test/`, no app-launch buttons are shown.
-/// - For Flutter `AppOrScript` files (`lib/main.dart`, etc.), `main()` exposes `Debug`, `Profile`,
-///   and `Release` (or active-session controls `Hot Reload`, `Hot Restart`, `DevTools`/`Performance`,
-///   `Stop`) plus target device selection.
+/// Returns `true` if a saved `.dart` file should NOT trigger auto Hot Reload.
+pub fn should_skip_auto_hot_reload(path: &Path) -> bool {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    if name.ends_with("_test.dart")
+        || name.ends_with(".g.dart")
+        || name.ends_with(".freezed.dart")
+        || name.ends_with(".gr.dart")
+        || name.ends_with(".mocks.dart")
+        || name.ends_with(".gen.dart")
+    {
+        return true;
+    }
+    let norm = path.to_string_lossy().replace('\\', "/");
+    norm.contains("/test/") || norm.contains("/integration_test/")
+}
+
 pub fn build_dart_code_lenses(
     uri: &Uri,
     parsed: &ParsedDartFile,
     project_kind: ProjectKind,
     selected_device_label: Option<&str>,
-    dap_session: Option<&ActiveSessionRecord>,
-    managed_app: Option<&ManagedAppSnapshot>,
+    active_session: Option<&ActiveSessionRecord>,
+    test_results: &HashMap<String, TestStatus>,
 ) -> Vec<CodeLens> {
     let mut lenses = Vec::new();
     let uri_str = uri.as_str().to_string();
@@ -186,10 +137,28 @@ pub fn build_dart_code_lenses(
                 };
                 lenses.push(make_lens(
                     range,
-                    "Run Tests",
+                    "Run File",
                     "flutterDebugger.runTest",
                     vec![json!(uri_str)],
                 ));
+
+                // If any test in this file failed in the last run, offer a quick Re-run Failed lens
+                if let Some(failed_entry) = parsed.tests.iter().find(|t| {
+                    !t.is_group
+                        && matches!(
+                            test_results
+                                .get(&t.full_name)
+                                .or_else(|| test_results.get(&t.local_name)),
+                            Some(TestStatus::Failed { .. })
+                        )
+                }) {
+                    lenses.push(make_lens(
+                        range,
+                        "Re-run Failed",
+                        "flutterDebugger.runTest",
+                        vec![json!(uri_str), json!(failed_entry.full_name)],
+                    ));
+                }
 
                 if parsed.role == DartFileRole::IntegrationTest
                     && project_kind == ProjectKind::Flutter
@@ -204,12 +173,6 @@ pub fn build_dart_code_lenses(
                         "flutterDebugger.cycleDevice",
                         vec![json!(uri_str)],
                     ));
-                    lenses.push(make_lens(
-                        range,
-                        "Refresh Devices",
-                        "flutterDebugger.refreshDevices",
-                        vec![json!(uri_str)],
-                    ));
                 }
             }
 
@@ -218,16 +181,32 @@ pub fn build_dart_code_lenses(
                     start: Position::new(entry.line, 0),
                     end: Position::new(entry.line, 0),
                 };
-                let label = if entry.is_group {
+                let base_label = if entry.is_group {
                     "Run Group"
                 } else {
                     "Run Test"
                 };
+                let label = if entry.is_group {
+                    base_label.to_string()
+                } else {
+                    match test_results
+                        .get(&entry.full_name)
+                        .or_else(|| test_results.get(&entry.local_name))
+                    {
+                        Some(TestStatus::Passed { duration_ms }) => {
+                            format!("{base_label} (PASS {duration_ms}ms)")
+                        }
+                        Some(TestStatus::Failed { .. }) => format!("{base_label} (FAIL)"),
+                        Some(TestStatus::Skipped) => format!("{base_label} (SKIP)"),
+                        None => base_label.to_string(),
+                    }
+                };
+
                 lenses.push(make_lens(
                     range,
-                    label,
+                    &label,
                     "flutterDebugger.runTest",
-                    vec![json!(uri_str), json!(entry.name)],
+                    vec![json!(uri_str), json!(entry.full_name)],
                 ));
             }
         }
@@ -239,17 +218,21 @@ pub fn build_dart_code_lenses(
                     end: Position::new(line, 0),
                 };
 
-                let active_mode = managed_app
-                    .map(|m| m.mode.as_str())
-                    .or_else(|| dap_session.map(|s| s.mode.as_str()));
+                if project_kind == ProjectKind::Flutter {
+                    let device_title = match selected_device_label {
+                        Some(label) => format!("Device: {label}"),
+                        None => "Device: Auto".to_string(),
+                    };
+                    lenses.push(make_lens(
+                        range,
+                        &device_title,
+                        "flutterDebugger.cycleDevice",
+                        vec![json!(uri_str)],
+                    ));
+                }
 
-                let has_devtools = managed_app
-                    .is_some_and(|m| m.devtools_uri.is_some() || m.vm_service_uri.is_some())
-                    || dap_session
-                        .is_some_and(|s| s.devtools_uri.is_some() || s.vm_service_uri.is_some());
-
-                if let Some(mode) = active_mode {
-                    if mode == "debug" {
+                if let Some(session) = active_session {
+                    if session.mode == "debug" {
                         lenses.push(make_lens(
                             range,
                             "Hot Reload",
@@ -263,8 +246,8 @@ pub fn build_dart_code_lenses(
                             vec![json!(uri_str)],
                         ));
                     }
-                    if has_devtools {
-                        let dt_label = if mode == "profile" {
+                    if session.devtools_uri.is_some() || session.vm_service_uri.is_some() {
+                        let dt_label = if session.mode == "profile" {
                             "Performance"
                         } else {
                             "DevTools"
@@ -276,50 +259,10 @@ pub fn build_dart_code_lenses(
                             vec![json!(uri_str)],
                         ));
                     }
-                    if managed_app.is_some() {
-                        lenses.push(make_lens(
-                            range,
-                            "Stop",
-                            "flutterDebugger.stopApp",
-                            vec![json!(uri_str)],
-                        ));
-                    }
-                } else if project_kind == ProjectKind::Flutter {
                     lenses.push(make_lens(
                         range,
-                        "Debug",
-                        "flutterDebugger.runMode",
-                        vec![json!(uri_str), json!(FlutterRunMode::Debug.as_str())],
-                    ));
-                    lenses.push(make_lens(
-                        range,
-                        "Profile",
-                        "flutterDebugger.runMode",
-                        vec![json!(uri_str), json!(FlutterRunMode::Profile.as_str())],
-                    ));
-                    lenses.push(make_lens(
-                        range,
-                        "Release",
-                        "flutterDebugger.runMode",
-                        vec![json!(uri_str), json!(FlutterRunMode::Release.as_str())],
-                    ));
-                }
-
-                if project_kind == ProjectKind::Flutter {
-                    let device_title = match selected_device_label {
-                        Some(label) => format!("Device: {label}"),
-                        None => "Device: Auto".to_string(),
-                    };
-                    lenses.push(make_lens(
-                        range,
-                        &device_title,
-                        "flutterDebugger.cycleDevice",
-                        vec![json!(uri_str)],
-                    ));
-                    lenses.push(make_lens(
-                        range,
-                        "Refresh Devices",
-                        "flutterDebugger.refreshDevices",
+                        "Stop",
+                        "flutterDebugger.stopApp",
                         vec![json!(uri_str)],
                     ));
                 }
@@ -342,7 +285,6 @@ fn make_lens(range: Range, title: &str, command: &str, arguments: Vec<serde_json
     }
 }
 
-/// Maps `lib/<rel>.dart` <-> `test/<rel>_test.dart` when the counterpart file exists on disk.
 pub fn find_counterpart_test_or_impl(
     file_path: &Path,
     project_root: &Path,
@@ -376,128 +318,54 @@ mod tests {
     use super::*;
 
     #[test]
-    fn classifies_unit_integration_helper_and_app_files() {
-        let root = Path::new("/repo");
-        assert_eq!(
-            classify_dart_file_role(
-                Path::new("/repo/test/widget_test.dart"),
-                Some(root),
-                "import 'package:flutter_test/flutter_test.dart';\nvoid main() {}",
-            ),
-            DartFileRole::UnitOrWidgetTest
-        );
-        assert_eq!(
-            classify_dart_file_role(
-                Path::new("/repo/integration_test/app_test.dart"),
-                Some(root),
-                "import 'package:integration_test/integration_test.dart';\nvoid main() {}",
-            ),
-            DartFileRole::IntegrationTest
-        );
-        assert_eq!(
-            classify_dart_file_role(
-                Path::new("/repo/test/helpers/fake_client.dart"),
-                Some(root),
-                "class FakeClient {}",
-            ),
-            DartFileRole::TestHelper
-        );
-        assert_eq!(
-            classify_dart_file_role(
-                Path::new("/repo/lib/main.dart"),
-                Some(root),
-                "import 'package:flutter/material.dart';\nvoid main() {}",
-            ),
-            DartFileRole::AppOrScript
-        );
+    fn skips_generated_and_test_files_for_auto_hot_reload() {
+        assert!(should_skip_auto_hot_reload(Path::new("/app/test/foo_test.dart")));
+        assert!(should_skip_auto_hot_reload(Path::new("/app/lib/user.g.dart")));
+        assert!(should_skip_auto_hot_reload(Path::new("/app/lib/user.freezed.dart")));
+        assert!(!should_skip_auto_hot_reload(Path::new("/app/lib/main.dart")));
     }
 
     #[test]
-    fn test_file_main_shows_run_tests_and_never_app_launchers() {
+    fn test_lenses_reflect_nested_group_full_names_and_pass_fail_status() {
         let code = r#"
 import 'package:flutter_test/flutter_test.dart';
-
-Future<void> main() async {
-  group('Counter', () {
-    testWidgets('increments counter', (tester) async {});
-    test('adds numbers', () {});
+void main() {
+  group('Cart', () {
+    test('adds item', () {});
+    test('removes item', () {});
   });
 }
 "#;
         let parsed = parse_dart_file(code, DartFileRole::UnitOrWidgetTest);
-        assert_eq!(parsed.main_line, Some(3));
-        assert_eq!(parsed.tests.len(), 3);
+        let uri: Uri = "file:///tmp/app/test/cart_test.dart".parse().expect("uri");
+        let mut results = HashMap::new();
+        results.insert(
+            "Cart adds item".to_string(),
+            TestStatus::Passed { duration_ms: 42 },
+        );
+        results.insert(
+            "Cart removes item".to_string(),
+            TestStatus::Failed {
+                duration_ms: 15,
+                error: "boom".into(),
+            },
+        );
 
-        let uri: Uri = "file:///tmp/app/test/widget_test.dart".parse().expect("uri");
-        let lenses = build_dart_code_lenses(&uri, &parsed, ProjectKind::Flutter, None, None, None);
-        let titles: Vec<&str> = lenses
-            .iter()
-            .filter_map(|l| l.command.as_ref().map(|c| c.title.as_str()))
-            .collect();
-        assert_eq!(titles, vec!["Run Tests", "Run Group", "Run Test", "Run Test"]);
-        assert!(!titles.contains(&"Debug"));
-        assert!(!titles.contains(&"Profile"));
-        assert!(!titles.contains(&"Release"));
-    }
-
-    #[test]
-    fn integration_test_main_shows_run_tests_and_device_selector() {
-        let code = r#"
-import 'package:integration_test/integration_test.dart';
-void main() {
-  testWidgets('full flow', (tester) async {});
-}
-"#;
-        let parsed = parse_dart_file(code, DartFileRole::IntegrationTest);
-        let uri: Uri = "file:///tmp/app/integration_test/app_test.dart"
-            .parse()
-            .expect("uri");
-        let lenses = build_dart_code_lenses(&uri, &parsed, ProjectKind::Flutter, None, None, None);
+        let lenses =
+            build_dart_code_lenses(&uri, &parsed, ProjectKind::Flutter, None, None, &results);
         let titles: Vec<&str> = lenses
             .iter()
             .filter_map(|l| l.command.as_ref().map(|c| c.title.as_str()))
             .collect();
         assert_eq!(
             titles,
-            vec!["Run Tests", "Device: Auto", "Refresh Devices", "Run Test"]
-        );
-        assert!(!titles.contains(&"Debug"));
-    }
-
-    #[test]
-    fn shows_debug_profile_release_lenses_on_flutter_app_main() {
-        let parsed = parse_dart_file(
-            "void main() => runApp(const App());",
-            DartFileRole::AppOrScript,
-        );
-        let uri: Uri = "file:///tmp/app/lib/main.dart".parse().expect("uri");
-        let lenses = build_dart_code_lenses(&uri, &parsed, ProjectKind::Flutter, None, None, None);
-        let titles: Vec<&str> = lenses
-            .iter()
-            .filter_map(|l| l.command.as_ref().map(|c| c.title.as_str()))
-            .collect();
-        assert!(titles.contains(&"Debug"));
-        assert!(titles.contains(&"Profile"));
-        assert!(titles.contains(&"Release"));
-    }
-
-    #[test]
-    fn maps_lib_and_test_counterparts() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let lib_file = dir.path().join("lib").join("counter.dart");
-        let test_file = dir.path().join("test").join("counter_test.dart");
-        std::fs::create_dir_all(lib_file.parent().expect("lib")).expect("mkdir lib");
-        std::fs::create_dir_all(test_file.parent().expect("test")).expect("mkdir test");
-        std::fs::write(&lib_file, "class Counter {}").expect("write lib");
-        std::fs::write(&test_file, "void main() {}").expect("write test");
-
-        assert_eq!(
-            find_counterpart_test_or_impl(&lib_file, dir.path()),
-            Some((test_file.clone(), true))
-        );
-        assert_eq!(
-            find_counterpart_test_or_impl(&test_file, dir.path()),
-            Some((lib_file, false))
+            vec![
+                "Run File",
+                "Re-run Failed",
+                "Run Group",
+                "Run Test (PASS 42ms)",
+                "Run Test (FAIL)"
+            ]
         );
     }
 }

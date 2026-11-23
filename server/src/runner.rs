@@ -21,11 +21,6 @@ pub enum AllowedCommand {
         device_id: Option<String>,
         output_path: String,
     },
-    TestFile {
-        relative_path: String,
-        test_name: Option<String>,
-        device_id: Option<String>,
-    },
 }
 
 impl AllowedCommand {
@@ -37,12 +32,11 @@ impl AllowedCommand {
             Self::Clean => "flutter clean",
             Self::Doctor => "flutter doctor",
             Self::Screenshot { .. } => "screenshot",
-            Self::TestFile { .. } => "test",
         }
     }
 
     pub fn always_open_log(&self) -> bool {
-        matches!(self, Self::PubOutdated | Self::Doctor | Self::TestFile { .. })
+        matches!(self, Self::PubOutdated | Self::Doctor)
     }
 
     pub fn build_args(&self) -> Vec<String> {
@@ -57,26 +51,6 @@ impl AllowedCommand {
                 output_path,
             } => {
                 let mut args = vec!["screenshot".into(), "-o".into(), output_path.clone()];
-                if let Some(dev) = device_id
-                    && !dev.trim().is_empty()
-                {
-                    args.push("-d".into());
-                    args.push(dev.clone());
-                }
-                args
-            }
-            Self::TestFile {
-                relative_path,
-                test_name,
-                device_id,
-            } => {
-                let mut args = vec!["test".into(), relative_path.clone()];
-                if let Some(name) = test_name
-                    && !name.trim().is_empty()
-                {
-                    args.push("--plain-name".into());
-                    args.push(name.clone());
-                }
                 if let Some(dev) = device_id
                     && !dev.trim().is_empty()
                 {

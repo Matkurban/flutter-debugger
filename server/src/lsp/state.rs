@@ -7,13 +7,24 @@ use crate::cache::{DEFAULT_DEVICE_CACHE_TTL_SECS, DEFAULT_PUB_CACHE_TTL_SECS};
 use crate::lsp::dart_file::{DartFileRole, ParsedDartFile, classify_dart_file_role, parse_dart_file};
 use crate::lsp::pubspec::{ParsedPubspec, parse_pubspec_dependencies};
 use crate::project::{ProjectInfo, find_project_for_path};
-use crate::wizard::{ProjectWizardConfig, WIZARD_FILENAME};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerConfig {
     #[serde(default = "default_true")]
     pub auto_hot_reload_on_save: bool,
+    #[serde(default = "default_debounce_ms")]
+    pub hot_reload_debounce_ms: u64,
+    #[serde(default = "default_true")]
+    pub closing_labels: bool,
+    #[serde(default = "default_closing_min_lines")]
+    pub closing_labels_min_lines: u32,
+    #[serde(default = "default_true")]
+    pub color_previews: bool,
+    #[serde(default)]
+    pub enable_pub_version_hints: bool,
+    #[serde(default)]
+    pub expose_global_code_actions: bool,
     #[serde(default)]
     pub flutter_sdk_path: Option<String>,
     #[serde(default = "default_pub_timeout")]
@@ -28,6 +39,12 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             auto_hot_reload_on_save: true,
+            hot_reload_debounce_ms: default_debounce_ms(),
+            closing_labels: true,
+            closing_labels_min_lines: default_closing_min_lines(),
+            color_previews: true,
+            enable_pub_version_hints: false,
+            expose_global_code_actions: false,
             flutter_sdk_path: None,
             pub_dev_timeout_secs: default_pub_timeout(),
             device_cache_ttl_secs: default_device_ttl(),
@@ -38,6 +55,14 @@ impl Default for ServerConfig {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_debounce_ms() -> u64 {
+    250
+}
+
+fn default_closing_min_lines() -> u32 {
+    2
 }
 
 fn default_pub_timeout() -> u64 {
@@ -57,51 +82,39 @@ pub enum DocumentKind {
     Pubspec,
     PubspecOverrides,
     Dart,
-    ProjectWizard,
-    RunLog,
     Ignored,
 }
 
 #[derive(Debug, Clone)]
 pub struct OpenDocument {
     pub kind: DocumentKind,
+    pub text: String,
     pub project: Option<ProjectInfo>,
     pub pubspec: Option<ParsedPubspec>,
     pub dart: Option<ParsedDartFile>,
-    pub wizard: Option<ProjectWizardConfig>,
 }
 
 impl OpenDocument {
     /// Synchronously classifies and parses a document so `documentLink`, `codeLens`,
-    /// and `inlayHint` immediately have parsed data right after `didOpen`.
+    /// `documentColor`, and `inlayHint` immediately have parsed data right after `didOpen`.
     pub fn parse_sync(uri: &Uri, text: &str) -> Option<Self> {
         let path = uri_to_file_path(uri)?;
         let kind = classify_document_path(&path);
 
         match kind {
-            DocumentKind::Ignored | DocumentKind::RunLog => Some(Self {
+            DocumentKind::Ignored => Some(Self {
                 kind,
+                text: String::new(),
                 project: None,
                 pubspec: None,
                 dart: None,
-                wizard: None,
             }),
-            DocumentKind::ProjectWizard => {
-                let wizard = serde_json::from_str::<ProjectWizardConfig>(text).ok();
-                Some(Self {
-                    kind,
-                    project: None,
-                    pubspec: None,
-                    dart: None,
-                    wizard,
-                })
-            }
             DocumentKind::Pubspec | DocumentKind::PubspecOverrides => Some(Self {
                 kind,
+                text: text.to_string(),
                 project: find_project_for_path(&path),
                 pubspec: Some(parse_pubspec_dependencies(text)),
                 dart: None,
-                wizard: None,
             }),
             DocumentKind::Dart => {
                 let project = find_project_for_path(&path);
@@ -112,10 +125,10 @@ impl OpenDocument {
                 );
                 Some(Self {
                     kind,
+                    text: text.to_string(),
                     project,
                     pubspec: None,
                     dart: Some(parse_dart_file(text, role)),
-                    wizard: None,
                 })
             }
         }
@@ -127,10 +140,6 @@ pub fn classify_document_path(path: &Path) -> DocumentKind {
     match file_name {
         "pubspec.yaml" => DocumentKind::Pubspec,
         "pubspec_overrides.yaml" => DocumentKind::PubspecOverrides,
-        WIZARD_FILENAME => DocumentKind::ProjectWizard,
-        _ if file_name.starts_with("flutter-run-") && file_name.ends_with(".log") => {
-            DocumentKind::RunLog
-        }
         _ if file_name.ends_with(".dart") => DocumentKind::Dart,
         _ => DocumentKind::Ignored,
     }
@@ -151,7 +160,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn classifies_only_target_files_and_ignores_others() {
+    fn classifies_only_dart_and_pubspec_files() {
         assert_eq!(
             classify_document_path(Path::new("/repo/.github/workflows/ci.yml")),
             DocumentKind::Ignored
@@ -163,14 +172,6 @@ mod tests {
         assert_eq!(
             classify_document_path(Path::new("/var/log/system.log")),
             DocumentKind::Ignored
-        );
-        assert_eq!(
-            classify_document_path(Path::new("/tmp/flutter-debugger-logs/flutter-run-debug-1.log")),
-            DocumentKind::RunLog
-        );
-        assert_eq!(
-            classify_document_path(Path::new("/tmp/flutter-project-wizard.json")),
-            DocumentKind::ProjectWizard
         );
         assert_eq!(
             classify_document_path(Path::new("/repo/pubspec.yaml")),

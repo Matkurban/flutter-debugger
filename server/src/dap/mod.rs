@@ -3,180 +3,264 @@ pub mod framing;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, mpsc};
 
-use crate::cache::{DiskCache, normalize_project_key};
+use crate::cache::{DiskCache, normalize_project_key, now_unix};
 use crate::dap::framing::{
-    ProxySessionState, enrich_launch_or_attach, inspect_adapter_event, read_dap_message,
-    write_dap_message,
+    ProxySessionState, build_synthetic_initialize_response, inspect_adapter_event,
+    read_dap_message, resolve_and_enrich_launch_or_attach, write_dap_message,
 };
+use crate::devtools::resolve_or_start_devtools_url;
 use crate::ipc::{
-    ActiveSessionRecord, IpcRequest, IpcResponse, remove_session_record, write_session_record,
+    ActiveSessionRecord, IpcRequest, IpcResponse, ServiceOverlay, generate_session_id,
+    remove_session_record_by_id, write_session_record,
 };
-use crate::project::{ProjectKind, find_project_for_path, resolve_sdk_executable};
+use crate::vm_service::VmServiceClient;
 
-/// Runs the transparent DAP proxy between Zed (stdio) and `flutter`/`dart debug_adapter`.
+/// Runs the enhanced DAP proxy between Zed (stdio) and `flutter`/`dart debug_adapter`.
 pub async fn run_dap_proxy() -> Result<(), Box<dyn std::error::Error>> {
     let cache = DiskCache::default_location();
     let default_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-
-    let project_info = find_project_for_path(&default_cwd);
-    let project_root = project_info
-        .as_ref()
-        .map(|p| p.root.clone())
-        .unwrap_or_else(|| default_cwd.clone());
-    let project_kind = project_info
-        .as_ref()
-        .map(|p| p.kind)
-        .unwrap_or(ProjectKind::Flutter);
-
     let custom_sdk = std::env::var("FLUTTER_SDK_PATH").ok();
-    let executable = resolve_sdk_executable(&project_root, project_kind, custom_sdk.as_deref());
 
-    let mut child = spawn_debug_adapter(&executable, &project_root)?;
-    let child_stdin = child
-        .stdin
-        .take()
-        .ok_or("Failed to capture child debug_adapter stdin")?;
-    let child_stdout = child
-        .stdout
-        .take()
-        .ok_or("Failed to capture child debug_adapter stdout")?;
-
-    let state = Arc::new(Mutex::new(ProxySessionState::new()));
-    {
-        let mut guard = state.lock().await;
-        guard.project_root = Some(project_root.clone());
-    }
+    let session_id = generate_session_id();
+    let state = Arc::new(Mutex::new(ProxySessionState::new(session_id.clone())));
+    let zed_stdout = Arc::new(Mutex::new(tokio::io::stdout()));
 
     let ipc_listener = TcpListener::bind("127.0.0.1:0").await?;
     let ipc_port = ipc_listener.local_addr()?.port();
 
     let session_guard = SessionCleanupGuard {
         cache: cache.clone(),
-        project_root: project_root.clone(),
+        session_id: session_id.clone(),
     };
-    persist_session(&cache, &project_root, ipc_port, &state).await;
 
-    let (to_adapter_tx, mut to_adapter_rx) = mpsc::channel::<Value>(64);
+    let (to_adapter_tx, to_adapter_rx) = mpsc::channel::<Value>(128);
+    let child_handle: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
 
-    // Task 1: Forward queued JSON frames to child debug_adapter stdin
-    let adapter_writer_handle = tokio::spawn(async move {
-        let mut writer = child_stdin;
-        while let Some(msg) = to_adapter_rx.recv().await {
-            if write_dap_message(&mut writer, &msg).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    // Task 2: Listen for local IPC commands from the LSP server (Hot Reload / Hot Restart / Status)
+    // Task 1: Listen for local IPC commands from LSP / `ctl` CLI
     let ipc_state = Arc::clone(&state);
     let ipc_tx = to_adapter_tx.clone();
+    let ipc_cache = cache.clone();
+    let ipc_child = Arc::clone(&child_handle);
+    let ipc_sdk = custom_sdk.clone();
     let ipc_handle = tokio::spawn(async move {
         while let Ok((stream, _)) = ipc_listener.accept().await {
             let state_ref = Arc::clone(&ipc_state);
             let tx = ipc_tx.clone();
+            let cache_ref = ipc_cache.clone();
+            let child_ref = Arc::clone(&ipc_child);
+            let sdk_ref = ipc_sdk.clone();
             tokio::spawn(async move {
-                handle_ipc_connection(stream, state_ref, tx).await;
+                handle_ipc_connection(stream, state_ref, tx, cache_ref, child_ref, sdk_ref).await;
             });
         }
     });
 
-    // Task 3: Read from child debug_adapter stdout -> Zed stdout (filtering injected responses)
-    let out_state = Arc::clone(&state);
-    let out_cache = cache.clone();
-    let out_root = project_root.clone();
-    let adapter_reader_handle = tokio::spawn(async move {
-        let mut reader = BufReader::new(child_stdout);
-        let mut zed_stdout = tokio::io::stdout();
-        let mut profile_devtools_opened = false;
+    // Main loop: read DAP messages from Zed stdin.
+    let mut zed_stdin = BufReader::new(tokio::io::stdin());
+    let mut saved_initialize: Option<Value> = None;
+    let mut child_spawned = false;
+    let mut writer_task: Option<tokio::task::JoinHandle<()>> = None;
+    let mut reader_task: Option<tokio::task::JoinHandle<()>> = None;
+    let mut to_adapter_rx_opt = Some(to_adapter_rx);
 
-        while let Ok(Some(msg)) = read_dap_message(&mut reader).await {
-            let suppress = if msg.get("type").and_then(Value::as_str) == Some("response") {
-                if let Some(req_seq) = msg.get("request_seq").and_then(Value::as_i64) {
-                    let mut guard = out_state.lock().await;
-                    guard.injected_seqs.remove(&req_seq)
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
+    while let Ok(Some(mut msg)) = read_dap_message(&mut zed_stdin).await {
+        let msg_type = msg.get("type").and_then(Value::as_str).unwrap_or_default();
+        let command = msg.get("command").and_then(Value::as_str).unwrap_or_default();
 
-            let (updated, profile_url) = {
-                let mut guard = out_state.lock().await;
-                let changed = inspect_adapter_event(&msg, &mut guard);
-                let url_to_open = if !profile_devtools_opened && guard.mode == "profile" {
-                    guard.devtools_uri.clone().or_else(|| {
-                        guard
-                            .vm_service_uri
-                            .as_deref()
-                            .and_then(crate::app_runner::build_devtools_performance_url)
-                    })
-                } else {
-                    None
-                };
-                (changed, url_to_open)
-            };
-
-            if updated {
-                persist_session(&out_cache, &out_root, ipc_port, &out_state).await;
-            }
-            if let Some(url) = profile_url {
-                profile_devtools_opened = true;
-                open_url_in_browser(&url);
-            }
-
-            if !suppress && write_dap_message(&mut zed_stdout, &msg).await.is_err() {
+        if !child_spawned && msg_type == "request" && command == "initialize" {
+            let req_seq = msg.get("seq").and_then(Value::as_i64).unwrap_or(1);
+            saved_initialize = Some(msg);
+            let synthetic = build_synthetic_initialize_response(req_seq);
+            let mut out = zed_stdout.lock().await;
+            if write_dap_message(&mut *out, &synthetic).await.is_err() {
                 break;
             }
+            continue;
         }
-    });
 
-    // Main loop: Read from Zed stdin -> enrich launch/attach -> forward to child adapter
-    let mut zed_stdin = BufReader::new(tokio::io::stdin());
-    while let Ok(Some(mut msg)) = read_dap_message(&mut zed_stdin).await {
-        if let Some((cwd, mode)) = enrich_launch_or_attach(&mut msg, &cache, &project_root) {
+        if !child_spawned && msg_type == "request" && (command == "launch" || command == "attach") {
+            let resolved = resolve_and_enrich_launch_or_attach(
+                &mut msg,
+                &cache,
+                &default_cwd,
+                custom_sdk.as_deref(),
+            );
+
+            let (proj_root, executable, is_test, mode, device_id) = match resolved {
+                Some(r) => (
+                    r.project_root,
+                    r.executable,
+                    r.is_test,
+                    r.mode,
+                    r.device_id,
+                ),
+                None => (
+                    default_cwd.clone(),
+                    crate::project::platform_cli_filename("flutter").to_string(),
+                    false,
+                    "debug".to_string(),
+                    None,
+                ),
+            };
+
+            let mut child = spawn_debug_adapter(&executable, &proj_root, is_test)?;
+            let child_stdin = child
+                .stdin
+                .take()
+                .ok_or("Failed to capture child debug_adapter stdin")?;
+            let child_stdout = child
+                .stdout
+                .take()
+                .ok_or("Failed to capture child debug_adapter stdout")?;
+            *child_handle.lock().await = Some(child);
+
             {
                 let mut guard = state.lock().await;
-                guard.project_root = Some(cwd);
+                guard.project_root = Some(proj_root.clone());
                 guard.mode = mode;
+                guard.device_id = device_id;
+                guard.is_test = is_test;
             }
-            persist_session(&cache, &project_root, ipc_port, &state).await;
+            persist_session(&cache, ipc_port, &state).await;
+
+            if let Some(mut rx) = to_adapter_rx_opt.take() {
+                writer_task = Some(tokio::spawn(async move {
+                    let mut writer = child_stdin;
+                    while let Some(m) = rx.recv().await {
+                        if write_dap_message(&mut writer, &m).await.is_err() {
+                            break;
+                        }
+                    }
+                }));
+            }
+
+            let out_state = Arc::clone(&state);
+            let out_cache = cache.clone();
+            let out_stdout = Arc::clone(&zed_stdout);
+            let out_sdk = custom_sdk.clone();
+            reader_task = Some(tokio::spawn(async move {
+                let mut reader = BufReader::new(child_stdout);
+                let mut profile_devtools_opened = false;
+
+                while let Ok(Some(child_msg)) = read_dap_message(&mut reader).await {
+                    let mut suppress = false;
+                    if child_msg.get("type").and_then(Value::as_str) == Some("response")
+                        && let Some(req_seq) = child_msg.get("request_seq").and_then(Value::as_i64)
+                    {
+                        let mut guard = out_state.lock().await;
+                        if let Some(tx) = guard.pending_injected.remove(&req_seq) {
+                            let _ = tx.send(child_msg.clone());
+                            suppress = true;
+                        } else if guard.suppressed_seqs.remove(&req_seq) {
+                            suppress = true;
+                        }
+                    }
+
+                    let (updated, profile_info) = {
+                        let mut guard = out_state.lock().await;
+                        let changed = inspect_adapter_event(&child_msg, &mut guard);
+                        let info = if !profile_devtools_opened
+                            && guard.mode == "profile"
+                            && (guard.devtools_uri.is_some() || guard.vm_service_uri.is_some())
+                        {
+                            Some((
+                                guard
+                                    .project_root
+                                    .clone()
+                                    .unwrap_or_else(|| PathBuf::from(".")),
+                                guard.devtools_uri.clone(),
+                                guard.vm_service_uri.clone(),
+                            ))
+                        } else {
+                            None
+                        };
+                        (changed, info)
+                    };
+
+                    if updated {
+                        persist_session(&out_cache, ipc_port, &out_state).await;
+                    }
+                    if let Some((root, dt, vm)) = profile_info
+                        && let Some(url) = resolve_or_start_devtools_url(
+                            &out_cache,
+                            &root,
+                            dt.as_deref(),
+                            vm.as_deref(),
+                            Some("performance"),
+                            out_sdk.as_deref(),
+                        )
+                        .await
+                    {
+                        profile_devtools_opened = true;
+                        open_url_in_browser(&url);
+                    }
+
+                    if !suppress {
+                        let mut out = out_stdout.lock().await;
+                        if write_dap_message(&mut *out, &child_msg).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }));
+
+            if let Some(init_msg) = saved_initialize.take() {
+                if let Some(init_seq) = init_msg.get("seq").and_then(Value::as_i64) {
+                    state.lock().await.mark_suppressed(init_seq);
+                }
+                if to_adapter_tx.send(init_msg).await.is_err() {
+                    break;
+                }
+            }
+
+            child_spawned = true;
         }
 
-        if to_adapter_tx.send(msg).await.is_err() {
+        if child_spawned && to_adapter_tx.send(msg).await.is_err() {
             break;
         }
     }
 
     drop(to_adapter_tx);
-    let _ = child.kill().await;
+    if let Some(mut child) = child_handle.lock().await.take() {
+        terminate_child_tree(&mut child).await;
+    }
     ipc_handle.abort();
-    let _ = adapter_writer_handle.await;
-    let _ = adapter_reader_handle.await;
+    if let Some(h) = writer_task {
+        let _ = h.await;
+    }
+    if let Some(h) = reader_task {
+        let _ = h.await;
+    }
     drop(session_guard);
 
     Ok(())
 }
 
-fn spawn_debug_adapter(
-    executable: &str,
-    cwd: &Path,
-) -> std::io::Result<tokio::process::Child> {
+fn spawn_debug_adapter(executable: &str, cwd: &Path, is_test: bool) -> std::io::Result<Child> {
+    let mut args = vec!["debug_adapter"];
+    if is_test {
+        args.push("--test");
+    }
+
     #[cfg(windows)]
     {
         let lower = executable.to_ascii_lowercase();
         if lower.ends_with(".bat") || lower.ends_with(".cmd") {
-            return Command::new("cmd")
-                .args(["/C", executable, "debug_adapter"])
+            let mut cmd = Command::new("cmd");
+            cmd.args(["/C", executable]);
+            cmd.args(&args);
+            return cmd
                 .current_dir(cwd)
+                .kill_on_drop(true)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::inherit())
@@ -185,18 +269,69 @@ fn spawn_debug_adapter(
     }
 
     Command::new(executable)
-        .arg("debug_adapter")
+        .args(&args)
         .current_dir(cwd)
+        .kill_on_drop(true)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
 }
 
+async fn inject_and_await(
+    state: &Arc<Mutex<ProxySessionState>>,
+    to_adapter_tx: &mpsc::Sender<Value>,
+    command: &str,
+    arguments: Value,
+    timeout_secs: u64,
+) -> Result<(Value, u64), String> {
+    let start = Instant::now();
+    let (seq, rx) = {
+        let mut guard = state.lock().await;
+        guard.allocate_injected_request()
+    };
+
+    let req = json!({
+        "seq": seq,
+        "type": "request",
+        "command": command,
+        "arguments": arguments
+    });
+
+    if to_adapter_tx.send(req).await.is_err() {
+        state.lock().await.pending_injected.remove(&seq);
+        return Err("Debug adapter session is closed".to_string());
+    }
+
+    match tokio::time::timeout(Duration::from_secs(timeout_secs), rx).await {
+        Ok(Ok(resp)) => {
+            let elapsed = start.elapsed().as_millis() as u64;
+            let ok = resp.get("success").and_then(Value::as_bool).unwrap_or(true);
+            if ok {
+                Ok((resp, elapsed))
+            } else {
+                let err_msg = resp
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Adapter request failed");
+                Err(err_msg.to_string())
+            }
+        }
+        Ok(Err(_)) => Err("Debug adapter closed before responding".to_string()),
+        Err(_) => {
+            state.lock().await.pending_injected.remove(&seq);
+            Err(format!("Timed out waiting for `{command}` response"))
+        }
+    }
+}
+
 async fn handle_ipc_connection(
     mut stream: tokio::net::TcpStream,
     state: Arc<Mutex<ProxySessionState>>,
     to_adapter_tx: mpsc::Sender<Value>,
+    cache: DiskCache,
+    child_handle: Arc<Mutex<Option<Child>>>,
+    custom_sdk: Option<String>,
 ) {
     let (read_half, mut write_half) = stream.split();
     let mut reader = BufReader::new(read_half);
@@ -208,86 +343,282 @@ async fn handle_ipc_connection(
 
     let response = match serde_json::from_str::<IpcRequest>(line.trim()) {
         Ok(IpcRequest::HotReload) => {
-            let mut guard = state.lock().await;
-            if guard.mode != "debug" {
+            let (mode, dev, vm, dt) = snapshot_meta(&state).await;
+            if mode != "debug" {
                 IpcResponse {
                     ok: false,
-                    message: format!("Hot Reload is disabled in `{}` mode", guard.mode),
-                    mode: Some(guard.mode.clone()),
-                    vm_service_uri: guard.vm_service_uri.clone(),
-                    devtools_uri: guard.devtools_uri.clone(),
+                    message: format!("Hot Reload is disabled in `{mode}` mode"),
+                    duration_ms: None,
+                    mode: Some(mode),
+                    device_id: dev,
+                    vm_service_uri: vm,
+                    devtools_uri: dt,
                 }
             } else {
-                let seq = guard.allocate_injected_seq();
-                let req = json!({
-                    "seq": seq,
-                    "type": "request",
-                    "command": "hotReload",
-                    "arguments": { "reason": "save" }
-                });
-                let sent = to_adapter_tx.send(req).await.is_ok();
-                IpcResponse {
-                    ok: sent,
-                    message: if sent {
-                        "Hot Reload triggered".to_string()
-                    } else {
-                        "Debug adapter session is closed".to_string()
+                match inject_and_await(
+                    &state,
+                    &to_adapter_tx,
+                    "hotReload",
+                    json!({ "reason": "save" }),
+                    12,
+                )
+                .await
+                {
+                    Ok((_, ms)) => IpcResponse {
+                        ok: true,
+                        message: format!("Hot Reload: {ms}ms"),
+                        duration_ms: Some(ms),
+                        mode: Some(mode),
+                        device_id: dev,
+                        vm_service_uri: vm,
+                        devtools_uri: dt,
                     },
-                    mode: Some(guard.mode.clone()),
-                    vm_service_uri: guard.vm_service_uri.clone(),
-                    devtools_uri: guard.devtools_uri.clone(),
+                    Err(err) => IpcResponse {
+                        ok: false,
+                        message: format!("Hot Reload failed: {err}"),
+                        duration_ms: None,
+                        mode: Some(mode),
+                        device_id: dev,
+                        vm_service_uri: vm,
+                        devtools_uri: dt,
+                    },
                 }
             }
         }
         Ok(IpcRequest::HotRestart) => {
-            let mut guard = state.lock().await;
-            if guard.mode != "debug" {
+            let (mode, dev, vm, dt) = snapshot_meta(&state).await;
+            if mode != "debug" {
                 IpcResponse {
                     ok: false,
-                    message: format!("Hot Restart is disabled in `{}` mode", guard.mode),
-                    mode: Some(guard.mode.clone()),
-                    vm_service_uri: guard.vm_service_uri.clone(),
-                    devtools_uri: guard.devtools_uri.clone(),
+                    message: format!("Hot Restart is disabled in `{mode}` mode"),
+                    duration_ms: None,
+                    mode: Some(mode),
+                    device_id: dev,
+                    vm_service_uri: vm,
+                    devtools_uri: dt,
                 }
             } else {
-                let seq = guard.allocate_injected_seq();
-                let req = json!({
-                    "seq": seq,
-                    "type": "request",
-                    "command": "hotRestart",
-                    "arguments": { "reason": "manual" }
-                });
-                let sent = to_adapter_tx.send(req).await.is_ok();
-                IpcResponse {
-                    ok: sent,
-                    message: if sent {
-                        "Hot Restart triggered".to_string()
-                    } else {
-                        "Debug adapter session is closed".to_string()
+                match inject_and_await(
+                    &state,
+                    &to_adapter_tx,
+                    "hotRestart",
+                    json!({ "reason": "manual" }),
+                    15,
+                )
+                .await
+                {
+                    Ok((_, ms)) => IpcResponse {
+                        ok: true,
+                        message: format!("Hot Restart: {ms}ms"),
+                        duration_ms: Some(ms),
+                        mode: Some(mode),
+                        device_id: dev,
+                        vm_service_uri: vm,
+                        devtools_uri: dt,
                     },
-                    mode: Some(guard.mode.clone()),
-                    vm_service_uri: guard.vm_service_uri.clone(),
-                    devtools_uri: guard.devtools_uri.clone(),
+                    Err(err) => IpcResponse {
+                        ok: false,
+                        message: format!("Hot Restart failed: {err}"),
+                        duration_ms: None,
+                        mode: Some(mode),
+                        device_id: dev,
+                        vm_service_uri: vm,
+                        devtools_uri: dt,
+                    },
+                }
+            }
+        }
+        Ok(IpcRequest::Stop) => {
+            let (mode, dev, vm, dt) = snapshot_meta(&state).await;
+            let _ = inject_and_await(&state, &to_adapter_tx, "terminate", json!({}), 3).await;
+            if let Some(mut child) = child_handle.lock().await.take() {
+                terminate_child_tree(&mut child).await;
+            }
+            IpcResponse {
+                ok: true,
+                message: "Stopped Flutter debug session".to_string(),
+                duration_ms: None,
+                mode: Some(mode),
+                device_id: dev,
+                vm_service_uri: vm,
+                devtools_uri: dt,
+            }
+        }
+        Ok(IpcRequest::ToggleOverlay { overlay }) => {
+            handle_overlay_toggle(&state, &to_adapter_tx, overlay).await
+        }
+        Ok(IpcRequest::CallServiceExtension { method, params }) => {
+            let (mode, dev, vm, dt) = snapshot_meta(&state).await;
+            let dap_res = inject_and_await(
+                &state,
+                &to_adapter_tx,
+                "callServiceExtension",
+                json!({ "methodName": method, "params": params }),
+                10,
+            )
+            .await;
+            match dap_res {
+                Ok((_, ms)) => IpcResponse {
+                    ok: true,
+                    message: format!("Called `{method}` ({ms}ms)"),
+                    duration_ms: Some(ms),
+                    mode: Some(mode),
+                    device_id: dev,
+                    vm_service_uri: vm,
+                    devtools_uri: dt,
+                },
+                Err(dap_err) => {
+                    if let Some(vm_uri) = vm.as_deref()
+                        && let Ok(mut client) = VmServiceClient::connect(vm_uri).await
+                        && client.call_service_extension(&method, params).await.is_ok()
+                    {
+                        IpcResponse {
+                            ok: true,
+                            message: format!("Called `{method}` via VM Service"),
+                            duration_ms: None,
+                            mode: Some(mode),
+                            device_id: dev,
+                            vm_service_uri: vm,
+                            devtools_uri: dt,
+                        }
+                    } else {
+                        IpcResponse {
+                            ok: false,
+                            message: format!("Service extension `{method}` failed: {dap_err}"),
+                            duration_ms: None,
+                            mode: Some(mode),
+                            device_id: dev,
+                            vm_service_uri: vm,
+                            devtools_uri: dt,
+                        }
+                    }
+                }
+            }
+        }
+        Ok(IpcRequest::OpenDevTools { page }) => {
+            let (mode, dev, vm, dt) = snapshot_meta(&state).await;
+            let project_root = state
+                .lock()
+                .await
+                .project_root
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("."));
+            if let Some(url) = resolve_or_start_devtools_url(
+                &cache,
+                &project_root,
+                dt.as_deref(),
+                vm.as_deref(),
+                page.as_deref(),
+                custom_sdk.as_deref(),
+            )
+            .await
+            {
+                open_url_in_browser(&url);
+                IpcResponse {
+                    ok: true,
+                    message: format!("Opened DevTools: {url}"),
+                    duration_ms: None,
+                    mode: Some(mode),
+                    device_id: dev,
+                    vm_service_uri: vm,
+                    devtools_uri: Some(url),
+                }
+            } else {
+                IpcResponse {
+                    ok: false,
+                    message: "DevTools URI is not ready yet for this session".to_string(),
+                    duration_ms: None,
+                    mode: Some(mode),
+                    device_id: dev,
+                    vm_service_uri: vm,
+                    devtools_uri: dt,
+                }
+            }
+        }
+        Ok(IpcRequest::Screenshot { output_path }) => {
+            let (mode, dev, vm, dt) = snapshot_meta(&state).await;
+            let project_root = state
+                .lock()
+                .await
+                .project_root
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("."));
+            let out_file = output_path.unwrap_or_else(|| {
+                project_root
+                    .join(format!("flutter_screenshot_{}.png", now_unix()))
+                    .to_string_lossy()
+                    .into_owned()
+            });
+
+            if let Some(vm_uri) = vm.as_deref()
+                && let Ok(mut client) = VmServiceClient::connect(vm_uri).await
+                && let Ok(png_bytes) = client.capture_screenshot_png().await
+                && std::fs::write(&out_file, png_bytes).is_ok()
+            {
+                IpcResponse {
+                    ok: true,
+                    message: format!("Screenshot saved to {out_file}"),
+                    duration_ms: None,
+                    mode: Some(mode),
+                    device_id: dev,
+                    vm_service_uri: vm,
+                    devtools_uri: dt,
+                }
+            } else {
+                let exe = crate::project::resolve_sdk_executable(
+                    &project_root,
+                    crate::project::ProjectKind::Flutter,
+                    custom_sdk.as_deref(),
+                );
+                let mut args = vec!["screenshot".to_string(), "-o".to_string(), out_file.clone()];
+                if let Some(d) = dev.as_deref() {
+                    args.push("-d".to_string());
+                    args.push(d.to_string());
+                }
+                match Command::new(&exe)
+                    .args(&args)
+                    .current_dir(&project_root)
+                    .output()
+                    .await
+                {
+                    Ok(out) if out.status.success() => IpcResponse {
+                        ok: true,
+                        message: format!("Screenshot saved to {out_file}"),
+                        duration_ms: None,
+                        mode: Some(mode),
+                        device_id: dev,
+                        vm_service_uri: vm,
+                        devtools_uri: dt,
+                    },
+                    Ok(out) => IpcResponse {
+                        ok: false,
+                        message: format!(
+                            "Screenshot failed: {}",
+                            String::from_utf8_lossy(&out.stderr).trim()
+                        ),
+                        duration_ms: None,
+                        mode: Some(mode),
+                        device_id: dev,
+                        vm_service_uri: vm,
+                        devtools_uri: dt,
+                    },
+                    Err(err) => IpcResponse::err(format!("Failed to run screenshot: {err}")),
                 }
             }
         }
         Ok(IpcRequest::Status) => {
-            let guard = state.lock().await;
+            let (mode, dev, vm, dt) = snapshot_meta(&state).await;
             IpcResponse {
                 ok: true,
                 message: "active".to_string(),
-                mode: Some(guard.mode.clone()),
-                vm_service_uri: guard.vm_service_uri.clone(),
-                devtools_uri: guard.devtools_uri.clone(),
+                duration_ms: None,
+                mode: Some(mode),
+                device_id: dev,
+                vm_service_uri: vm,
+                devtools_uri: dt,
             }
         }
-        Err(err) => IpcResponse {
-            ok: false,
-            message: format!("Invalid IPC request: {err}"),
-            mode: None,
-            vm_service_uri: None,
-            devtools_uri: None,
-        },
+        Err(err) => IpcResponse::err(format!("Invalid IPC request: {err}")),
     };
 
     if let Ok(mut payload) = serde_json::to_string(&response) {
@@ -296,36 +627,152 @@ async fn handle_ipc_connection(
     }
 }
 
-async fn persist_session(
-    cache: &DiskCache,
-    project_root: &Path,
-    port: u16,
+async fn handle_overlay_toggle(
     state: &Arc<Mutex<ProxySessionState>>,
-) {
+    to_adapter_tx: &mpsc::Sender<Value>,
+    overlay: ServiceOverlay,
+) -> IpcResponse {
+    let (mode, dev, vm, dt, method, params, status_label) = {
+        let mut guard = state.lock().await;
+        if guard.mode == "release" {
+            return IpcResponse {
+                ok: false,
+                message: "Visual overlays are unavailable in release mode".to_string(),
+                duration_ms: None,
+                mode: Some(guard.mode.clone()),
+                device_id: guard.device_id.clone(),
+                vm_service_uri: guard.vm_service_uri.clone(),
+                devtools_uri: guard.devtools_uri.clone(),
+            };
+        }
+        let (m, p, label) = guard.overlays.toggle(overlay);
+        (
+            guard.mode.clone(),
+            guard.device_id.clone(),
+            guard.vm_service_uri.clone(),
+            guard.devtools_uri.clone(),
+            m,
+            p,
+            label,
+        )
+    };
+
+    match inject_and_await(
+        state,
+        to_adapter_tx,
+        "callServiceExtension",
+        json!({ "methodName": method, "params": params }),
+        10,
+    )
+    .await
+    {
+        Ok((_, ms)) => IpcResponse {
+            ok: true,
+            message: status_label,
+            duration_ms: Some(ms),
+            mode: Some(mode),
+            device_id: dev,
+            vm_service_uri: vm,
+            devtools_uri: dt,
+        },
+        Err(dap_err) => {
+            if let Some(vm_uri) = vm.as_deref()
+                && let Ok(mut client) = VmServiceClient::connect(vm_uri).await
+                && client.call_service_extension(method, params).await.is_ok()
+            {
+                return IpcResponse {
+                    ok: true,
+                    message: status_label,
+                    duration_ms: None,
+                    mode: Some(mode),
+                    device_id: dev,
+                    vm_service_uri: vm,
+                    devtools_uri: dt,
+                };
+            }
+            IpcResponse {
+                ok: false,
+                message: format!("Failed to toggle {}: {dap_err}", overlay.label()),
+                duration_ms: None,
+                mode: Some(mode),
+                device_id: dev,
+                vm_service_uri: vm,
+                devtools_uri: dt,
+            }
+        }
+    }
+}
+
+async fn snapshot_meta(
+    state: &Arc<Mutex<ProxySessionState>>,
+) -> (String, Option<String>, Option<String>, Option<String>) {
     let guard = state.lock().await;
+    (
+        guard.mode.clone(),
+        guard.device_id.clone(),
+        guard.vm_service_uri.clone(),
+        guard.devtools_uri.clone(),
+    )
+}
+
+async fn persist_session(cache: &DiskCache, port: u16, state: &Arc<Mutex<ProxySessionState>>) {
+    let guard = state.lock().await;
+    let Some(root) = &guard.project_root else {
+        return;
+    };
     let record = ActiveSessionRecord {
-        project_root: normalize_project_key(project_root),
-        port,
+        session_id: guard.session_id.clone(),
+        project_root: normalize_project_key(root),
+        device_id: guard.device_id.clone(),
         mode: guard.mode.clone(),
+        pid: std::process::id(),
+        ipc_port: port,
         vm_service_uri: guard.vm_service_uri.clone(),
         devtools_uri: guard.devtools_uri.clone(),
-        pid: std::process::id(),
+        started_at: now_unix(),
+        is_test: guard.is_test,
+        kind: "dap".to_string(),
     };
-    let _ = write_session_record(cache, project_root, &record);
+    let _ = write_session_record(cache, &record);
 }
 
 struct SessionCleanupGuard {
     cache: DiskCache,
-    project_root: PathBuf,
+    session_id: String,
 }
 
 impl Drop for SessionCleanupGuard {
     fn drop(&mut self) {
-        remove_session_record(&self.cache, &self.project_root);
+        remove_session_record_by_id(&self.cache, &self.session_id);
     }
 }
 
-fn open_url_in_browser(url: &str) {
+async fn terminate_child_tree(child: &mut Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        let _ = Command::new("pkill")
+            .args(["-TERM", "-P", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
+    }
+
+    #[cfg(windows)]
+    if let Some(pid) = child.id() {
+        let _ = Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
+    }
+
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
+pub fn open_url_in_browser(url: &str) {
     #[cfg(target_os = "macos")]
     let _ = std::process::Command::new("open")
         .arg(url)
