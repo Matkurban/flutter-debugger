@@ -313,9 +313,16 @@ pub fn rewrite_dart_output_paths(
         let raw_candidate = &text[delim_token_start..dart_end];
 
         // Find where the URI/path candidate begins and what kind it is.
-        let Some((match_start, is_bare_path)) =
-            locate_dart_candidate(text, segment_start, delim_token_start, dart_pos, raw_candidate)
-        else {
+        let Some((match_start, is_bare_path)) = locate_dart_candidate(
+            text,
+            emit_cursor,
+            segment_start,
+            delim_token_start,
+            dart_pos,
+            dart_end,
+            raw_candidate,
+            &root_clean,
+        ) else {
             search_cursor = full_match_end;
             continue;
         };
@@ -390,7 +397,7 @@ fn find_delim_token_start(text: &str, segment_start: usize, dart_pos: usize) -> 
             || c.is_control()
             || matches!(
                 c,
-                '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | '\'' | '"' | ',' | ';'
+                '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | '\'' | '"' | '`' | ',' | ';'
             )
     }) {
         Some(rel_idx) => {
@@ -404,14 +411,18 @@ fn find_delim_token_start(text: &str, segment_start: usize, dart_pos: usize) -> 
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn locate_dart_candidate(
     text: &str,
+    emit_cursor: usize,
     segment_start: usize,
     delim_token_start: usize,
     dart_pos: usize,
+    dart_end: usize,
     raw_candidate: &str,
+    root_clean: &Path,
 ) -> Option<(usize, bool)> {
-    // 1. Check for `file://` in `raw_candidate` or earlier in the current line segment (supporting spaces/parens in `file://` paths).
+    // 1. Check for `file://` in `raw_candidate` or earlier in the current line segment (supporting spaces/parens in real disk `file://` paths).
     if let Some(rel_file) = raw_candidate.find("file://") {
         return Some((delim_token_start + rel_file, false));
     }
@@ -426,6 +437,14 @@ fn locate_dart_candidate(
             && !after_scheme.contains("wss://")
             && !after_scheme.contains("zed://")
             && !after_scheme.contains("package:")
+            && !after_scheme.contains("dart:")
+            && !after_scheme.contains(',')
+            && !after_scheme.contains(';')
+            && !after_scheme.contains('\'')
+            && !after_scheme.contains('"')
+            && let Some(resolved) =
+                resolve_dart_uri_to_local_path(&text[file_start..dart_end], Some(root_clean))
+            && resolved.is_file()
         {
             return Some((file_start, false));
         }
@@ -451,11 +470,11 @@ fn locate_dart_candidate(
         return None;
     }
 
-    // 4. Bare local path (handle optional glued `Widget:lib/foo.dart` prefix, excluding Windows drive `C:/`).
+    // 4. Bare local path (handle optional glued `Widget:lib/foo.dart` or `Swiper<int>:lib/foo.dart` prefix, excluding Windows drive `C:/`).
     if !is_windows_drive_path(raw_candidate)
         && let Some(colon_idx) = raw_candidate.find(':')
     {
-        let prefix_with_colon = &raw_candidate[..=colon_idx];
+        let prefix_with_colon = &text[emit_cursor..delim_token_start + colon_idx + 1];
         if has_glued_widget_colon_prefix(prefix_with_colon) {
             let after_colon = &raw_candidate[colon_idx + 1..];
             if after_colon.starts_with("dart:") || after_colon.contains("://") {
@@ -659,6 +678,29 @@ mod tests {
             rewrite_dart_output_paths(untouched, &project_root);
         assert_eq!(rewritten_untouched, untouched);
         assert!(first_untouched.is_none());
+
+        // 4. Backtick-wrapped bare path and generic widget glued bare path
+        let backtick_and_generic = "`lib/pages/home/nicepay_view.dart:374:40` and Swiper<int>:lib/pages/home/nicepay_view.dart:374:40\n";
+        let (rewritten_bg, _) = rewrite_dart_output_paths(backtick_and_generic, &project_root);
+        assert_eq!(
+            rewritten_bg,
+            format!("`{expected_uri}` and Swiper<int> ({expected_uri})\n")
+        );
+
+        // 5. Same line with preceding non-.dart `file://` URI must NOT swallow unrelated text
+        let mixed_file_line = "Loaded file:///Users/dev/app/pubspec.yaml, error in lib/pages/home/nicepay_view.dart:374:40\n";
+        let (rewritten_mixed, first_mixed) =
+            rewrite_dart_output_paths(mixed_file_line, &project_root);
+        assert_eq!(
+            rewritten_mixed,
+            format!("Loaded file:///Users/dev/app/pubspec.yaml, error in {expected_uri}\n")
+        );
+        assert_eq!(first_mixed, Some((nicepay_file, 374, Some(40))));
+
+        let config_see_main = "file:///Users/dev/app/config.json -> see main.dart\n";
+        let (rewritten_cfg, first_cfg) = rewrite_dart_output_paths(config_see_main, &project_root);
+        assert_eq!(rewritten_cfg, config_see_main);
+        assert!(first_cfg.is_none());
     }
 
     #[test]
@@ -699,6 +741,16 @@ mod tests {
         // `resolve_dart_uri_to_local_path` round-trips `zed://file/...`
         let resolved_back = resolve_dart_uri_to_local_path(&uri, None).expect("resolve zed://file");
         assert_eq!(resolved_back, clean_relative_segments(&dart_file));
+
+        // Real disk `file://` URI containing raw spaces, parentheses, and Chinese characters
+        let raw_space_file_uri = format!("at file://{}:10:2\n", dart_file.display());
+        let (rewritten_raw_space, first_raw_space) =
+            rewrite_dart_output_paths(&raw_space_file_uri, &special_root);
+        assert_eq!(rewritten_raw_space, format!("at {uri}\n"));
+        assert_eq!(
+            first_raw_space,
+            Some((clean_relative_segments(&dart_file), 10, Some(2)))
+        );
     }
 
     #[test]
