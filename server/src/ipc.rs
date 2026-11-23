@@ -26,7 +26,6 @@ pub enum ServiceOverlay {
 }
 
 impl ServiceOverlay {
-    #[allow(dead_code)]
     pub fn parse(input: &str) -> Option<Self> {
         match input.trim().to_ascii_lowercase().as_str() {
             "inspector" | "widget-inspector" | "widgetinspector" => Some(Self::Inspector),
@@ -375,7 +374,6 @@ pub fn read_session_record(cache: &DiskCache, project_root: &Path) -> Option<Act
 
 /// Returns the newest live session for `project_root`, falling back to any live session
 /// if `project_root` is `None`.
-#[allow(dead_code)]
 pub fn find_latest_session(
     cache: &DiskCache,
     project_root: Option<&Path>,

@@ -142,21 +142,36 @@ pub fn build_dart_code_lenses(
                     vec![json!(uri_str)],
                 ));
 
-                // If any test in this file failed in the last run, offer a quick Re-run Failed lens
-                if let Some(failed_entry) = parsed.tests.iter().find(|t| {
-                    !t.is_group
-                        && matches!(
-                            test_results
-                                .get(&t.full_name)
-                                .or_else(|| test_results.get(&t.local_name)),
-                            Some(TestStatus::Failed { .. })
-                        )
-                }) {
+                // Collect all failed tests in this file for one-click Re-run Failed
+                let failed_names: Vec<String> = parsed
+                    .tests
+                    .iter()
+                    .filter(|t| {
+                        !t.is_group
+                            && matches!(
+                                test_results
+                                    .get(&t.full_name)
+                                    .or_else(|| test_results.get(&t.local_name)),
+                                Some(TestStatus::Failed { .. })
+                            )
+                    })
+                    .map(|t| t.full_name.clone())
+                    .collect();
+
+                if failed_names.len() == 1 {
                     lenses.push(make_lens(
                         range,
                         "Re-run Failed",
                         "flutterDebugger.runTest",
-                        vec![json!(uri_str), json!(failed_entry.full_name)],
+                        vec![json!(uri_str), json!(failed_names[0]), json!("plain")],
+                    ));
+                } else if failed_names.len() > 1 {
+                    let pattern = crate::lsp::test_runner::build_multi_test_regex(&failed_names);
+                    lenses.push(make_lens(
+                        range,
+                        &format!("Re-run Failed ({})", failed_names.len()),
+                        "flutterDebugger.runTest",
+                        vec![json!(uri_str), json!(pattern), json!("regex")],
                     ));
                 }
 

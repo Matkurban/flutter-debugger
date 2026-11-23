@@ -51,10 +51,10 @@ impl zed::Extension for FlutterDebuggerExtension {
         _language_server_id: &LanguageServerId,
         worktree: &Worktree,
     ) -> Result<Option<serde_json::Value>> {
-        let settings = LspSettings::for_worktree(SERVER_ID, worktree)
+        let opts = LspSettings::for_worktree(SERVER_ID, worktree)
             .ok()
-            .and_then(|s| s.initialization_options);
-        Ok(settings)
+            .and_then(|s| s.initialization_options.or(s.settings));
+        Ok(opts)
     }
 
     fn language_server_workspace_configuration(
@@ -64,7 +64,7 @@ impl zed::Extension for FlutterDebuggerExtension {
     ) -> Result<Option<serde_json::Value>> {
         let settings = LspSettings::for_worktree(SERVER_ID, worktree)
             .ok()
-            .and_then(|s| s.settings);
+            .and_then(|s| s.settings.or(s.initialization_options));
         Ok(settings)
     }
 
@@ -214,11 +214,20 @@ impl zed::Extension for FlutterDebuggerExtension {
         let mut flavor: Option<String> = None;
         let mut dart_define_from_file: Option<String> = None;
         let mut flutter_mode = "debug".to_string();
+        let mut explicit_cwd = build_task.cwd;
         let mut tool_args: Vec<String> = Vec::new();
 
         let mut iter = arg_slice.iter().peekable();
         while let Some(arg) = iter.next() {
             match arg.as_str() {
+                "-p" | "--project" if is_ctl => {
+                    if let Some(proj_dir) = iter.next() {
+                        explicit_cwd = Some(proj_dir.clone());
+                    }
+                }
+                value if is_ctl && value.starts_with("--project=") => {
+                    explicit_cwd = Some(value.trim_start_matches("--project=").to_string());
+                }
                 "-t" | "--target" => {
                     if let Some(target) = iter.next() {
                         program = target.clone();
@@ -247,6 +256,12 @@ impl zed::Extension for FlutterDebuggerExtension {
                 "--profile" => flutter_mode = "profile".to_string(),
                 "--release" => flutter_mode = "release".to_string(),
                 "--debug" => flutter_mode = "debug".to_string(),
+                "--" if is_ctl => {
+                    // Remaining args after `--` are forwarded as Flutter toolArgs
+                    for extra in iter.by_ref() {
+                        tool_args.push(extra.clone());
+                    }
+                }
                 value if value.starts_with("--dart-define-from-file=") => {
                     dart_define_from_file =
                         Some(value.trim_start_matches("--dart-define-from-file=").to_string());
@@ -269,7 +284,7 @@ impl zed::Extension for FlutterDebuggerExtension {
         if is_test {
             map.insert("isTest".to_string(), serde_json::json!(true));
         }
-        if let Some(cwd) = build_task.cwd {
+        if let Some(cwd) = explicit_cwd {
             map.insert("cwd".to_string(), serde_json::json!(cwd));
         }
         if let Some(dev) = device_id {

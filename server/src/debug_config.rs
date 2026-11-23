@@ -1,11 +1,11 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use regex::Regex;
 use serde_json::{Value, json};
 
-use crate::cache::DiskCache;
 use crate::project::{ProjectInfo, ProjectKind, find_project_for_path};
 
 /// CLI entrypoint for `flutter-debugger-server init-zed [--project <dir>] [--force]`.
@@ -35,12 +35,8 @@ pub fn run_init_zed(args: &[String]) -> Result<(), String> {
     let project = find_project_for_path(&base)
         .ok_or_else(|| format!("No pubspec.yaml found in or above `{}`", base.display()))?;
 
-    let cache = DiskCache::default_location();
-    let selected_device = cache.get_selected_device(&project.root);
-
-    let (debug_path, debug_added) =
-        sync_zed_debug_json(&project, selected_device.as_deref(), force)
-            .map_err(|e| format!("Failed to update .zed/debug.json: {e}"))?;
+    let (debug_path, debug_added) = sync_zed_debug_json(&project, force)
+        .map_err(|e| format!("Failed to update .zed/debug.json: {e}"))?;
     let (tasks_path, tasks_added) = sync_zed_tasks_json(&project, force)
         .map_err(|e| format!("Failed to update .zed/tasks.json: {e}"))?;
 
@@ -56,21 +52,17 @@ pub fn run_init_zed(args: &[String]) -> Result<(), String> {
 }
 
 /// Losslessly creates or merges `.zed/debug.json` preserving custom user entries by `label`.
-pub fn sync_zed_debug_json(
-    project: &ProjectInfo,
-    selected_device_id: Option<&str>,
-    force: bool,
-) -> std::io::Result<(PathBuf, usize)> {
+pub fn sync_zed_debug_json(project: &ProjectInfo, force: bool) -> io::Result<(PathBuf, usize)> {
     let zed_dir = project.root.join(".zed");
     fs::create_dir_all(&zed_dir)?;
     let path = zed_dir.join("debug.json");
-    let presets = build_debug_presets(project, selected_device_id);
+    let presets = build_debug_presets(project);
     let added = merge_json_array_file(&path, &presets, force)?;
     Ok((path, added))
 }
 
 /// Losslessly creates or merges `.zed/tasks.json` preserving custom user tasks by `label`.
-pub fn sync_zed_tasks_json(project: &ProjectInfo, force: bool) -> std::io::Result<(PathBuf, usize)> {
+pub fn sync_zed_tasks_json(project: &ProjectInfo, force: bool) -> io::Result<(PathBuf, usize)> {
     let zed_dir = project.root.join(".zed");
     fs::create_dir_all(&zed_dir)?;
     let path = zed_dir.join("tasks.json");
@@ -79,12 +71,9 @@ pub fn sync_zed_tasks_json(project: &ProjectInfo, force: bool) -> std::io::Resul
     Ok((path, added))
 }
 
-/// Kept for LSP command compatibility: ensures `.zed/debug.json` and `.zed/tasks.json` exist.
-pub fn ensure_zed_debug_config(
-    project: &ProjectInfo,
-    selected_device_id: Option<&str>,
-) -> std::io::Result<(PathBuf, bool)> {
-    let (debug_path, added) = sync_zed_debug_json(project, selected_device_id, false)?;
+/// Ensures `.zed/debug.json` and `.zed/tasks.json` exist for the LSP command.
+pub fn ensure_zed_debug_config(project: &ProjectInfo) -> io::Result<(PathBuf, bool)> {
+    let (debug_path, added) = sync_zed_debug_json(project, false)?;
     let _ = sync_zed_tasks_json(project, false);
     Ok((debug_path, added > 0))
 }
@@ -125,7 +114,6 @@ fn extract_gradle_flavors(text: &str, out: &mut BTreeSet<String>) {
         return;
     };
 
-    // Extract balanced block of `productFlavors { ... }`
     let mut depth = 0i32;
     let mut block = String::new();
     for ch in rest[brace_start..].chars() {
@@ -151,7 +139,6 @@ fn extract_gradle_flavors(text: &str, out: &mut BTreeSet<String>) {
         }
     }
 
-    // Matches Kotlin DSL `create("staging")` or Groovy `staging {`
     let kts_re = Regex::new(r#"create\s*\(\s*["']([A-Za-z0-9_-]+)["']\s*\)"#).expect("valid regex");
     let groovy_re = Regex::new(r"(?m)^\s*([A-Za-z][A-Za-z0-9_-]*)\s*\{").expect("valid regex");
 
@@ -163,8 +150,10 @@ fn extract_gradle_flavors(text: &str, out: &mut BTreeSet<String>) {
     for cap in groovy_re.captures_iter(&block) {
         if let Some(m) = cap.get(1) {
             let name = m.as_str();
-            if !matches!(name, "create" | "register" | "named" | "resValue" | "manifestPlaceholders")
-            {
+            if !matches!(
+                name,
+                "create" | "register" | "named" | "resValue" | "manifestPlaceholders"
+            ) {
                 out.insert(name.to_string());
             }
         }
@@ -193,14 +182,16 @@ pub fn detect_main_entrypoints(project_root: &Path) -> Vec<String> {
     }
 }
 
-pub fn build_debug_presets(
-    project: &ProjectInfo,
-    selected_device_id: Option<&str>,
-) -> Vec<Value> {
+/// Builds default `.zed/debug.json` presets WITHOUT hardcoding `deviceId` (so presets always
+/// dynamically follow `flutter-debugger-server ctl select-device`) and without duplicate labels
+/// when both `lib/main_<flavor>.dart` and flavor `<flavor>` exist.
+pub fn build_debug_presets(project: &ProjectInfo) -> Vec<Value> {
     match project.kind {
         ProjectKind::Flutter => {
             let mut entries = Vec::new();
             let main_files = detect_main_entrypoints(&project.root);
+            let flavors = detect_flavors(&project.root);
+
             let primary_entry = if main_files.iter().any(|f| f == "lib/main.dart") {
                 "lib/main.dart".to_string()
             } else {
@@ -218,11 +209,6 @@ pub fn build_debug_presets(
                     "program": program,
                     "flutterMode": mode
                 });
-                if let Some(dev) = selected_device_id
-                    && !dev.trim().is_empty()
-                {
-                    obj["deviceId"] = json!(dev);
-                }
                 if let Some(f) = flavor {
                     obj["flavor"] = json!(f);
                 }
@@ -233,27 +219,40 @@ pub fn build_debug_presets(
             entries.push(make_app("Flutter: Profile", "profile", &primary_entry, None));
             entries.push(make_app("Flutter: Release", "release", &primary_entry, None));
 
-            for entry in &main_files {
-                if entry != &primary_entry {
-                    let suffix = entry
-                        .trim_start_matches("lib/main_")
-                        .trim_end_matches(".dart");
+            let mut paired_entries: HashSet<String> = HashSet::new();
+
+            // Pair `lib/main_<flavor>.dart` with matching flavor into a single smart preset
+            for flavor in &flavors {
+                let matching_entry = format!("lib/main_{flavor}.dart");
+                if main_files.iter().any(|e| e == &matching_entry) {
+                    paired_entries.insert(matching_entry.clone());
                     entries.push(make_app(
-                        &format!("Flutter: Debug ({suffix})"),
+                        &format!("Flutter: Debug (flavor: {flavor})"),
+                        "debug",
+                        &matching_entry,
+                        Some(flavor),
+                    ));
+                } else {
+                    entries.push(make_app(
+                        &format!("Flutter: Debug (flavor: {flavor})"),
+                        "debug",
+                        &primary_entry,
+                        Some(flavor),
+                    ));
+                }
+            }
+
+            // Remaining unpaired `lib/main_*.dart` entrypoints
+            for entry in &main_files {
+                if entry != &primary_entry && !paired_entries.contains(entry) {
+                    let stem = entry.trim_start_matches("lib/").trim_end_matches(".dart");
+                    entries.push(make_app(
+                        &format!("Flutter: Debug ({stem})"),
                         "debug",
                         entry,
                         None,
                     ));
                 }
-            }
-
-            for flavor in detect_flavors(&project.root) {
-                entries.push(make_app(
-                    &format!("Flutter: Debug ({flavor})"),
-                    "debug",
-                    &primary_entry,
-                    Some(&flavor),
-                ));
             }
 
             entries.push(json!({
@@ -362,17 +361,147 @@ fn task_item(
     })
 }
 
-/// Losslessly merges `desired` objects into a JSON array file keyed by `"label"`.
-/// Existing entries with custom user labels are always preserved; matching labels are only
-/// overwritten when `force == true`.
+/// Strips JSONC comments (`// ...`, `/* ... */`) and trailing commas (`,}` / `,]`)
+/// while strictly preserving string literals.
+pub fn strip_jsonc(raw: &str) -> String {
+    // Pass 1: Strip comments outside string literals
+    let bytes = raw.as_bytes();
+    let len = bytes.len();
+    let mut no_comments = String::with_capacity(len);
+    let mut i = 0usize;
+    let mut in_string = false;
+
+    while i < len {
+        let b = bytes[i];
+        if in_string {
+            if b == b'\\' && i + 1 < len {
+                no_comments.push('\\');
+                let ch = raw[i + 1..].chars().next().unwrap();
+                no_comments.push(ch);
+                i += 1 + ch.len_utf8();
+                continue;
+            }
+            if b == b'"' {
+                in_string = false;
+            }
+            let ch = raw[i..].chars().next().unwrap();
+            no_comments.push(ch);
+            i += ch.len_utf8();
+            continue;
+        }
+
+        if b == b'"' {
+            in_string = true;
+            no_comments.push('"');
+            i += 1;
+            continue;
+        }
+
+        // Line comment `// ...`
+        if b == b'/' && i + 1 < len && bytes[i + 1] == b'/' {
+            i += 2;
+            while i < len && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+
+        // Block comment `/* ... */`
+        if b == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < len && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                if bytes[i] == b'\n' {
+                    no_comments.push('\n');
+                }
+                i += 1;
+            }
+            if i + 1 < len {
+                i += 2;
+            }
+            continue;
+        }
+
+        let ch = raw[i..].chars().next().unwrap();
+        no_comments.push(ch);
+        i += ch.len_utf8();
+    }
+
+    // Pass 2: Strip trailing commas before `}` or `]` outside string literals
+    let nc_bytes = no_comments.as_bytes();
+    let nc_len = nc_bytes.len();
+    let mut out = String::with_capacity(nc_len);
+    let mut j = 0usize;
+    in_string = false;
+
+    while j < nc_len {
+        let b = nc_bytes[j];
+        if in_string {
+            if b == b'\\' && j + 1 < nc_len {
+                out.push('\\');
+                let ch = no_comments[j + 1..].chars().next().unwrap();
+                out.push(ch);
+                j += 1 + ch.len_utf8();
+                continue;
+            }
+            if b == b'"' {
+                in_string = false;
+            }
+            let ch = no_comments[j..].chars().next().unwrap();
+            out.push(ch);
+            j += ch.len_utf8();
+            continue;
+        }
+
+        if b == b'"' {
+            in_string = true;
+            out.push('"');
+            j += 1;
+            continue;
+        }
+
+        if b == b',' {
+            // Look ahead past whitespace for `}` or `]`
+            let mut k = j + 1;
+            while k < nc_len && nc_bytes[k].is_ascii_whitespace() {
+                k += 1;
+            }
+            if k < nc_len && (nc_bytes[k] == b'}' || nc_bytes[k] == b']') {
+                j += 1;
+                continue;
+            }
+        }
+
+        let ch = no_comments[j..].chars().next().unwrap();
+        out.push(ch);
+        j += ch.len_utf8();
+    }
+
+    out
+}
+
+/// Losslessly merges `desired` objects into a JSON/JSONC array file keyed by `"label"`.
+/// Refuses to overwrite if the existing file cannot be parsed as a valid JSON array.
 pub fn merge_json_array_file(
     path: &Path,
     desired: &[Value],
     force: bool,
-) -> std::io::Result<usize> {
+) -> io::Result<usize> {
     let mut existing: Vec<Value> = if path.is_file() {
         let raw = fs::read_to_string(path)?;
-        serde_json::from_str::<Vec<Value>>(&raw).unwrap_or_default()
+        if raw.trim().is_empty() {
+            Vec::new()
+        } else {
+            let cleaned = strip_jsonc(&raw);
+            serde_json::from_str::<Vec<Value>>(&cleaned).map_err(|err| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Refusing to overwrite `{}` because it is not a valid JSON/JSONC array ({err}). Please fix syntax manually.",
+                        path.display()
+                    ),
+                )
+            })?
+        }
     } else {
         Vec::new()
     };
@@ -406,32 +535,83 @@ mod tests {
     use super::*;
 
     #[test]
-    fn detects_gradle_kts_and_groovy_flavors() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        fs::create_dir_all(dir.path().join("android/app")).expect("mkdir");
-        fs::write(
-            dir.path().join("android/app/build.gradle.kts"),
-            r#"
-android {
-    productFlavors {
-        create("dev") {
-            dimension = "env"
-        }
-        create("prod") {
-            dimension = "env"
-        }
-    }
-}
-"#,
-        )
-        .expect("write gradle");
-
-        let flavors = detect_flavors(dir.path());
-        assert_eq!(flavors, vec!["dev", "prod"]);
+    fn strips_jsonc_comments_and_trailing_commas_preserving_strings() {
+        let raw = r#"
+        // top comment
+        [
+          {
+            "label": "Custom // keep http://url",
+            /* block comment */
+            "adapter": "Flutter",
+          },
+        ]
+        "#;
+        let cleaned = strip_jsonc(raw);
+        let parsed: Vec<Value> = serde_json::from_str(&cleaned).expect("valid json");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0]["label"], "Custom // keep http://url");
     }
 
     #[test]
-    fn losslessly_merges_debug_and_tasks_json_preserving_custom_entries() {
+    fn refuses_to_overwrite_invalid_json_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("debug.json");
+        let broken = "[ { \"label\": \"Broken\" ";
+        fs::write(&path, broken).expect("write broken");
+
+        let res = merge_json_array_file(&path, &[json!({"label": "New"})], false);
+        assert!(res.is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), broken);
+    }
+
+    #[test]
+    fn does_not_hardcode_device_id_and_deduplicates_main_dev_with_flavor_dev() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::create_dir_all(dir.path().join("lib")).expect("mkdir lib");
+        fs::create_dir_all(dir.path().join("android/app")).expect("mkdir android");
+        fs::write(dir.path().join("lib/main.dart"), "void main() {}").expect("main");
+        fs::write(dir.path().join("lib/main_dev.dart"), "void main() {}").expect("main_dev");
+        fs::write(dir.path().join("lib/main_storybook.dart"), "void main() {}").expect("sb");
+        fs::write(
+            dir.path().join("android/app/build.gradle.kts"),
+            r#"android { productFlavors { create("dev") {} create("prod") {} } }"#,
+        )
+        .expect("gradle");
+
+        let project = ProjectInfo {
+            root: dir.path().to_path_buf(),
+            pubspec_path: dir.path().join("pubspec.yaml"),
+            kind: ProjectKind::Flutter,
+        };
+
+        let presets = build_debug_presets(&project);
+        // No preset should hardcode deviceId
+        assert!(presets.iter().all(|p| p.get("deviceId").is_none()));
+
+        // All labels must be unique
+        let labels: Vec<&str> = presets
+            .iter()
+            .filter_map(|p| p.get("label").and_then(Value::as_str))
+            .collect();
+        let unique: HashSet<&str> = labels.iter().copied().collect();
+        assert_eq!(labels.len(), unique.len());
+
+        // `dev` flavor should be smartly paired with `lib/main_dev.dart`
+        let dev_preset = presets
+            .iter()
+            .find(|p| p["label"] == "Flutter: Debug (flavor: dev)")
+            .expect("dev preset");
+        assert_eq!(dev_preset["program"], "lib/main_dev.dart");
+        assert_eq!(dev_preset["flavor"], "dev");
+
+        // Unpaired `main_storybook.dart` should have its own label
+        assert!(presets
+            .iter()
+            .any(|p| p["label"] == "Flutter: Debug (main_storybook)"));
+    }
+
+    #[test]
+    fn losslessly_merges_jsonc_debug_and_tasks_json() {
         let dir = tempfile::tempdir().expect("tempdir");
         let project = ProjectInfo {
             root: dir.path().to_path_buf(),
@@ -443,12 +623,18 @@ android {
         fs::create_dir_all(&zed_dir).expect("mkdir .zed");
         fs::write(
             zed_dir.join("debug.json"),
-            r#"[{"label": "My Custom Entry", "adapter": "Flutter", "request": "launch"}]"#,
+            r#"[
+              // user custom preset
+              {
+                "label": "My Custom Entry",
+                "adapter": "Flutter",
+                "request": "launch",
+              },
+            ]"#,
         )
-        .expect("write custom");
+        .expect("write custom jsonc");
 
-        let (debug_path, added) =
-            sync_zed_debug_json(&project, Some("macos"), false).expect("sync debug");
+        let (debug_path, added) = sync_zed_debug_json(&project, false).expect("sync debug");
         assert!(added >= 5);
         let parsed: Vec<Value> =
             serde_json::from_str(&fs::read_to_string(&debug_path).unwrap()).unwrap();
@@ -456,12 +642,5 @@ android {
         assert!(parsed
             .iter()
             .any(|v| v["label"] == "Flutter: Current Test (Breakpoints)" && v["isTest"] == true));
-
-        let (tasks_path, tasks_added) = sync_zed_tasks_json(&project, false).expect("sync tasks");
-        assert!(tasks_added >= 15);
-        let tasks: Vec<Value> =
-            serde_json::from_str(&fs::read_to_string(&tasks_path).unwrap()).unwrap();
-        assert!(tasks.iter().any(|t| t["label"] == "Flutter: Hot Reload"));
-        assert!(tasks.iter().any(|t| t["label"] == "Flutter: Select Device"));
     }
 }

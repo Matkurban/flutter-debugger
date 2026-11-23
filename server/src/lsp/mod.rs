@@ -37,7 +37,9 @@ use crate::cache::{
 use crate::daemon::FlutterDaemonManager;
 use crate::debug_config::ensure_zed_debug_config;
 use crate::devtools::resolve_or_start_devtools_url;
-use crate::ipc::{IpcRequest, ServiceOverlay, read_session_record, send_ipc_request};
+use crate::ipc::{
+    IpcRequest, ServiceOverlay, list_active_sessions, read_session_record, send_ipc_request,
+};
 use crate::lsp::colors::{build_color_presentations, find_dart_colors};
 use crate::lsp::dart_file::{
     DartFileRole, build_dart_code_lenses, find_counterpart_test_or_impl,
@@ -52,7 +54,7 @@ use crate::lsp::pubspec::{
 use crate::lsp::state::{
     DocumentKind, OpenDocument, ServerConfig, file_path_to_uri, uri_to_file_path,
 };
-use crate::lsp::test_runner::{TestRunStore, run_tests_streaming};
+use crate::lsp::test_runner::{TestFilter, TestRunStore, run_tests_streaming};
 use crate::project::{ProjectInfo, ProjectKind, find_project_for_path};
 use crate::runner::{AllowedCommand, CommandRunner, extract_error_summary};
 
@@ -96,6 +98,7 @@ pub struct FlutterLspBackend {
     pub_scan_lock: Arc<Mutex<()>>,
     reload_debounce: Arc<DashMap<PathBuf, u64>>,
     reload_seq: Arc<AtomicU64>,
+    watcher_abort: Arc<Mutex<Option<tokio::task::AbortHandle>>>,
     test_results: TestRunStore,
     runner: CommandRunner,
     http: reqwest::Client,
@@ -127,6 +130,7 @@ impl FlutterLspBackend {
             pub_scan_lock: Arc::new(Mutex::new(())),
             reload_debounce: Arc::new(DashMap::new()),
             reload_seq: Arc::new(AtomicU64::new(1)),
+            watcher_abort: Arc::new(Mutex::new(None)),
             test_results: TestRunStore::new(),
             runner: CommandRunner::new(),
             http,
@@ -580,8 +584,7 @@ impl FlutterLspBackend {
             return;
         };
 
-        let selected_device = self.cache.get_selected_device(&project.root);
-        match ensure_zed_debug_config(&project, selected_device.as_deref()) {
+        match ensure_zed_debug_config(&project) {
             Ok((config_path, created)) => {
                 self.open_local_file_in_editor(&config_path).await;
                 let msg = if created {
@@ -644,10 +647,8 @@ impl FlutterLspBackend {
 
 impl LanguageServer for FlutterLspBackend {
     async fn initialize(&self, params: InitializeParams) -> RpcResult<InitializeResult> {
-        if let Some(opts) = params.initialization_options
-            && let Ok(parsed) = serde_json::from_value::<ServerConfig>(opts)
-        {
-            *self.config.write().await = parsed;
+        if let Some(opts) = params.initialization_options {
+            self.config.write().await.apply_json_patch(&opts);
         }
 
         Ok(InitializeResult {
@@ -681,16 +682,34 @@ impl LanguageServer for FlutterLspBackend {
 
     async fn initialized(&self, _params: InitializedParams) {
         tracing::info!("flutter-debugger-server LSP initialized");
+        let cache = self.cache.clone();
+        let client = self.client.clone();
+        let handle = tokio::spawn(async move {
+            let mut last_sig = compute_external_state_signature(&cache);
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let cur_sig = compute_external_state_signature(&cache);
+                if cur_sig != last_sig {
+                    last_sig = cur_sig;
+                    let _ = client.send_request::<CodeLensRefresh>(()).await;
+                }
+            }
+        });
+        *self.watcher_abort.lock().await = Some(handle.abort_handle());
     }
 
     async fn shutdown(&self) -> RpcResult<()> {
+        if let Some(h) = self.watcher_abort.lock().await.take() {
+            h.abort();
+        }
         self.daemon.shutdown().await;
         Ok(())
     }
 
     async fn did_change_configuration(&self, params: DidChangeConfigurationParams) {
-        if let Ok(parsed) = serde_json::from_value::<ServerConfig>(params.settings) {
-            *self.config.write().await = parsed;
+        if self.config.write().await.apply_json_patch(&params.settings) {
+            let _ = self.client.send_request::<InlayHintRefreshRequest>(()).await;
+            let _ = self.client.send_request::<CodeLensRefresh>(()).await;
         }
     }
 
@@ -725,6 +744,7 @@ impl LanguageServer for FlutterLspBackend {
 
         if project.kind == ProjectKind::Flutter {
             let root = project.root.clone();
+            let was_started = self.daemon.is_started();
             let custom_sdk = self.config.read().await.flutter_sdk_path.clone();
             let client_ref = self.client.clone();
             self.daemon.ensure_started(
@@ -737,10 +757,13 @@ impl LanguageServer for FlutterLspBackend {
                     });
                 })),
             );
-            let this = self.clone_handle();
-            tokio::spawn(async move {
-                this.maybe_scan_devices_in_background(root, false).await;
-            });
+            let has_devices = !self.devices.read().await.is_empty();
+            if !was_started && !has_devices {
+                let this = self.clone_handle();
+                tokio::spawn(async move {
+                    this.maybe_scan_devices_in_background(root, false).await;
+                });
+            }
         }
 
         if !hosted_packages.is_empty() && self.config.read().await.enable_pub_version_hints {
@@ -1119,11 +1142,23 @@ impl LanguageServer for FlutterLspBackend {
                 self.execute_project_cli(&uri, AllowedCommand::Doctor).await;
             }
             "flutterDebugger.runTest" => {
-                let test_name = params
+                let filter_str = params
                     .arguments
                     .get(1)
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned);
+                let filter_kind = params
+                    .arguments
+                    .get(2)
+                    .and_then(Value::as_str)
+                    .unwrap_or("plain");
+                let filter = match filter_str {
+                    Some(s) if !s.trim().is_empty() && filter_kind == "regex" => {
+                        TestFilter::NameRegex(s)
+                    }
+                    Some(s) if !s.trim().is_empty() => TestFilter::PlainName(s),
+                    _ => TestFilter::All,
+                };
                 if let Some(path) = uri_to_file_path(&uri)
                     && let Some(project) = find_project_for_path(&path)
                 {
@@ -1132,15 +1167,24 @@ impl LanguageServer for FlutterLspBackend {
                         .unwrap_or(&path)
                         .to_string_lossy()
                         .into_owned();
-                    let (is_integration, parsed_tests) = self
+                    let (is_integration, parsed_tests, main_line, source_text) = self
                         .docs
                         .get(&uri)
-                        .and_then(|doc| {
-                            doc.dart.as_ref().map(|d| {
-                                (d.role == DartFileRole::IntegrationTest, d.tests.clone())
-                            })
+                        .map(|doc| {
+                            let (is_int, tests, mline) = doc
+                                .dart
+                                .as_ref()
+                                .map(|d| {
+                                    (
+                                        d.role == DartFileRole::IntegrationTest,
+                                        d.tests.clone(),
+                                        d.main_line,
+                                    )
+                                })
+                                .unwrap_or((false, Vec::new(), None));
+                            (is_int, tests, mline, doc.text.clone())
                         })
-                        .unwrap_or((false, Vec::new()));
+                        .unwrap_or((false, Vec::new(), None, String::new()));
 
                     let device_id = if is_integration && project.kind == ProjectKind::Flutter {
                         self.cache.get_selected_device(&project.root)
@@ -1152,20 +1196,24 @@ impl LanguageServer for FlutterLspBackend {
                     let store = self.test_results.clone();
                     let uri_clone = uri.clone();
 
-                    tokio::spawn(async move {
+                    let task = tokio::spawn(async move {
                         run_tests_streaming(
                             client,
                             store,
                             uri_clone,
                             project,
                             rel,
-                            test_name,
+                            filter,
                             device_id,
                             custom_sdk,
                             parsed_tests,
+                            main_line,
+                            source_text,
                         )
                         .await;
                     });
+                    self.test_results
+                        .register_active_run(&uri, task.abort_handle());
                 }
             }
             "flutterDebugger.stopApp" => {
@@ -1228,11 +1276,30 @@ impl FlutterLspBackend {
             pub_scan_lock: Arc::clone(&self.pub_scan_lock),
             reload_debounce: Arc::clone(&self.reload_debounce),
             reload_seq: Arc::clone(&self.reload_seq),
+            watcher_abort: Arc::clone(&self.watcher_abort),
             test_results: self.test_results.clone(),
             runner: self.runner.clone(),
             http: self.http.clone(),
         }
     }
+}
+
+fn compute_external_state_signature(cache: &DiskCache) -> String {
+    let selected_raw = std::fs::read_to_string(cache.root_dir().join("selected_devices.json"))
+        .unwrap_or_default();
+    let sessions_summary: Vec<String> = list_active_sessions(cache)
+        .into_iter()
+        .map(|s| {
+            format!(
+                "{}:{}:{}:{}",
+                s.session_id,
+                s.mode,
+                s.vm_service_uri.unwrap_or_default(),
+                s.devtools_uri.unwrap_or_default()
+            )
+        })
+        .collect();
+    format!("{selected_raw}|{}", sessions_summary.join(";"))
 }
 
 #[derive(Debug, Deserialize)]

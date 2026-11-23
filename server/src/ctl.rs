@@ -1,14 +1,16 @@
+use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::Instant;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::{Duration, Instant};
 
+use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
-use tokio::process::{Child, Command};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::cache::{DiskCache, FlutterDevice, normalize_project_key, now_unix};
 use crate::dap::open_url_in_browser;
@@ -20,6 +22,7 @@ use crate::ipc::{
     generate_session_id, list_active_sessions, remove_session_record_by_id, send_ipc_to_session,
     write_session_record,
 };
+use crate::process_util::{build_command, terminate_child_tree};
 use crate::project::{ProjectInfo, ProjectKind, find_project_for_path, resolve_sdk_executable};
 use crate::runner::strip_ansi_codes;
 use crate::vm_service::VmServiceClient;
@@ -282,7 +285,9 @@ async fn cmd_screenshot(args: &[String]) -> Result<(), String> {
 async fn fetch_devices_live(root: &Path) -> Result<Vec<FlutterDevice>, String> {
     let custom_sdk = std::env::var("FLUTTER_SDK_PATH").ok();
     let exe = resolve_sdk_executable(root, ProjectKind::Flutter, custom_sdk.as_deref());
-    let out = spawn_output(&exe, &["devices", "--machine"], root)
+    let out = build_command(&exe, ["devices", "--machine"], root)
+        .stdin(Stdio::null())
+        .output()
         .await
         .map_err(|e| format!("Failed to run `{exe} devices --machine`: {e}"))?;
     if !out.status.success() {
@@ -403,8 +408,9 @@ async fn cmd_launch_emulator(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// Native terminal `flutter run` wrapper that preserves full ANSI color output while
-/// registering into the unified session center so `did_save` Hot Reload and `ctl` commands work.
+/// Drives `flutter run --machine` over structured JSON-RPC while rendering rich ANSI-colored
+/// output in Zed's native terminal, measuring real Hot Reload/Restart latency, supporting all
+/// Flutter Service Extensions, auto-opening Profile DevTools, and cleaning up on Ctrl+C / SIGTERM.
 async fn cmd_run(args: &[String]) -> Result<(), String> {
     let project_flag = parse_project_flag(args);
     let project = resolve_project_info(project_flag.as_deref())?;
@@ -412,7 +418,9 @@ async fn cmd_run(args: &[String]) -> Result<(), String> {
         return Err("`ctl run` is only supported for Flutter projects.".to_string());
     }
 
-    let mode = parse_flag_value(args, "--mode", Some("-m")).unwrap_or_else(|| "debug".to_string());
+    let mode = parse_flag_value(args, "--mode", Some("-m"))
+        .unwrap_or_else(|| "debug".to_string())
+        .to_ascii_lowercase();
     let target =
         parse_flag_value(args, "--target", Some("-t")).unwrap_or_else(|| "lib/main.dart".into());
     let flavor = parse_flag_value(args, "--flavor", None);
@@ -427,7 +435,7 @@ async fn cmd_run(args: &[String]) -> Result<(), String> {
         .map(|idx| args[idx + 1..].to_vec())
         .unwrap_or_default();
 
-    let mode_flag = match mode.to_ascii_lowercase().as_str() {
+    let mode_flag = match mode.as_str() {
         "profile" => "--profile",
         "release" => "--release",
         _ => "--debug",
@@ -435,9 +443,10 @@ async fn cmd_run(args: &[String]) -> Result<(), String> {
 
     let mut flutter_args = vec![
         "run".to_string(),
+        "--machine".to_string(),
         mode_flag.to_string(),
         "-t".to_string(),
-        target,
+        target.clone(),
     ];
     if let Some(ref dev) = device_id
         && !dev.trim().is_empty()
@@ -461,7 +470,17 @@ async fn cmd_run(args: &[String]) -> Result<(), String> {
     let custom_sdk = std::env::var("FLUTTER_SDK_PATH").ok();
     let exe = resolve_sdk_executable(&project.root, ProjectKind::Flutter, custom_sdk.as_deref());
 
-    let mut child = spawn_interactive(&exe, &flutter_args, &project.root)
+    println!(
+        "\x1b[1;36m[Flutter]\x1b[0m Launching \x1b[1m{target}\x1b[0m ({mode}) on {}...",
+        device_id.as_deref().unwrap_or("auto")
+    );
+
+    let mut child = build_command(&exe, &flutter_args, &project.root)
+        .kill_on_drop(true)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| format!("Failed to spawn `{exe}`: {e}"))?;
 
     let child_stdin = child.stdin.take().ok_or("Failed to capture child stdin")?;
@@ -478,11 +497,14 @@ async fn cmd_run(args: &[String]) -> Result<(), String> {
         session_id: session_id.clone(),
         project_root: project.root.clone(),
         device_id: device_id.clone(),
-        mode: mode.to_ascii_lowercase(),
+        mode: mode.clone(),
+        app_id: None,
         vm_service_uri: None,
         devtools_uri: None,
         overlays: OverlayState::default(),
+        pending_rpc: HashMap::new(),
     }));
+    let next_rpc_id = Arc::new(AtomicI64::new(1));
 
     persist_run_session(&cache, ipc_port, &run_state).await;
     let _cleanup = RunSessionCleanupGuard {
@@ -490,89 +512,233 @@ async fn cmd_run(args: &[String]) -> Result<(), String> {
         session_id,
     };
 
-    let (stdin_tx, mut stdin_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (stdin_tx, mut stdin_rx) = mpsc::channel::<String>(64);
+    let (stop_tx, mut stop_rx) = mpsc::channel::<()>(4);
+
     let stdin_writer = tokio::spawn(async move {
         let mut writer = child_stdin;
-        while let Some(bytes) = stdin_rx.recv().await {
-            if writer.write_all(&bytes).await.is_err() {
+        while let Some(line) = stdin_rx.recv().await {
+            if writer.write_all(line.as_bytes()).await.is_err() {
                 break;
             }
             let _ = writer.flush().await;
         }
     });
 
-    let term_tx = stdin_tx.clone();
+    // Forward stderr with dim red coloring
+    let stderr_task = tokio::spawn(async move {
+        let mut reader = BufReader::new(child_stderr);
+        let mut buf = String::new();
+        while reader.read_line(&mut buf).await.unwrap_or(0) > 0 {
+            let cleaned = strip_ansi_codes(&buf);
+            if !cleaned.trim().is_empty() {
+                eprint!("\x1b[31m{cleaned}\x1b[0m");
+                let _ = io::stderr().flush();
+            }
+            buf.clear();
+        }
+    });
+
+    // Parse `flutter run --machine` JSON-RPC events & responses on stdout
+    let out_state = Arc::clone(&run_state);
+    let out_cache = cache.clone();
+    let out_sdk = custom_sdk.clone();
+    let stdout_task = tokio::spawn(async move {
+        let mut reader = BufReader::new(child_stdout);
+        let mut buf = String::new();
+        let mut profile_devtools_opened = false;
+
+        while reader.read_line(&mut buf).await.unwrap_or(0) > 0 {
+            let cleaned = strip_ansi_codes(&buf);
+            if let Some(messages) = parse_machine_line(&cleaned) {
+                for msg in messages {
+                    // Check if this is an RPC response matching a pending request
+                    if let Some(id) = msg.get("id").and_then(Value::as_i64)
+                        && let Some(tx) = out_state.lock().await.pending_rpc.remove(&id)
+                    {
+                        let _ = tx.send(msg);
+                        continue;
+                    }
+
+                    let event = msg
+                        .get("event")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let params = msg.get("params");
+
+                    match event {
+                        "app.start" => {
+                            if let Some(app_id) =
+                                params.and_then(|p| p.get("appId")).and_then(Value::as_str)
+                            {
+                                let dev_id = params
+                                    .and_then(|p| p.get("deviceId"))
+                                    .and_then(Value::as_str)
+                                    .map(ToOwned::to_owned);
+                                {
+                                    let mut g = out_state.lock().await;
+                                    g.app_id = Some(app_id.to_string());
+                                    if g.device_id.is_none() {
+                                        g.device_id = dev_id;
+                                    }
+                                }
+                                persist_run_session(&out_cache, ipc_port, &out_state).await;
+                            }
+                        }
+                        "app.debugPort" => {
+                            if let Some(ws_uri) =
+                                params.and_then(|p| p.get("wsUri")).and_then(Value::as_str)
+                            {
+                                let (root, mode_now, dt_now) = {
+                                    let mut g = out_state.lock().await;
+                                    g.vm_service_uri = Some(ws_uri.to_string());
+                                    (g.project_root.clone(), g.mode.clone(), g.devtools_uri.clone())
+                                };
+                                persist_run_session(&out_cache, ipc_port, &out_state).await;
+                                println!("\x1b[32m[VM Service]\x1b[0m {ws_uri}");
+
+                                if mode_now == "profile" && !profile_devtools_opened {
+                                    profile_devtools_opened = true;
+                                    if let Some(url) = resolve_or_start_devtools_url(
+                                        &out_cache,
+                                        &root,
+                                        dt_now.as_deref(),
+                                        Some(ws_uri),
+                                        Some("performance"),
+                                        out_sdk.as_deref(),
+                                    )
+                                    .await
+                                    {
+                                        open_url_in_browser(&url);
+                                        println!("\x1b[35m[DevTools]\x1b[0m Opened Performance: {url}");
+                                    }
+                                }
+                            }
+                        }
+                        "app.webLaunchUrl" => {
+                            if let Some(url) =
+                                params.and_then(|p| p.get("url")).and_then(Value::as_str)
+                            {
+                                println!("\x1b[36m[Web]\x1b[0m {url}");
+                            }
+                        }
+                        "app.started" => {
+                            println!(
+                                "\x1b[1;32m[Flutter]\x1b[0m Application running. \x1b[2mPress r (Hot Reload), R (Hot Restart), d (DevTools), q (Quit) + Enter\x1b[0m"
+                            );
+                        }
+                        "app.progress" => {
+                            if let Some(message) =
+                                params.and_then(|p| p.get("message")).and_then(Value::as_str)
+                            {
+                                println!("\x1b[36m[Progress]\x1b[0m {message}");
+                            }
+                        }
+                        "app.log" => {
+                            if let Some(log) =
+                                params.and_then(|p| p.get("log")).and_then(Value::as_str)
+                            {
+                                let is_err = params
+                                    .and_then(|p| p.get("error"))
+                                    .and_then(Value::as_bool)
+                                    .unwrap_or(false);
+                                if is_err {
+                                    println!("\x1b[31m{log}\x1b[0m");
+                                } else {
+                                    println!("{log}");
+                                }
+                            }
+                        }
+                        "daemon.logMessage" => {
+                            if let Some(message) =
+                                params.and_then(|p| p.get("message")).and_then(Value::as_str)
+                            {
+                                println!("\x1b[2m{message}\x1b[0m");
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            } else if !cleaned.trim().is_empty() {
+                print!("{cleaned}");
+                let _ = io::stdout().flush();
+            }
+            buf.clear();
+        }
+    });
+
+    // Interactive keyboard controls (r / R / d / q) routed through the exact same RPC engine
+    let kb_state = Arc::clone(&run_state);
+    let kb_stdin = stdin_tx.clone();
+    let kb_rpc_id = Arc::clone(&next_rpc_id);
+    let kb_cache = cache.clone();
+    let kb_sdk = custom_sdk.clone();
+    let kb_stop = stop_tx.clone();
     let term_reader = tokio::spawn(async move {
         let mut stdin = BufReader::new(tokio::io::stdin());
         let mut line = String::new();
         while stdin.read_line(&mut line).await.unwrap_or(0) > 0 {
-            if term_tx.send(line.as_bytes().to_vec()).await.is_err() {
-                break;
+            match line.trim() {
+                "r" => {
+                    let resp =
+                        execute_machine_restart(&kb_state, &kb_stdin, &kb_rpc_id, false).await;
+                    print_reload_banner(&resp);
+                }
+                "R" => {
+                    let resp =
+                        execute_machine_restart(&kb_state, &kb_stdin, &kb_rpc_id, true).await;
+                    print_reload_banner(&resp);
+                }
+                "d" => {
+                    let resp = execute_open_devtools(&kb_state, &kb_cache, &kb_sdk, None).await;
+                    println!("\x1b[35m[DevTools]\x1b[0m {}", resp.message);
+                }
+                "q" | "Q" => {
+                    let _ = kb_stop.send(()).await;
+                    break;
+                }
+                _ => {}
             }
             line.clear();
         }
     });
 
-    let stderr_task = tokio::spawn(async move {
-        let mut reader = BufReader::new(child_stderr);
-        let mut buf = String::new();
-        while reader.read_line(&mut buf).await.unwrap_or(0) > 0 {
-            eprint!("{buf}");
-            let _ = io::stderr().flush();
-            buf.clear();
-        }
-    });
-
-    let out_state = Arc::clone(&run_state);
-    let out_cache = cache.clone();
-    let stdout_task = tokio::spawn(async move {
-        let mut reader = BufReader::new(child_stdout);
-        let mut buf = String::new();
-        while reader.read_line(&mut buf).await.unwrap_or(0) > 0 {
-            print!("{buf}");
-            let _ = io::stdout().flush();
-
-            let cleaned = strip_ansi_codes(&buf);
-            let mut updated = false;
-            {
-                let mut guard = out_state.lock().await;
-                if let Some(vm) = extract_vm_service_uri(&cleaned)
-                    && guard.vm_service_uri.as_deref() != Some(vm.as_str())
-                {
-                    guard.vm_service_uri = Some(vm);
-                    updated = true;
-                }
-                if let Some(dt) = extract_devtools_uri(&cleaned)
-                    && guard.devtools_uri.as_deref() != Some(dt.as_str())
-                {
-                    guard.devtools_uri = Some(dt);
-                    updated = true;
-                }
-            }
-            if updated {
-                persist_run_session(&out_cache, ipc_port, &out_state).await;
-            }
-            buf.clear();
-        }
-    });
-
+    // Local IPC server for LSP & `ctl` subcommands
     let ipc_state = Arc::clone(&run_state);
     let ipc_stdin = stdin_tx.clone();
+    let ipc_rpc_id = Arc::clone(&next_rpc_id);
     let ipc_cache = cache.clone();
     let ipc_sdk = custom_sdk.clone();
+    let ipc_stop = stop_tx.clone();
     let ipc_task = tokio::spawn(async move {
         while let Ok((stream, _)) = ipc_listener.accept().await {
             let st = Arc::clone(&ipc_state);
             let tx = ipc_stdin.clone();
+            let rid = Arc::clone(&ipc_rpc_id);
             let c = ipc_cache.clone();
             let sdk = ipc_sdk.clone();
+            let stop = ipc_stop.clone();
             tokio::spawn(async move {
-                handle_run_ipc(stream, st, tx, c, sdk).await;
+                handle_run_ipc(stream, st, tx, rid, c, sdk, stop).await;
             });
         }
     });
 
-    let status = child.wait().await.map_err(|e| e.to_string())?;
+    // Wait for child exit, Ctrl+C, or IPC/keyboard stop request
+    let exit_status = tokio::select! {
+        status = child.wait() => status.ok(),
+        _ = wait_for_termination_signal() => {
+            println!("\n\x1b[33m[Flutter]\x1b[0m Stopping application...");
+            graceful_stop_machine_app(&run_state, &stdin_tx, &next_rpc_id, &mut child).await;
+            None
+        }
+        _ = stop_rx.recv() => {
+            println!("\x1b[33m[Flutter]\x1b[0m Stopping application...");
+            graceful_stop_machine_app(&run_state, &stdin_tx, &next_rpc_id, &mut child).await;
+            None
+        }
+    };
+
     ipc_task.abort();
     term_reader.abort();
     drop(stdin_tx);
@@ -580,13 +746,60 @@ async fn cmd_run(args: &[String]) -> Result<(), String> {
     let _ = stdout_task.await;
     let _ = stderr_task.await;
 
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!(
+    match exit_status {
+        None => Ok(()),
+        Some(st) if st.success() => Ok(()),
+        Some(st) => Err(format!(
             "flutter run exited with status {}",
-            status.code().unwrap_or(-1)
-        ))
+            st.code().unwrap_or(-1)
+        )),
+    }
+}
+
+async fn wait_for_termination_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        if let Ok(mut sigterm) = signal(SignalKind::terminate()) {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = sigterm.recv() => {}
+            }
+            return;
+        }
+    }
+    let _ = tokio::signal::ctrl_c().await;
+}
+
+async fn graceful_stop_machine_app(
+    state: &Arc<Mutex<RunSessionState>>,
+    stdin_tx: &mpsc::Sender<String>,
+    next_rpc_id: &Arc<AtomicI64>,
+    child: &mut tokio::process::Child,
+) {
+    let app_id = state.lock().await.app_id.clone();
+    if let Some(app_id) = app_id {
+        let id = next_rpc_id.fetch_add(1, Ordering::Relaxed);
+        let payload = format!(
+            "{}\n",
+            json!([{ "method": "app.stop", "id": id, "params": { "appId": app_id } }])
+        );
+        let _ = stdin_tx.send(payload).await;
+    }
+
+    if tokio::time::timeout(Duration::from_secs(2), child.wait())
+        .await
+        .is_err()
+    {
+        terminate_child_tree(child).await;
+    }
+}
+
+fn print_reload_banner(resp: &IpcResponse) {
+    if resp.ok {
+        println!("\x1b[32m[Flutter]\x1b[0m {}", resp.message);
+    } else {
+        println!("\x1b[31m[Flutter]\x1b[0m {}", resp.message);
     }
 }
 
@@ -595,9 +808,11 @@ struct RunSessionState {
     project_root: PathBuf,
     device_id: Option<String>,
     mode: String,
+    app_id: Option<String>,
     vm_service_uri: Option<String>,
     devtools_uri: Option<String>,
     overlays: OverlayState,
+    pending_rpc: HashMap<i64, oneshot::Sender<Value>>,
 }
 
 async fn persist_run_session(cache: &DiskCache, port: u16, state: &Arc<Mutex<RunSessionState>>) {
@@ -629,12 +844,174 @@ impl Drop for RunSessionCleanupGuard {
     }
 }
 
+async fn send_machine_rpc(
+    state: &Arc<Mutex<RunSessionState>>,
+    stdin_tx: &mpsc::Sender<String>,
+    next_rpc_id: &Arc<AtomicI64>,
+    method: &str,
+    params: Value,
+    timeout_secs: u64,
+) -> Result<(Value, u64), String> {
+    let start = Instant::now();
+    let id = next_rpc_id.fetch_add(1, Ordering::Relaxed);
+    let (tx, rx) = oneshot::channel();
+    state.lock().await.pending_rpc.insert(id, tx);
+
+    let line = format!(
+        "{}\n",
+        json!([{
+            "method": method,
+            "id": id,
+            "params": params
+        }])
+    );
+
+    if stdin_tx.send(line).await.is_err() {
+        state.lock().await.pending_rpc.remove(&id);
+        return Err("Flutter run session is closed".to_string());
+    }
+
+    match tokio::time::timeout(Duration::from_secs(timeout_secs), rx).await {
+        Ok(Ok(resp)) => {
+            let ms = start.elapsed().as_millis() as u64;
+            if let Some(err) = resp.get("error") {
+                let err_msg = err
+                    .as_str()
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| err.to_string());
+                return Err(err_msg);
+            }
+            Ok((resp.get("result").cloned().unwrap_or(Value::Null), ms))
+        }
+        Ok(Err(_)) => Err("Flutter run session closed before responding".to_string()),
+        Err(_) => {
+            state.lock().await.pending_rpc.remove(&id);
+            Err(format!("Timed out waiting for `{method}` response"))
+        }
+    }
+}
+
+async fn execute_machine_restart(
+    state: &Arc<Mutex<RunSessionState>>,
+    stdin_tx: &mpsc::Sender<String>,
+    next_rpc_id: &Arc<AtomicI64>,
+    full_restart: bool,
+) -> IpcResponse {
+    let (mode, dev, vm, dt, app_id) = {
+        let g = state.lock().await;
+        (
+            g.mode.clone(),
+            g.device_id.clone(),
+            g.vm_service_uri.clone(),
+            g.devtools_uri.clone(),
+            g.app_id.clone(),
+        )
+    };
+    let label = if full_restart {
+        "Hot Restart"
+    } else {
+        "Hot Reload"
+    };
+    if mode != "debug" {
+        return IpcResponse::err(format!("{label} is disabled in `{mode}` mode"));
+    }
+    let Some(app_id) = app_id else {
+        return IpcResponse::err("Flutter app is still starting; try again in a moment");
+    };
+
+    match send_machine_rpc(
+        state,
+        stdin_tx,
+        next_rpc_id,
+        "app.restart",
+        json!({
+            "appId": app_id,
+            "fullRestart": full_restart,
+            "pause": false
+        }),
+        15,
+    )
+    .await
+    {
+        Ok((result, ms)) => {
+            let code = result.get("code").and_then(Value::as_i64).unwrap_or(0);
+            if code == 0 {
+                IpcResponse {
+                    ok: true,
+                    message: format!("{label}: {ms}ms"),
+                    duration_ms: Some(ms),
+                    mode: Some(mode),
+                    device_id: dev,
+                    vm_service_uri: vm,
+                    devtools_uri: dt,
+                }
+            } else {
+                let err_msg = result
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Reload rejected (compilation error)");
+                IpcResponse {
+                    ok: false,
+                    message: format!("{label} failed: {err_msg}"),
+                    duration_ms: Some(ms),
+                    mode: Some(mode),
+                    device_id: dev,
+                    vm_service_uri: vm,
+                    devtools_uri: dt,
+                }
+            }
+        }
+        Err(err) => IpcResponse::err(format!("{label} failed: {err}")),
+    }
+}
+
+async fn execute_open_devtools(
+    state: &Arc<Mutex<RunSessionState>>,
+    cache: &DiskCache,
+    custom_sdk: &Option<String>,
+    page: Option<&str>,
+) -> IpcResponse {
+    let (root, dt, vm) = {
+        let g = state.lock().await;
+        (
+            g.project_root.clone(),
+            g.devtools_uri.clone(),
+            g.vm_service_uri.clone(),
+        )
+    };
+    if let Some(url) = resolve_or_start_devtools_url(
+        cache,
+        &root,
+        dt.as_deref(),
+        vm.as_deref(),
+        page,
+        custom_sdk.as_deref(),
+    )
+    .await
+    {
+        open_url_in_browser(&url);
+        IpcResponse {
+            ok: true,
+            message: format!("Opened DevTools: {url}"),
+            duration_ms: None,
+            mode: None,
+            device_id: None,
+            vm_service_uri: vm,
+            devtools_uri: Some(url),
+        }
+    } else {
+        IpcResponse::err("DevTools URI is not ready yet")
+    }
+}
+
 async fn handle_run_ipc(
     mut stream: tokio::net::TcpStream,
     state: Arc<Mutex<RunSessionState>>,
-    stdin_tx: mpsc::Sender<Vec<u8>>,
+    stdin_tx: mpsc::Sender<String>,
+    next_rpc_id: Arc<AtomicI64>,
     cache: DiskCache,
     custom_sdk: Option<String>,
+    stop_tx: mpsc::Sender<()>,
 ) {
     let (read_half, mut write_half) = stream.split();
     let mut reader = BufReader::new(read_half);
@@ -645,67 +1022,17 @@ async fn handle_run_ipc(
 
     let response = match serde_json::from_str::<IpcRequest>(line.trim()) {
         Ok(IpcRequest::HotReload) => {
-            let (mode, dev, vm, dt) = {
-                let g = state.lock().await;
-                (
-                    g.mode.clone(),
-                    g.device_id.clone(),
-                    g.vm_service_uri.clone(),
-                    g.devtools_uri.clone(),
-                )
-            };
-            if mode != "debug" {
-                IpcResponse::err(format!("Hot Reload is disabled in `{mode}` mode"))
-            } else {
-                let start = Instant::now();
-                let sent = stdin_tx.send(b"r".to_vec()).await.is_ok();
-                let ms = start.elapsed().as_millis() as u64;
-                IpcResponse {
-                    ok: sent,
-                    message: if sent {
-                        format!("Hot Reload triggered ({ms}ms)")
-                    } else {
-                        "Flutter run session closed".to_string()
-                    },
-                    duration_ms: Some(ms),
-                    mode: Some(mode),
-                    device_id: dev,
-                    vm_service_uri: vm,
-                    devtools_uri: dt,
-                }
-            }
+            let resp = execute_machine_restart(&state, &stdin_tx, &next_rpc_id, false).await;
+            print_reload_banner(&resp);
+            resp
         }
         Ok(IpcRequest::HotRestart) => {
-            let (mode, dev, vm, dt) = {
-                let g = state.lock().await;
-                (
-                    g.mode.clone(),
-                    g.device_id.clone(),
-                    g.vm_service_uri.clone(),
-                    g.devtools_uri.clone(),
-                )
-            };
-            if mode != "debug" {
-                IpcResponse::err(format!("Hot Restart is disabled in `{mode}` mode"))
-            } else {
-                let sent = stdin_tx.send(b"R".to_vec()).await.is_ok();
-                IpcResponse {
-                    ok: sent,
-                    message: if sent {
-                        "Hot Restart triggered".to_string()
-                    } else {
-                        "Flutter run session closed".to_string()
-                    },
-                    duration_ms: None,
-                    mode: Some(mode),
-                    device_id: dev,
-                    vm_service_uri: vm,
-                    devtools_uri: dt,
-                }
-            }
+            let resp = execute_machine_restart(&state, &stdin_tx, &next_rpc_id, true).await;
+            print_reload_banner(&resp);
+            resp
         }
         Ok(IpcRequest::Stop) => {
-            let _ = stdin_tx.send(b"q".to_vec()).await;
+            let _ = stop_tx.send(()).await;
             IpcResponse {
                 ok: true,
                 message: "Stopping Flutter application...".to_string(),
@@ -717,7 +1044,7 @@ async fn handle_run_ipc(
             }
         }
         Ok(IpcRequest::ToggleOverlay { overlay }) => {
-            let (mode, dev, vm, dt, method, params, label) = {
+            let (mode, dev, vm, dt, app_id, method, params, label) = {
                 let mut g = state.lock().await;
                 if g.mode == "release" {
                     write_ipc_resp(
@@ -733,87 +1060,108 @@ async fn handle_run_ipc(
                     g.device_id.clone(),
                     g.vm_service_uri.clone(),
                     g.devtools_uri.clone(),
+                    g.app_id.clone(),
                     m,
                     p,
                     l,
                 )
             };
-            if let Some(vm_uri) = vm.as_deref() {
-                match VmServiceClient::connect(vm_uri).await {
-                    Ok(mut client) => match client.call_service_extension(method, params).await {
-                        Ok(_) => IpcResponse {
-                            ok: true,
-                            message: label,
-                            duration_ms: None,
-                            mode: Some(mode),
-                            device_id: dev,
-                            vm_service_uri: vm,
-                            devtools_uri: dt,
-                        },
-                        Err(e) => {
-                            IpcResponse::err(format!("Failed to toggle {}: {e}", overlay.label()))
-                        }
-                    },
-                    Err(e) => IpcResponse::err(e),
+
+            let rpc_ok = if let Some(aid) = app_id {
+                send_machine_rpc(
+                    &state,
+                    &stdin_tx,
+                    &next_rpc_id,
+                    "app.callServiceExtension",
+                    json!({
+                        "appId": aid,
+                        "methodName": method,
+                        "params": params
+                    }),
+                    8,
+                )
+                .await
+                .ok()
+            } else {
+                None
+            };
+
+            if let Some((_, ms)) = rpc_ok {
+                IpcResponse {
+                    ok: true,
+                    message: label,
+                    duration_ms: Some(ms),
+                    mode: Some(mode),
+                    device_id: dev,
+                    vm_service_uri: vm,
+                    devtools_uri: dt,
+                }
+            } else if let Some(vm_uri) = vm.as_deref()
+                && let Ok(mut client) = VmServiceClient::connect(vm_uri).await
+                && client.call_service_extension(method, params).await.is_ok()
+            {
+                IpcResponse {
+                    ok: true,
+                    message: label,
+                    duration_ms: None,
+                    mode: Some(mode),
+                    device_id: dev,
+                    vm_service_uri: vm,
+                    devtools_uri: dt,
                 }
             } else {
-                IpcResponse::err("VM Service URI not ready yet")
+                IpcResponse::err(format!("Failed to toggle {}", overlay.label()))
             }
         }
         Ok(IpcRequest::CallServiceExtension { method, params }) => {
-            let vm = state.lock().await.vm_service_uri.clone();
-            if let Some(vm_uri) = vm.as_deref() {
-                match VmServiceClient::connect(vm_uri).await {
-                    Ok(mut client) => match client.call_service_extension(&method, params).await {
-                        Ok(_) => IpcResponse {
-                            ok: true,
-                            message: format!("Called `{method}`"),
-                            duration_ms: None,
-                            mode: None,
-                            device_id: None,
-                            vm_service_uri: vm,
-                            devtools_uri: None,
-                        },
-                        Err(e) => IpcResponse::err(e),
-                    },
-                    Err(e) => IpcResponse::err(e),
-                }
-            } else {
-                IpcResponse::err("VM Service URI not ready yet")
-            }
-        }
-        Ok(IpcRequest::OpenDevTools { page }) => {
-            let (root, dt, vm) = {
+            let (app_id, vm) = {
                 let g = state.lock().await;
-                (
-                    g.project_root.clone(),
-                    g.devtools_uri.clone(),
-                    g.vm_service_uri.clone(),
-                )
+                (g.app_id.clone(), g.vm_service_uri.clone())
             };
-            if let Some(url) = resolve_or_start_devtools_url(
-                &cache,
-                &root,
-                dt.as_deref(),
-                vm.as_deref(),
-                page.as_deref(),
-                custom_sdk.as_deref(),
-            )
-            .await
+            if let Some(aid) = app_id
+                && send_machine_rpc(
+                    &state,
+                    &stdin_tx,
+                    &next_rpc_id,
+                    "app.callServiceExtension",
+                    json!({
+                        "appId": aid,
+                        "methodName": method,
+                        "params": params
+                    }),
+                    8,
+                )
+                .await
+                .is_ok()
             {
-                open_url_in_browser(&url);
                 IpcResponse {
                     ok: true,
-                    message: format!("Opened DevTools: {url}"),
+                    message: format!("Called `{method}`"),
                     duration_ms: None,
                     mode: None,
                     device_id: None,
                     vm_service_uri: vm,
-                    devtools_uri: Some(url),
+                    devtools_uri: None,
+                }
+            } else if let Some(vm_uri) = vm.as_deref()
+                && let Ok(mut client) = VmServiceClient::connect(vm_uri).await
+                && client.call_service_extension(&method, params).await.is_ok()
+            {
+                IpcResponse {
+                    ok: true,
+                    message: format!("Called `{method}`"),
+                    duration_ms: None,
+                    mode: None,
+                    device_id: None,
+                    vm_service_uri: vm,
+                    devtools_uri: None,
                 }
             } else {
-                IpcResponse::err("DevTools URI is not ready yet")
+                IpcResponse::err(format!("Service extension `{method}` failed"))
             }
+        }
+        Ok(IpcRequest::OpenDevTools { page }) => {
+            execute_open_devtools(&state, &cache, &custom_sdk, page.as_deref()).await
         }
         Ok(IpcRequest::Screenshot { output_path }) => {
             let (root, vm) = {
@@ -868,6 +1216,14 @@ async fn write_ipc_resp(write_half: &mut tokio::net::tcp::WriteHalf<'_>, resp: &
     }
 }
 
+pub fn parse_machine_line(line: &str) -> Option<Vec<Value>> {
+    let trimmed = line.trim();
+    if !trimmed.starts_with('[') || !trimmed.ends_with(']') {
+        return None;
+    }
+    serde_json::from_str::<Vec<Value>>(trimmed).ok()
+}
+
 async fn cmd_build_runner(args: &[String]) -> Result<(), String> {
     let project_flag = parse_project_flag(args);
     let project = resolve_project_info(project_flag.as_deref())?;
@@ -885,12 +1241,14 @@ async fn cmd_build_runner(args: &[String]) -> Result<(), String> {
 
     let custom_sdk = std::env::var("FLUTTER_SDK_PATH").ok();
     let dart_exe = resolve_sdk_executable(&project.root, ProjectKind::Dart, custom_sdk.as_deref());
-    let status = Command::new(&dart_exe)
-        .args(["run", "build_runner", action, "--delete-conflicting-outputs"])
-        .current_dir(&project.root)
-        .status()
-        .await
-        .map_err(|e| format!("Failed to run build_runner: {e}"))?;
+    let status = build_command(
+        &dart_exe,
+        ["run", "build_runner", action, "--delete-conflicting-outputs"],
+        &project.root,
+    )
+    .status()
+    .await
+    .map_err(|e| format!("Failed to run build_runner: {e}"))?;
 
     if status.success() {
         Ok(())
@@ -911,9 +1269,7 @@ async fn cmd_passthrough_flutter(args: &[String], subargs: &[&str]) -> Result<()
     let custom_sdk = std::env::var("FLUTTER_SDK_PATH").ok();
     let exe = resolve_sdk_executable(&root, kind, custom_sdk.as_deref());
 
-    let status = Command::new(&exe)
-        .args(subargs)
-        .current_dir(&root)
+    let status = build_command(&exe, subargs, &root)
         .status()
         .await
         .map_err(|e| format!("Failed to execute `{exe}`: {e}"))?;
@@ -948,8 +1304,9 @@ async fn cmd_create_interactive(args: &[String]) -> Result<(), String> {
     let custom_sdk = std::env::var("FLUTTER_SDK_PATH").ok();
     let exe = resolve_sdk_executable(&base_dir, ProjectKind::Flutter, custom_sdk.as_deref());
 
-    let status = Command::new(&exe)
-        .args([
+    let status = build_command(
+        &exe,
+        [
             "create",
             "--project-name",
             &name,
@@ -957,11 +1314,12 @@ async fn cmd_create_interactive(args: &[String]) -> Result<(), String> {
             &org,
             &format!("--template={template}"),
             &target.to_string_lossy(),
-        ])
-        .current_dir(&base_dir)
-        .status()
-        .await
-        .map_err(|e| format!("Failed to run flutter create: {e}"))?;
+        ],
+        &base_dir,
+    )
+    .status()
+    .await
+    .map_err(|e| format!("Failed to run flutter create: {e}"))?;
 
     if status.success() {
         println!("Created Flutter project at {}", target.display());
@@ -969,41 +1327,6 @@ async fn cmd_create_interactive(args: &[String]) -> Result<(), String> {
     } else {
         Err("flutter create failed".to_string())
     }
-}
-
-pub fn extract_vm_service_uri(line: &str) -> Option<String> {
-    if !line.contains("http://") && !line.contains("ws://") {
-        return None;
-    }
-    for token in line.split_whitespace() {
-        let cleaned = token.trim_matches(|c: char| matches!(c, '(' | ')' | ',' | '.' | '"' | '\''));
-        if let Ok(parsed) = url::Url::parse(cleaned)
-            && matches!(parsed.scheme(), "http" | "ws")
-            && matches!(parsed.host_str(), Some("127.0.0.1" | "localhost"))
-            && !cleaned.contains("devtools")
-            && parsed.port().is_some()
-        {
-            return Some(cleaned.to_string());
-        }
-    }
-    None
-}
-
-pub fn extract_devtools_uri(line: &str) -> Option<String> {
-    if !line.contains("devtools") && !line.contains("?uri=") {
-        return None;
-    }
-    for token in line.split_whitespace() {
-        let cleaned = token.trim_matches(|c: char| matches!(c, '(' | ')' | ',' | '.' | '"' | '\''));
-        if let Ok(parsed) = url::Url::parse(cleaned)
-            && matches!(parsed.scheme(), "http" | "https")
-            && matches!(parsed.host_str(), Some("127.0.0.1" | "localhost"))
-            && (cleaned.contains("devtools") || parsed.query().is_some())
-        {
-            return Some(cleaned.to_string());
-        }
-    }
-    None
 }
 
 fn first_positional_arg(args: &[String]) -> Option<&str> {
@@ -1060,30 +1383,6 @@ fn prompt_string(prompt: &str, default: &str) -> Result<String, String> {
     }
 }
 
-async fn spawn_output(
-    exe: &str,
-    args: &[&str],
-    cwd: &Path,
-) -> std::io::Result<std::process::Output> {
-    Command::new(exe)
-        .args(args)
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .output()
-        .await
-}
-
-fn spawn_interactive(exe: &str, args: &[String], cwd: &Path) -> std::io::Result<Child> {
-    Command::new(exe)
-        .args(args)
-        .current_dir(cwd)
-        .kill_on_drop(true)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-}
-
 pub fn print_recommended_zed_config() {
     println!(
         r#"=== Recommended ~/.config/zed/settings.json snippet ===
@@ -1096,6 +1395,7 @@ pub fn print_recommended_zed_config() {
     "flutter-debugger": {{
       "initialization_options": {{
         "autoHotReloadOnSave": true,
+        "hotReloadDebounceMs": 250,
         "closingLabels": true,
         "closingLabelsMinLines": 2,
         "colorPreviews": true,
@@ -1130,18 +1430,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn extracts_vm_service_and_devtools_uris_from_flutter_run_output() {
-        let vm_line = "A Dart VM Service on macOS is available at: http://localhost:54321/session/";
-        assert_eq!(
-            extract_vm_service_uri(vm_line).as_deref(),
-            Some("http://localhost:54321/session/")
-        );
-
-        let dt_line = "The Flutter DevTools debugger and profiler on macOS is available at: http://localhost:9100?uri=http://localhost:54321/session/";
-        assert_eq!(
-            extract_devtools_uri(dt_line).as_deref(),
-            Some("http://localhost:9100?uri=http://localhost:54321/session/")
-        );
+    fn parses_machine_protocol_lines_and_ignores_plain_text() {
+        assert!(parse_machine_line("Launching lib/main.dart...").is_none());
+        let events = parse_machine_line(
+            r#"[{"event":"app.debugPort","params":{"appId":"1","wsUri":"ws://localhost:50000/ws"}}]"#,
+        )
+        .expect("parsed");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["event"], "app.debugPort");
     }
 
     #[test]

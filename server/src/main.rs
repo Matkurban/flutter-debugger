@@ -7,6 +7,7 @@ mod devtools;
 mod emulators;
 mod ipc;
 mod lsp;
+mod process_util;
 mod project;
 mod runner;
 mod vm_service;

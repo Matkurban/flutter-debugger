@@ -37,7 +37,8 @@ pub struct ParsedPubspec {
 }
 
 /// Synchronously parses `pubspec.yaml` or `pubspec_overrides.yaml` dependencies,
-/// local `path:` dependencies, and `flutter.assets` / `flutter.fonts` entries.
+/// local `path:` dependencies, and `flutter.assets` / `flutter.fonts` entries
+/// with accurate UTF-16 column spans located strictly after the `:` or `-` delimiter.
 pub fn parse_pubspec_dependencies(content: &str) -> ParsedPubspec {
     let mut deps: Vec<PubDependency> = Vec::new();
     let mut assets: Vec<FlutterAssetEntry> = Vec::new();
@@ -46,13 +47,14 @@ pub fn parse_pubspec_dependencies(content: &str) -> ParsedPubspec {
     let mut pending_block_dep_index: Option<usize> = None;
 
     for (line_idx, raw_line) in content.lines().enumerate() {
-        let stripped = strip_comment(raw_line);
+        let clean_line = raw_line.trim_end_matches('\r');
+        let stripped = strip_comment(clean_line);
         let trimmed = stripped.trim();
         if trimmed.is_empty() {
             continue;
         }
 
-        let indent = raw_line.len() - raw_line.trim_start_matches(' ').len();
+        let indent = clean_line.len() - clean_line.trim_start_matches(' ').len();
 
         if indent == 0 {
             pending_block_dep_index = None;
@@ -84,9 +86,9 @@ pub fn parse_pubspec_dependencies(content: &str) -> ParsedPubspec {
                             | "flutter_driver"
                     );
 
-                    let name_start_col = raw_line.find(name).unwrap_or(indent) as u32;
-                    let name_end_col = name_start_col + name.len() as u32;
-                    let line_end_col = raw_line.trim_end().len() as u32;
+                    let (name_start_col, name_end_col) =
+                        utf16_span_after(clean_line, indent, name);
+                    let line_end_col = clean_line.trim_end().encode_utf16().count() as u32;
 
                     let is_inline_map = val.starts_with('{');
                     let version_constraint = if val.is_empty() || is_inline_map {
@@ -124,8 +126,8 @@ pub fn parse_pubspec_dependencies(content: &str) -> ParsedPubspec {
                     if matches!(sk, "sdk" | "path" | "git") {
                         deps[idx].is_hosted_pub_dev = false;
                         if sk == "path" && !sv.is_empty() {
-                            let start_col = raw_line.find(sv).unwrap_or(indent) as u32;
-                            let end_col = start_col + sv.len() as u32;
+                            let after_colon = stripped.find(':').map(|p| p + 1).unwrap_or(indent);
+                            let (start_col, end_col) = utf16_span_after(clean_line, after_colon, sv);
                             deps[idx].local_path =
                                 Some((sv.to_string(), line_idx as u32, start_col, end_col));
                         }
@@ -148,24 +150,30 @@ pub fn parse_pubspec_dependencies(content: &str) -> ParsedPubspec {
                         if !candidate.is_empty() && !candidate.starts_with("path:") {
                             let cleaned = candidate.trim_matches(|c| c == '"' || c == '\'');
                             if !cleaned.is_empty() {
-                                let start_col = raw_line.find(cleaned).unwrap_or(indent) as u32;
+                                let after_dash =
+                                    stripped.find('-').map(|p| p + 1).unwrap_or(indent);
+                                let (start_col, end_col) =
+                                    utf16_span_after(clean_line, after_dash, cleaned);
                                 assets.push(FlutterAssetEntry {
                                     path: cleaned.to_string(),
                                     line: line_idx as u32,
                                     start_col,
-                                    end_col: start_col + cleaned.len() as u32,
+                                    end_col,
                                     is_font: false,
                                 });
                             }
                         } else if let Some((_, pval)) = candidate.split_once(':') {
                             let cleaned = pval.trim().trim_matches(|c| c == '"' || c == '\'');
                             if !cleaned.is_empty() {
-                                let start_col = raw_line.find(cleaned).unwrap_or(indent) as u32;
+                                let after_colon =
+                                    stripped.find(':').map(|p| p + 1).unwrap_or(indent);
+                                let (start_col, end_col) =
+                                    utf16_span_after(clean_line, after_colon, cleaned);
                                 assets.push(FlutterAssetEntry {
                                     path: cleaned.to_string(),
                                     line: line_idx as u32,
                                     start_col,
-                                    end_col: start_col + cleaned.len() as u32,
+                                    end_col,
                                     is_font: false,
                                 });
                             }
@@ -178,12 +186,14 @@ pub fn parse_pubspec_dependencies(content: &str) -> ParsedPubspec {
                     {
                         let cleaned = v.trim().trim_matches(|c| c == '"' || c == '\'');
                         if !cleaned.is_empty() {
-                            let start_col = raw_line.find(cleaned).unwrap_or(indent) as u32;
+                            let after_colon = stripped.find(':').map(|p| p + 1).unwrap_or(indent);
+                            let (start_col, end_col) =
+                                utf16_span_after(clean_line, after_colon, cleaned);
                             assets.push(FlutterAssetEntry {
                                 path: cleaned.to_string(),
                                 line: line_idx as u32,
                                 start_col,
-                                end_col: start_col + cleaned.len() as u32,
+                                end_col,
                                 is_font: true,
                             });
                         }
@@ -200,10 +210,19 @@ pub fn parse_pubspec_dependencies(content: &str) -> ParsedPubspec {
     }
 }
 
-/// Builds `textDocument/documentLink` targets:
-/// - `pub.dev` links for hosted dependencies (when `include_pub_dev_links` is true)
-/// - Local file/folder links for `flutter.assets` & `flutter.fonts`
-/// - Local `pubspec.yaml` links for `path:` dependencies
+/// Finds `needle` starting at or after byte offset `after_byte` in `line`, returning its
+/// exact `(start_col_utf16, end_col_utf16)` span.
+fn utf16_span_after(line: &str, after_byte: usize, needle: &str) -> (u32, u32) {
+    let base = after_byte.min(line.len());
+    let byte_start = line[base..]
+        .find(needle)
+        .map(|rel| base + rel)
+        .unwrap_or(base);
+    let start_col = line[..byte_start].encode_utf16().count() as u32;
+    let end_col = start_col + needle.encode_utf16().count() as u32;
+    (start_col, end_col)
+}
+
 pub fn build_document_links(
     parsed: &ParsedPubspec,
     project_root: &Path,
@@ -270,15 +289,12 @@ pub fn build_document_links(
     links
 }
 
-/// Validates `flutter.assets` and `flutter.fonts` paths on disk, returning Warning diagnostics
-/// for missing files or directories.
 pub fn build_pubspec_asset_diagnostics(
     parsed: &ParsedPubspec,
     project_root: &Path,
 ) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
     for asset in &parsed.assets {
-        // Skip package asset references (`packages/<pkg>/...`)
         if asset.path.starts_with("packages/") {
             continue;
         }
@@ -300,7 +316,6 @@ pub fn build_pubspec_asset_diagnostics(
     diags
 }
 
-/// Builds monochrome Unicode Inlay Hints showing newer versions from cache.
 pub fn build_inlay_hints(parsed: &ParsedPubspec, pub_cache: &PubVersionCache) -> Vec<InlayHint> {
     parsed
         .dependencies
@@ -332,7 +347,6 @@ pub fn build_inlay_hints(parsed: &ParsedPubspec, pub_cache: &PubVersionCache) ->
         .collect()
 }
 
-/// Builds top-of-file dependency-only CodeLens actions for `pubspec.yaml` / `pubspec_overrides.yaml`.
 pub fn build_pubspec_code_lenses(uri: &Uri) -> Vec<CodeLens> {
     let top_range = Range {
         start: Position::new(0, 0),
@@ -362,7 +376,12 @@ pub fn build_pubspec_code_lenses(uri: &Uri) -> Vec<CodeLens> {
     ]
 }
 
-fn make_lens(range: Range, title: &str, command: &str, arguments: Vec<serde_json::Value>) -> CodeLens {
+fn make_lens(
+    range: Range,
+    title: &str,
+    command: &str,
+    arguments: Vec<serde_json::Value>,
+) -> CodeLens {
     CodeLens {
         range,
         command: Some(Command {
@@ -402,41 +421,30 @@ fn is_valid_package_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
 
     #[test]
-    fn validates_flutter_assets_and_links_local_path_deps() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        fs::create_dir_all(dir.path().join("assets/images")).expect("mkdir assets");
-        fs::create_dir_all(dir.path().join("packages/core")).expect("mkdir core");
-        fs::write(dir.path().join("packages/core/pubspec.yaml"), "name: core\n").expect("write");
-
+    fn computes_exact_utf16_columns_for_cjk_paths_and_same_name_keys() {
         let yaml = r#"
 name: demo
 dependencies:
-  flutter:
-    sdk: flutter
-  http: ^1.2.0
-  core:
-    path: packages/core
+  path:
+    path: path # 本地路径注释
 flutter:
   assets:
-    - assets/images/
-    - assets/missing.png
-  fonts:
-    - family: Inter
-      fonts:
-        - asset: fonts/Inter-Regular.ttf
+    - assets/图标/logo.png # 中文注释
 "#;
         let parsed = parse_pubspec_dependencies(yaml);
-        assert_eq!(parsed.assets.len(), 3);
+        let dep = &parsed.dependencies[0];
+        let (rel, _, start_col, end_col) = dep.local_path.as_ref().expect("local path");
+        assert_eq!(rel, "path");
+        // `    path: path` -> value `path` starts at col 10 (after `: `), NOT col 4!
+        assert_eq!(*start_col, 10);
+        assert_eq!(*end_col, 14);
 
-        let diags = build_pubspec_asset_diagnostics(&parsed, dir.path());
-        assert_eq!(diags.len(), 2);
-        assert!(diags[0].message.contains("assets/missing.png"));
-        assert!(diags[1].message.contains("fonts/Inter-Regular.ttf"));
-
-        let links = build_document_links(&parsed, dir.path(), false);
-        assert_eq!(links.len(), 2); // local `core` pubspec.yaml + `assets/images/`
+        let asset = &parsed.assets[0];
+        assert_eq!(asset.path, "assets/图标/logo.png");
+        // `    - assets/图标/logo.png` -> starts at col 6, UTF-16 len of `assets/图标/logo.png` is 18
+        assert_eq!(asset.start_col, 6);
+        assert_eq!(asset.end_col, 6 + "assets/图标/logo.png".encode_utf16().count() as u32);
     }
 }

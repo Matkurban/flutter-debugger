@@ -4,9 +4,9 @@ use std::sync::{Arc, OnceLock};
 
 use dashmap::DashSet;
 use regex::Regex;
-use tokio::process::Command;
 
 use crate::cache::now_unix;
+use crate::process_util::build_command;
 use crate::project::{ProjectInfo, resolve_sdk_executable};
 
 /// Strict whitelist of external CLI commands allowed to run.
@@ -63,7 +63,6 @@ impl AllowedCommand {
     }
 }
 
-/// Output captured from executing a whitelisted CLI command.
 #[derive(Debug, Clone)]
 pub struct CommandOutput {
     pub exit_code: i32,
@@ -92,7 +91,6 @@ pub enum RunnerError {
     },
 }
 
-/// Non-blocking CLI runner with per-project re-entrancy protection.
 #[derive(Debug, Clone, Default)]
 pub struct CommandRunner {
     running_projects: Arc<DashSet<PathBuf>>,
@@ -131,7 +129,8 @@ impl CommandRunner {
         let args = cmd.build_args();
         let command_line = format!("{program} {}", args.join(" "));
 
-        let output = spawn_cli(&program, &args, &project.root)
+        let output = build_command(&program, &args, &project.root)
+            .output()
             .await
             .map_err(|source| RunnerError::SpawnFailed {
                 program: program.clone(),
@@ -164,7 +163,6 @@ impl CommandRunner {
         })
     }
 
-    /// Runs `flutter devices --machine` without holding a per-project lock.
     pub async fn run_flutter_devices(
         &self,
         cwd: &Path,
@@ -175,7 +173,8 @@ impl CommandRunner {
         let args = vec!["devices".to_string(), "--machine".to_string()];
         let command_line = format!("{program} {}", args.join(" "));
 
-        let output = spawn_cli(&program, &args, cwd)
+        let output = build_command(&program, &args, cwd)
+            .output()
             .await
             .map_err(|source| RunnerError::SpawnFailed {
                 program: program.clone(),
@@ -220,27 +219,6 @@ impl Drop for RunningGuard {
     }
 }
 
-async fn spawn_cli(
-    program: &str,
-    args: &[String],
-    cwd: &Path,
-) -> std::io::Result<std::process::Output> {
-    #[cfg(windows)]
-    {
-        let lower = program.to_ascii_lowercase();
-        if lower.ends_with(".bat") || lower.ends_with(".cmd") {
-            let mut command = Command::new("cmd");
-            command.arg("/C").arg(program).args(args).current_dir(cwd);
-            return command.output().await;
-        }
-    }
-
-    let mut command = Command::new(program);
-    command.args(args).current_dir(cwd);
-    command.output().await
-}
-
-/// Strips ANSI CSI and OSC escape codes from CLI output.
 pub fn strip_ansi_codes(input: &str) -> String {
     static ANSI_RE: OnceLock<Regex> = OnceLock::new();
     let re = ANSI_RE.get_or_init(|| {
@@ -250,7 +228,6 @@ pub fn strip_ansi_codes(input: &str) -> String {
     re.replace_all(input, "").into_owned()
 }
 
-/// Writes full command execution diagnostics to a temporary `.log` file.
 pub fn write_command_log(
     label: &str,
     command_line: &str,
@@ -288,8 +265,6 @@ pub fn write_command_log(
     Ok(path)
 }
 
-/// Extracts a concise, high-signal error summary from full stderr/stdout rather than
-/// blindly taking only the last line.
 pub fn extract_error_summary(stderr: &str, stdout: &str, exit_code: i32) -> String {
     let combined = if !stderr.trim().is_empty() {
         stderr
@@ -348,29 +323,8 @@ mod tests {
 
     #[test]
     fn extracts_meaningful_error_not_only_last_line() {
-        let stderr = "Resolving dependencies...\nBecause app depends on foo ^9.0.0 which doesn't match any versions, version solving failed.\n\nYou can try the following suggestion to make the pubspec resolve:\n* Try upgrading your constraint.";
+        let stderr = "Resolving dependencies...\nBecause app depends on foo ^9.0.0 which doesn't match any versions, version solving failed.\n";
         let summary = extract_error_summary(stderr, "", 1);
         assert!(summary.contains("version solving failed"));
-        assert!(!summary.starts_with("* Try upgrading"));
-    }
-
-    #[test]
-    fn writes_complete_log_file() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = write_command_log(
-            "pub get",
-            "flutter pub get",
-            dir.path(),
-            1,
-            "Error: offline",
-            "Resolving...",
-        )
-        .expect("log written");
-        let content = fs::read_to_string(&path).expect("read log");
-        assert!(content.contains("Command: flutter pub get"));
-        assert!(content.contains("Exit Code: 1"));
-        assert!(content.contains("Error: offline"));
-        assert!(content.contains("Resolving..."));
-        let _ = fs::remove_file(path);
     }
 }

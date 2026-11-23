@@ -1,8 +1,11 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
+
+const MAX_WS_FRAME_BYTES: u64 = 32 * 1024 * 1024; // 32 MiB cap to prevent OOM on malformed frames
 
 /// Lightweight, zero-dependency RFC 6455 loopback WebSocket client for Dart VM Service JSON-RPC 2.0.
 pub struct VmServiceClient {
@@ -10,17 +13,9 @@ pub struct VmServiceClient {
     next_id: u64,
 }
 
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub struct ReloadOutcome {
-    pub success: bool,
-    pub duration_ms: u64,
-    pub message: String,
-}
-
 impl VmServiceClient {
-    /// Connects to a Dart VM Service WebSocket URI (e.g. `ws://localhost:50000/abc/ws`
-    /// or `http://localhost:50000/abc/`).
+    /// Connects to a Dart VM Service WebSocket URI (`ws://...` or `http://...`).
+    /// Rejects `wss://` / `https://` explicitly since TLS is not supported on this loopback client.
     pub async fn connect(uri: &str) -> Result<Self, String> {
         let ws_uri = normalize_to_ws_uri(uri)?;
         let parsed =
@@ -57,29 +52,36 @@ impl VmServiceClient {
             .map_err(|e| format!("Failed to send WebSocket handshake: {e}"))?;
 
         let mut reader = BufReader::new(stream);
-        let mut status_line = String::new();
-        tokio::time::timeout(Duration::from_secs(3), reader.read_line(&mut status_line))
-            .await
-            .map_err(|_| "Timed out waiting for WebSocket handshake".to_string())?
-            .map_err(|e| format!("WebSocket handshake read error: {e}"))?;
 
-        if !status_line.contains("101") {
-            return Err(format!(
-                "VM Service rejected WebSocket upgrade: {}",
-                status_line.trim()
-            ));
-        }
-
-        loop {
-            let mut header = String::new();
-            let n = reader
-                .read_line(&mut header)
+        // Wrap the ENTIRE HTTP upgrade response read in a single 3s timeout
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let mut status_line = String::new();
+            reader
+                .read_line(&mut status_line)
                 .await
-                .map_err(|e| format!("Handshake header read error: {e}"))?;
-            if n == 0 || header.trim().is_empty() {
-                break;
+                .map_err(|e| format!("WebSocket handshake read error: {e}"))?;
+
+            if !status_line.contains("101") {
+                return Err(format!(
+                    "VM Service rejected WebSocket upgrade: {}",
+                    status_line.trim()
+                ));
             }
-        }
+
+            loop {
+                let mut header = String::new();
+                let n = reader
+                    .read_line(&mut header)
+                    .await
+                    .map_err(|e| format!("Handshake header read error: {e}"))?;
+                if n == 0 || header.trim().is_empty() {
+                    break;
+                }
+            }
+            Ok::<(), String>(())
+        })
+        .await
+        .map_err(|_| "Timed out waiting for WebSocket handshake".to_string())??;
 
         Ok(Self {
             stream: reader,
@@ -98,7 +100,7 @@ impl VmServiceClient {
             "params": params
         });
         let text = serde_json::to_string(&req).map_err(|e| e.to_string())?;
-        write_ws_text_frame(self.stream.get_mut(), &text).await?;
+        write_ws_frame(self.stream.get_mut(), 0x1, text.as_bytes()).await?;
 
         let deadline = Instant::now() + Duration::from_secs(12);
         loop {
@@ -175,47 +177,6 @@ impl VmServiceClient {
         self.call(method, Value::Object(obj)).await
     }
 
-    #[allow(dead_code)]
-    pub async fn hot_reload(&mut self) -> Result<ReloadOutcome, String> {
-        let start = Instant::now();
-        let isolate_id = self.get_main_isolate_id().await?;
-        let report = self
-            .call("reloadSources", json!({ "isolateId": isolate_id }))
-            .await?;
-
-        let success = report
-            .get("success")
-            .and_then(Value::as_bool)
-            .unwrap_or(true);
-
-        if success {
-            let _ = self
-                .call("ext.flutter.reassemble", json!({ "isolateId": isolate_id }))
-                .await;
-            let ms = start.elapsed().as_millis() as u64;
-            Ok(ReloadOutcome {
-                success: true,
-                duration_ms: ms,
-                message: format!("Hot Reload: {ms}ms"),
-            })
-        } else {
-            let notice = report
-                .get("details")
-                .and_then(|d| d.get("notices"))
-                .and_then(Value::as_array)
-                .and_then(|arr| arr.first())
-                .and_then(|n| n.get("message"))
-                .and_then(Value::as_str)
-                .unwrap_or("Reload failed (compilation error)");
-            let ms = start.elapsed().as_millis() as u64;
-            Ok(ReloadOutcome {
-                success: false,
-                duration_ms: ms,
-                message: format!("Hot Reload failed: {notice}"),
-            })
-        }
-    }
-
     pub async fn capture_screenshot_png(&mut self) -> Result<Vec<u8>, String> {
         let result = self.call("_flutter.screenshot", json!({})).await?;
         let b64 = result
@@ -231,7 +192,7 @@ pub fn normalize_to_ws_uri(uri: &str) -> Result<String, String> {
     let mut parsed =
         url::Url::parse(trimmed).map_err(|e| format!("Invalid URI `{trimmed}`: {e}"))?;
     match parsed.scheme() {
-        "ws" | "wss" => Ok(parsed.to_string()),
+        "ws" => Ok(parsed.to_string()),
         "http" => {
             let _ = parsed.set_scheme("ws");
             if !parsed.path().ends_with("/ws") {
@@ -240,24 +201,32 @@ pub fn normalize_to_ws_uri(uri: &str) -> Result<String, String> {
             }
             Ok(parsed.to_string())
         }
-        "https" => {
-            let _ = parsed.set_scheme("wss");
-            if !parsed.path().ends_with("/ws") {
-                let path = parsed.path().trim_end_matches('/');
-                parsed.set_path(&format!("{path}/ws"));
-            }
-            Ok(parsed.to_string())
-        }
+        "wss" | "https" => Err(format!(
+            "TLS scheme `{}` is not supported by the local loopback VM Service client",
+            parsed.scheme()
+        )),
         other => Err(format!("Unsupported VM Service URI scheme `{other}`")),
     }
 }
 
 fn make_ws_nonce() -> [u8; 16] {
+    static SEQ: AtomicU64 = AtomicU64::new(1);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0x1234_5678_9abc_def0);
-    nanos.to_le_bytes()
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed) as u128;
+    (nanos ^ (seq << 64)).to_le_bytes()
+}
+
+fn make_mask_key() -> [u8; 4] {
+    static MASK_SEQ: AtomicU64 = AtomicU64::new(0x9e37_79b9);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x5a5a_a5a5);
+    let mixed = nanos ^ MASK_SEQ.fetch_add(0x7f4a_7c15, Ordering::Relaxed);
+    (mixed as u32).to_le_bytes()
 }
 
 fn encode_base64(input: &[u8]) -> String {
@@ -321,12 +290,10 @@ fn decode_base64(input: &str) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-async fn write_ws_text_frame(stream: &mut TcpStream, text: &str) -> Result<(), String> {
-    let payload = text.as_bytes();
-    let mask_key: [u8; 4] = [0x37, 0xfa, 0x21, 0x3d];
-
+async fn write_ws_frame(stream: &mut TcpStream, opcode: u8, payload: &[u8]) -> Result<(), String> {
+    let mask_key = make_mask_key();
     let mut frame = Vec::with_capacity(payload.len() + 14);
-    frame.push(0x81);
+    frame.push(0x80 | (opcode & 0x0f));
 
     let len = payload.len();
     if len < 126 {
@@ -385,6 +352,12 @@ async fn read_ws_text_frame(reader: &mut BufReader<TcpStream>) -> Result<String,
             payload_len = u64::from_be_bytes(ext);
         }
 
+        if payload_len > MAX_WS_FRAME_BYTES {
+            return Err(format!(
+                "WebSocket frame size ({payload_len} bytes) exceeds 32 MiB safety limit"
+            ));
+        }
+
         let mask = if masked {
             let mut m = [0u8; 4];
             reader
@@ -411,12 +384,15 @@ async fn read_ws_text_frame(reader: &mut BufReader<TcpStream>) -> Result<String,
         match opcode {
             0x8 => return Err("VM Service closed WebSocket connection".to_string()),
             0x9 => {
-                let pong = [0x8au8, 0x80, 0, 0, 0, 0];
-                let _ = reader.get_mut().write_all(&pong).await;
+                // RFC 6455: Pong MUST echo the exact Ping payload with client masking
+                let _ = write_ws_frame(reader.get_mut(), 0xa, &data).await;
                 continue;
             }
             0xa => continue,
             0x1 | 0x0 => {
+                if assembled.len() as u64 + data.len() as u64 > MAX_WS_FRAME_BYTES {
+                    return Err("Assembled WebSocket message exceeds 32 MiB limit".to_string());
+                }
                 assembled.extend_from_slice(&data);
                 if fin {
                     return String::from_utf8(assembled)
@@ -434,24 +410,13 @@ mod tests {
     use tokio::net::TcpListener;
 
     #[test]
-    fn normalizes_http_and_ws_uris() {
+    fn normalizes_http_and_rejects_wss() {
         assert_eq!(
             normalize_to_ws_uri("http://localhost:50000/abc/").expect("ws"),
             "ws://localhost:50000/abc/ws"
         );
-        assert_eq!(
-            normalize_to_ws_uri("ws://localhost:50000/abc/ws").expect("ws"),
-            "ws://localhost:50000/abc/ws"
-        );
-    }
-
-    #[test]
-    fn roundtrips_base64() {
-        let encoded = encode_base64(b"Flutter VM Service");
-        assert_eq!(
-            decode_base64(&encoded).expect("decode"),
-            b"Flutter VM Service"
-        );
+        assert!(normalize_to_ws_uri("wss://localhost:50000/abc/ws").is_err());
+        assert!(normalize_to_ws_uri("https://localhost:50000/abc/").is_err());
     }
 
     #[tokio::test]

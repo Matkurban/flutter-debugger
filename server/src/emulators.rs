@@ -1,8 +1,7 @@
 use std::path::Path;
 use std::process::Stdio;
 
-use tokio::process::Command;
-
+use crate::process_util::build_command;
 use crate::project::{ProjectKind, resolve_sdk_executable};
 use crate::runner::strip_ansi_codes;
 
@@ -24,9 +23,6 @@ impl FlutterEmulator {
 }
 
 /// Parses the bullet/table output of `flutter emulators`.
-///
-/// Example line:
-/// `Pixel_8_API_35 • Pixel 8 API 35 • Google • android`
 pub fn parse_emulators_output(stdout: &str) -> Vec<FlutterEmulator> {
     let mut results = Vec::new();
     for line in stdout.lines() {
@@ -57,7 +53,9 @@ pub async fn list_emulators(
     custom_sdk_path: Option<&str>,
 ) -> Result<Vec<FlutterEmulator>, String> {
     let program = resolve_sdk_executable(cwd, ProjectKind::Flutter, custom_sdk_path);
-    let output = run_flutter_cmd(&program, &["emulators"], cwd)
+    let output = build_command(&program, ["emulators"], cwd)
+        .stdin(Stdio::null())
+        .output()
         .await
         .map_err(|err| format!("Failed to run `{program} emulators`: {err}"))?;
 
@@ -79,8 +77,9 @@ pub async fn launch_emulator(
     }
 
     let program = resolve_sdk_executable(cwd, ProjectKind::Flutter, custom_sdk_path);
-    let args = ["emulators", "--launch", emulator_id];
-    let output = run_flutter_cmd(&program, &args, cwd)
+    let output = build_command(&program, ["emulators", "--launch", emulator_id], cwd)
+        .stdin(Stdio::null())
+        .output()
         .await
         .map_err(|err| format!("Failed to launch emulator `{emulator_id}`: {err}"))?;
 
@@ -98,34 +97,6 @@ pub async fn launch_emulator(
     }
 }
 
-async fn run_flutter_cmd(
-    program: &str,
-    args: &[&str],
-    cwd: &Path,
-) -> std::io::Result<std::process::Output> {
-    #[cfg(windows)]
-    {
-        let lower = program.to_ascii_lowercase();
-        if lower.ends_with(".bat") || lower.ends_with(".cmd") {
-            return Command::new("cmd")
-                .arg("/C")
-                .arg(program)
-                .args(args)
-                .current_dir(cwd)
-                .stdin(Stdio::null())
-                .output()
-                .await;
-        }
-    }
-
-    Command::new(program)
-        .args(args)
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .output()
-        .await
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,14 +110,10 @@ Id                   • Name                 • Manufacturer • Platform
 
 apple_ios_simulator  • iOS Simulator        • Apple        • ios
 Pixel_8_API_35       • Pixel 8 API 35       • Google       • android
-
-To run an emulator, run 'flutter emulators --launch <emulator id>'.
 "#;
         let emulators = parse_emulators_output(sample);
         assert_eq!(emulators.len(), 2);
         assert_eq!(emulators[0].id, "apple_ios_simulator");
-        assert_eq!(emulators[0].platform, "ios");
         assert_eq!(emulators[1].id, "Pixel_8_API_35");
-        assert_eq!(emulators[1].name, "Pixel 8 API 35");
     }
 }

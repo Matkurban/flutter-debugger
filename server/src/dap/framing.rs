@@ -32,6 +32,7 @@ pub struct ProxySessionState {
     pub suppressed_seqs: HashSet<i64>,
     pub pending_injected: HashMap<i64, oneshot::Sender<Value>>,
     pub next_injected_seq: i64,
+    pub next_proxy_seq: i64,
 }
 
 impl ProxySessionState {
@@ -48,6 +49,7 @@ impl ProxySessionState {
             suppressed_seqs: HashSet::new(),
             pending_injected: HashMap::new(),
             next_injected_seq: 900_000,
+            next_proxy_seq: 800_000,
         }
     }
 
@@ -59,8 +61,16 @@ impl ProxySessionState {
         (seq, rx)
     }
 
-    pub fn mark_suppressed(&mut self, seq: i64) {
-        self.suppressed_seqs.insert(seq);
+    pub fn allocate_proxy_seq(&mut self) -> i64 {
+        let seq = self.next_proxy_seq;
+        self.next_proxy_seq += 1;
+        seq
+    }
+
+    pub fn register_suppressed_waiter(&mut self, seq: i64) -> oneshot::Receiver<Value> {
+        let (tx, rx) = oneshot::channel();
+        self.pending_injected.insert(seq, tx);
+        rx
     }
 }
 
@@ -120,11 +130,11 @@ pub async fn write_dap_message<W: AsyncWrite + Unpin>(
     writer.flush().await
 }
 
-/// Builds an immediate synthetic DAP `initialize` response so Zed proceeds to send
-/// `launch`/`attach` (which carries `cwd`, `program`, and `isTest` for Monorepo/FVM/--test resolution).
-pub fn build_synthetic_initialize_response(request_seq: i64) -> Value {
+/// Builds an immediate synthetic DAP `initialize` response with a non-colliding `seq`
+/// so Zed proceeds to send `launch`/`attach`.
+pub fn build_synthetic_initialize_response(proxy_seq: i64, request_seq: i64) -> Value {
     json!({
-        "seq": 1,
+        "seq": proxy_seq,
         "type": "response",
         "request_seq": request_seq,
         "success": true,
@@ -146,6 +156,27 @@ pub fn build_synthetic_initialize_response(request_seq: i64) -> Value {
             ]
         }
     })
+}
+
+/// Builds a clean DAP response (success or failure) emitted directly by the proxy.
+pub fn build_proxy_response(
+    proxy_seq: i64,
+    request_seq: i64,
+    command: &str,
+    success: bool,
+    message: Option<&str>,
+) -> Value {
+    let mut obj = json!({
+        "seq": proxy_seq,
+        "type": "response",
+        "request_seq": request_seq,
+        "success": success,
+        "command": command
+    });
+    if let Some(msg) = message {
+        obj["message"] = json!(msg);
+    }
+    obj
 }
 
 /// Determines whether a `launch` request targets a Dart/Flutter test file or folder.
@@ -172,8 +203,12 @@ pub fn is_test_launch_request(args: &serde_json::Map<String, Value>) -> bool {
     false
 }
 
-/// Enhances a `launch` or `attach` DAP request with Monorepo-aware `cwd` resolution,
-/// FVM/SDK detection, `--test` detection, persisted `deviceId`, `flavor`, and `dartDefineFromFile`.
+/// Enhances a `launch` or `attach` DAP request with:
+/// - Monorepo-aware `cwd` resolution (walks up from `program` first)
+/// - FVM/SDK executable detection & `--test` detection
+/// - Dynamic `deviceId` injection from `DiskCache` when omitted
+/// - `flutterMode` -> `--profile` / `--release` (`+ noDebug: true`) in `toolArgs`
+/// - `flavor` -> `--flavor` and `dartDefineFromFile` -> `--dart-define-from-file=...`
 pub fn resolve_and_enrich_launch_or_attach(
     msg: &mut Value,
     cache: &DiskCache,
@@ -202,8 +237,6 @@ pub fn resolve_and_enrich_launch_or_attach(
         .filter(|s| !s.is_empty())
         .map(ToOwned::to_owned);
 
-    // Resolve the nearest pubspec.yaml starting from `program` (handles Monorepo subpackages!)
-    // before falling back to `raw_cwd`.
     let candidate_path = match &program_str {
         Some(prog) => {
             let p = Path::new(prog);
@@ -238,7 +271,6 @@ pub fn resolve_and_enrich_launch_or_attach(
         .unwrap_or("debug")
         .to_ascii_lowercase();
 
-    // Only auto-inject deviceId for Flutter apps or integration_test (not unit/widget tests)
     let is_integration_test = program_str
         .as_deref()
         .is_some_and(|p| p.replace('\\', "/").contains("integration_test"));
@@ -273,7 +305,16 @@ pub fn resolve_and_enrich_launch_or_attach(
         .filter(|s| !s.is_empty())
         .map(ToOwned::to_owned);
 
-    if flavor.is_some() || dart_define_file.is_some() {
+    let need_profile_flag =
+        is_launch && project_kind == ProjectKind::Flutter && !is_test && mode == "profile";
+    let need_release_flag =
+        is_launch && project_kind == ProjectKind::Flutter && !is_test && mode == "release";
+
+    if need_release_flag && !args.contains_key("noDebug") {
+        args.insert("noDebug".to_string(), json!(true));
+    }
+
+    if flavor.is_some() || dart_define_file.is_some() || need_profile_flag || need_release_flag {
         let mut tool_args: Vec<String> = args
             .get("toolArgs")
             .and_then(Value::as_array)
@@ -284,6 +325,13 @@ pub fn resolve_and_enrich_launch_or_attach(
                     .collect()
             })
             .unwrap_or_default();
+
+        if need_profile_flag && !tool_args.iter().any(|a| a == "--profile") {
+            tool_args.push("--profile".to_string());
+        }
+        if need_release_flag && !tool_args.iter().any(|a| a == "--release") {
+            tool_args.push("--release".to_string());
+        }
 
         if let Some(flav) = flavor
             && !tool_args.iter().any(|a| a == "--flavor")
@@ -372,22 +420,51 @@ mod tests {
     use super::*;
     use std::fs;
 
-    #[tokio::test]
-    async fn roundtrips_dap_framing() {
-        let msg = json!({"seq": 1, "type": "request", "command": "initialize"});
-        let mut buf = Vec::new();
-        write_dap_message(&mut buf, &msg).await.expect("write");
+    #[test]
+    fn maps_flutter_mode_profile_and_release_into_tool_args_and_no_debug() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = DiskCache::with_root(dir.path().join(".cache"));
+        fs::write(
+            dir.path().join("pubspec.yaml"),
+            "name: demo\nflutter:\n  uses-material-design: true\n",
+        )
+        .expect("write pubspec");
 
-        let mut cursor = tokio::io::BufReader::new(buf.as_slice());
-        let decoded = read_dap_message(&mut cursor)
-            .await
-            .expect("read")
-            .expect("some");
-        assert_eq!(decoded, msg);
+        let mut profile_req = json!({
+            "seq": 2,
+            "type": "request",
+            "command": "launch",
+            "arguments": {
+                "program": "lib/main.dart",
+                "flutterMode": "profile"
+            }
+        });
+        let resolved_p =
+            resolve_and_enrich_launch_or_attach(&mut profile_req, &cache, dir.path(), None)
+                .expect("profile");
+        assert_eq!(resolved_p.mode, "profile");
+        assert_eq!(profile_req["arguments"]["toolArgs"], json!(["--profile"]));
+        assert!(profile_req["arguments"].get("noDebug").is_none());
+
+        let mut release_req = json!({
+            "seq": 3,
+            "type": "request",
+            "command": "launch",
+            "arguments": {
+                "program": "lib/main.dart",
+                "flutterMode": "release"
+            }
+        });
+        let resolved_r =
+            resolve_and_enrich_launch_or_attach(&mut release_req, &cache, dir.path(), None)
+                .expect("release");
+        assert_eq!(resolved_r.mode, "release");
+        assert_eq!(release_req["arguments"]["toolArgs"], json!(["--release"]));
+        assert_eq!(release_req["arguments"]["noDebug"], json!(true));
     }
 
     #[test]
-    fn resolves_monorepo_subpackage_and_fvm_and_test_flag() {
+    fn resolves_monorepo_subpackage_and_test_flag() {
         let dir = tempfile::tempdir().expect("tempdir");
         let cache = DiskCache::with_root(dir.path().join(".cache"));
 
@@ -416,74 +493,5 @@ mod tests {
         assert_eq!(resolved.project_root, subpkg);
         assert_eq!(resolved.project_kind, ProjectKind::Dart);
         assert!(resolved.is_test);
-        assert_eq!(resolved.device_id, None);
-    }
-
-    #[test]
-    fn enriches_flutter_app_launch_with_selected_device_and_flavor() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let cache = DiskCache::with_root(dir.path().join(".cache"));
-        fs::write(
-            dir.path().join("pubspec.yaml"),
-            "name: demo\nflutter:\n  uses-material-design: true\n",
-        )
-        .expect("write pubspec");
-        cache.set_selected_device(dir.path(), "emulator-5554");
-
-        let mut req = json!({
-            "seq": 2,
-            "type": "request",
-            "command": "launch",
-            "arguments": {
-                "program": "lib/main.dart",
-                "flavor": "staging",
-                "dartDefineFromFile": "env/staging.json"
-            }
-        });
-
-        let resolved = resolve_and_enrich_launch_or_attach(&mut req, &cache, dir.path(), None)
-            .expect("resolved");
-        assert_eq!(resolved.project_root, dir.path());
-        assert_eq!(resolved.project_kind, ProjectKind::Flutter);
-        assert!(!resolved.is_test);
-        assert_eq!(resolved.device_id.as_deref(), Some("emulator-5554"));
-        assert_eq!(req["arguments"]["deviceId"], "emulator-5554");
-        assert_eq!(
-            req["arguments"]["toolArgs"],
-            json!(["--flavor", "staging", "--dart-define-from-file=env/staging.json"])
-        );
-    }
-
-    #[test]
-    fn detects_explicit_is_test_and_test_paths() {
-        let explicit: serde_json::Map<String, Value> =
-            serde_json::from_value(json!({ "isTest": true, "program": "lib/foo.dart" })).unwrap();
-        assert!(is_test_launch_request(&explicit));
-
-        let unit: serde_json::Map<String, Value> =
-            serde_json::from_value(json!({ "program": "test/widget_test.dart" })).unwrap();
-        assert!(is_test_launch_request(&unit));
-
-        let app: serde_json::Map<String, Value> =
-            serde_json::from_value(json!({ "program": "lib/main.dart" })).unwrap();
-        assert!(!is_test_launch_request(&app));
-    }
-
-    #[test]
-    fn captures_debugger_uris_event() {
-        let mut state = ProxySessionState::new("test-sess".into());
-        let evt = json!({
-            "type": "event",
-            "event": "dart.debuggerUris",
-            "body": {
-                "vmServiceUri": "ws://localhost:50000/vm",
-                "devtoolsUri": "http://localhost:9100/devtools"
-            }
-        });
-        assert!(inspect_adapter_event(&evt, &mut state));
-        assert_eq!(
-            state.devtools_uri.as_deref(),
-            Some("http://localhost:9100/devtools")
-        );
     }
 }

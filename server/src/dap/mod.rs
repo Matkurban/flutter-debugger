@@ -8,19 +8,21 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
-use tokio::process::{Child, Command};
+use tokio::process::Child;
 use tokio::sync::{Mutex, mpsc};
 
 use crate::cache::{DiskCache, normalize_project_key, now_unix};
 use crate::dap::framing::{
-    ProxySessionState, build_synthetic_initialize_response, inspect_adapter_event,
-    read_dap_message, resolve_and_enrich_launch_or_attach, write_dap_message,
+    ProxySessionState, build_proxy_response, build_synthetic_initialize_response,
+    inspect_adapter_event, read_dap_message, resolve_and_enrich_launch_or_attach,
+    write_dap_message,
 };
 use crate::devtools::resolve_or_start_devtools_url;
 use crate::ipc::{
     ActiveSessionRecord, IpcRequest, IpcResponse, ServiceOverlay, generate_session_id,
     remove_session_record_by_id, write_session_record,
 };
+use crate::process_util::{build_command, terminate_child_tree};
 use crate::vm_service::VmServiceClient;
 
 /// Runs the enhanced DAP proxy between Zed (stdio) and `flutter`/`dart debug_adapter`.
@@ -44,7 +46,6 @@ pub async fn run_dap_proxy() -> Result<(), Box<dyn std::error::Error>> {
     let (to_adapter_tx, to_adapter_rx) = mpsc::channel::<Value>(128);
     let child_handle: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
 
-    // Task 1: Listen for local IPC commands from LSP / `ctl` CLI
     let ipc_state = Arc::clone(&state);
     let ipc_tx = to_adapter_tx.clone();
     let ipc_cache = cache.clone();
@@ -63,9 +64,9 @@ pub async fn run_dap_proxy() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // Main loop: read DAP messages from Zed stdin.
     let mut zed_stdin = BufReader::new(tokio::io::stdin());
     let mut saved_initialize: Option<Value> = None;
+    let mut pre_launch_queue: Vec<Value> = Vec::new();
     let mut child_spawned = false;
     let mut writer_task: Option<tokio::task::JoinHandle<()>> = None;
     let mut reader_task: Option<tokio::task::JoinHandle<()>> = None;
@@ -73,20 +74,38 @@ pub async fn run_dap_proxy() -> Result<(), Box<dyn std::error::Error>> {
 
     while let Ok(Some(mut msg)) = read_dap_message(&mut zed_stdin).await {
         let msg_type = msg.get("type").and_then(Value::as_str).unwrap_or_default();
-        let command = msg.get("command").and_then(Value::as_str).unwrap_or_default();
+        let command = msg
+            .get("command")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let req_seq = msg.get("seq").and_then(Value::as_i64).unwrap_or(1);
 
-        if !child_spawned && msg_type == "request" && command == "initialize" {
-            let req_seq = msg.get("seq").and_then(Value::as_i64).unwrap_or(1);
-            saved_initialize = Some(msg);
-            let synthetic = build_synthetic_initialize_response(req_seq);
-            let mut out = zed_stdout.lock().await;
-            if write_dap_message(&mut *out, &synthetic).await.is_err() {
+        if !child_spawned {
+            if msg_type == "request" && command == "initialize" {
+                saved_initialize = Some(msg);
+                let proxy_seq = state.lock().await.allocate_proxy_seq();
+                let synthetic = build_synthetic_initialize_response(proxy_seq, req_seq);
+                let mut out = zed_stdout.lock().await;
+                if write_dap_message(&mut *out, &synthetic).await.is_err() {
+                    break;
+                }
+                continue;
+            }
+
+            if msg_type == "request" && (command == "disconnect" || command == "terminate") {
+                let proxy_seq = state.lock().await.allocate_proxy_seq();
+                let resp = build_proxy_response(proxy_seq, req_seq, &command, true, None);
+                let mut out = zed_stdout.lock().await;
+                let _ = write_dap_message(&mut *out, &resp).await;
                 break;
             }
-            continue;
-        }
 
-        if !child_spawned && msg_type == "request" && (command == "launch" || command == "attach") {
+            if msg_type != "request" || (command != "launch" && command != "attach") {
+                pre_launch_queue.push(msg);
+                continue;
+            }
+
             let resolved = resolve_and_enrich_launch_or_attach(
                 &mut msg,
                 &cache,
@@ -111,7 +130,22 @@ pub async fn run_dap_proxy() -> Result<(), Box<dyn std::error::Error>> {
                 ),
             };
 
-            let mut child = spawn_debug_adapter(&executable, &proj_root, is_test)?;
+            let mut child = match spawn_debug_adapter(&executable, &proj_root, is_test) {
+                Ok(c) => c,
+                Err(err) => {
+                    let proxy_seq = state.lock().await.allocate_proxy_seq();
+                    let err_msg = format!(
+                        "Failed to start `{executable} debug_adapter` in `{}`: {err}",
+                        proj_root.display()
+                    );
+                    let resp =
+                        build_proxy_response(proxy_seq, req_seq, &command, false, Some(&err_msg));
+                    let mut out = zed_stdout.lock().await;
+                    let _ = write_dap_message(&mut *out, &resp).await;
+                    break;
+                }
+            };
+
             let child_stdin = child
                 .stdin
                 .take()
@@ -153,13 +187,13 @@ pub async fn run_dap_proxy() -> Result<(), Box<dyn std::error::Error>> {
                 while let Ok(Some(child_msg)) = read_dap_message(&mut reader).await {
                     let mut suppress = false;
                     if child_msg.get("type").and_then(Value::as_str) == Some("response")
-                        && let Some(req_seq) = child_msg.get("request_seq").and_then(Value::as_i64)
+                        && let Some(rseq) = child_msg.get("request_seq").and_then(Value::as_i64)
                     {
                         let mut guard = out_state.lock().await;
-                        if let Some(tx) = guard.pending_injected.remove(&req_seq) {
+                        if let Some(tx) = guard.pending_injected.remove(&rseq) {
                             let _ = tx.send(child_msg.clone());
                             suppress = true;
-                        } else if guard.suppressed_seqs.remove(&req_seq) {
+                        } else if guard.suppressed_seqs.remove(&rseq) {
                             suppress = true;
                         }
                     }
@@ -213,18 +247,28 @@ pub async fn run_dap_proxy() -> Result<(), Box<dyn std::error::Error>> {
             }));
 
             if let Some(init_msg) = saved_initialize.take() {
-                if let Some(init_seq) = init_msg.get("seq").and_then(Value::as_i64) {
-                    state.lock().await.mark_suppressed(init_seq);
-                }
+                let init_seq = init_msg.get("seq").and_then(Value::as_i64).unwrap_or(1);
+                let init_rx = state.lock().await.register_suppressed_waiter(init_seq);
                 if to_adapter_tx.send(init_msg).await.is_err() {
                     break;
                 }
+                let _ = tokio::time::timeout(Duration::from_secs(5), init_rx).await;
             }
 
             child_spawned = true;
+
+            if to_adapter_tx.send(msg).await.is_err() {
+                break;
+            }
+            for queued in pre_launch_queue.drain(..) {
+                if to_adapter_tx.send(queued).await.is_err() {
+                    break;
+                }
+            }
+            continue;
         }
 
-        if child_spawned && to_adapter_tx.send(msg).await.is_err() {
+        if to_adapter_tx.send(msg).await.is_err() {
             break;
         }
     }
@@ -251,26 +295,7 @@ fn spawn_debug_adapter(executable: &str, cwd: &Path, is_test: bool) -> std::io::
         args.push("--test");
     }
 
-    #[cfg(windows)]
-    {
-        let lower = executable.to_ascii_lowercase();
-        if lower.ends_with(".bat") || lower.ends_with(".cmd") {
-            let mut cmd = Command::new("cmd");
-            cmd.args(["/C", executable]);
-            cmd.args(&args);
-            return cmd
-                .current_dir(cwd)
-                .kill_on_drop(true)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::inherit())
-                .spawn();
-        }
-    }
-
-    Command::new(executable)
-        .args(&args)
-        .current_dir(cwd)
+    build_command(executable, &args, cwd)
         .kill_on_drop(true)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -575,9 +600,7 @@ async fn handle_ipc_connection(
                     args.push("-d".to_string());
                     args.push(d.to_string());
                 }
-                match Command::new(&exe)
-                    .args(&args)
-                    .current_dir(&project_root)
+                match build_command(&exe, &args, &project_root)
                     .output()
                     .await
                 {
@@ -747,30 +770,6 @@ impl Drop for SessionCleanupGuard {
     }
 }
 
-async fn terminate_child_tree(child: &mut Child) {
-    #[cfg(unix)]
-    if let Some(pid) = child.id() {
-        let _ = Command::new("pkill")
-            .args(["-TERM", "-P", &pid.to_string()])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await;
-    }
-
-    #[cfg(windows)]
-    if let Some(pid) = child.id() {
-        let _ = Command::new("taskkill")
-            .args(["/T", "/F", "/PID", &pid.to_string()])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await;
-    }
-
-    let _ = child.kill().await;
-    let _ = child.wait().await;
-}
 
 pub fn open_url_in_browser(url: &str) {
     #[cfg(target_os = "macos")]
