@@ -642,6 +642,7 @@ async fn cmd_run(args: &[String]) -> Result<(), String> {
         project_root: project.root.clone(),
         device_id: device_id.clone(),
         mode: mode.clone(),
+        terminated: false,
         app_id: None,
         vm_service_uri: None,
         devtools_uri: None,
@@ -653,6 +654,7 @@ async fn cmd_run(args: &[String]) -> Result<(), String> {
     let next_rpc_id = Arc::new(AtomicI64::new(1));
 
     persist_run_session(&cache, ipc_port, &run_state).await;
+    let session_id_for_stdout = session_id.clone();
     let _cleanup = RunSessionCleanupGuard {
         cache: cache.clone(),
         session_id,
@@ -773,6 +775,11 @@ async fn cmd_run(args: &[String]) -> Result<(), String> {
                                 "\x1b[1;32m[Flutter]\x1b[0m Application running. \x1b[2mPress r (Hot Reload), R (Hot Restart), d (DevTools), q (Quit) + Enter\x1b[0m"
                             );
                         }
+                        "app.stop" => {
+                            out_state.lock().await.terminated = true;
+                            remove_session_record_by_id(&out_cache, &session_id_for_stdout);
+                            println!("\x1b[33m[Flutter]\x1b[0m Application stopped.");
+                        }
                         "app.progress" => {
                             if let Some(message) =
                                 params.and_then(|p| p.get("message")).and_then(Value::as_str)
@@ -811,6 +818,8 @@ async fn cmd_run(args: &[String]) -> Result<(), String> {
             }
             buf.clear();
         }
+        out_state.lock().await.terminated = true;
+        remove_session_record_by_id(&out_cache, &session_id_for_stdout);
     });
 
     // Interactive keyboard controls (r / R / d / q) routed through the exact same RPC engine
@@ -955,6 +964,7 @@ struct RunSessionState {
     project_root: PathBuf,
     device_id: Option<String>,
     mode: String,
+    terminated: bool,
     app_id: Option<String>,
     vm_service_uri: Option<String>,
     devtools_uri: Option<String>,
@@ -966,6 +976,9 @@ struct RunSessionState {
 
 async fn persist_run_session(cache: &DiskCache, port: u16, state: &Arc<Mutex<RunSessionState>>) {
     let guard = state.lock().await;
+    if guard.terminated {
+        return;
+    }
     let record = ActiveSessionRecord {
         session_id: guard.session_id.clone(),
         project_root: normalize_project_key(&guard.project_root),
@@ -1184,7 +1197,11 @@ async fn handle_run_ipc(
             resp
         }
         Ok(IpcRequest::Stop) => {
-            let session_id = state.lock().await.session_id.clone();
+            let session_id = {
+                let mut g = state.lock().await;
+                g.terminated = true;
+                g.session_id.clone()
+            };
             remove_session_record_by_id(&cache, &session_id);
             let resp = IpcResponse {
                 ok: true,

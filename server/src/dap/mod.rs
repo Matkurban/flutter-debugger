@@ -14,8 +14,8 @@ use tokio::sync::{Mutex, Notify, mpsc};
 use crate::cache::{DiskCache, normalize_project_key, now_unix};
 use crate::dap::framing::{
     ProxySessionState, build_proxy_response, build_synthetic_initialize_response,
-    inspect_adapter_event, read_dap_message, resolve_and_enrich_launch_or_attach,
-    write_dap_message,
+    inspect_adapter_event, is_adapter_termination_event, read_dap_message,
+    resolve_and_enrich_launch_or_attach, write_dap_message,
 };
 use crate::devtools::resolve_or_start_devtools_url;
 use crate::ipc::{
@@ -227,11 +227,16 @@ pub async fn run_dap_proxy() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
 
+                    let is_terminating = is_adapter_termination_event(&child_msg);
                     let (updated, profile_info, current_project_root) = {
                         let mut guard = out_state.lock().await;
+                        if is_terminating {
+                            guard.terminated = true;
+                        }
                         let changed = inspect_adapter_event(&child_msg, &mut guard);
                         let proj_root = guard.project_root.clone();
-                        let info = if !profile_devtools_opened
+                        let info = if !guard.terminated
+                            && !profile_devtools_opened
                             && guard.mode == "profile"
                             && (guard.devtools_uri.is_some() || guard.vm_service_uri.is_some())
                         {
@@ -245,10 +250,12 @@ pub async fn run_dap_proxy() -> Result<(), Box<dyn std::error::Error>> {
                         } else {
                             None
                         };
-                        (changed, info, proj_root)
+                        (changed && !guard.terminated, info, proj_root)
                     };
 
-                    if updated {
+                    if is_terminating {
+                        remove_session_record_by_id(&out_cache, &session_id_for_reader);
+                    } else if updated {
                         persist_session(&out_cache, ipc_port, &out_state).await;
                     }
                     if let Some((root, dt, vm)) = profile_info
@@ -318,6 +325,10 @@ pub async fn run_dap_proxy() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
 
+        if msg_type == "request" && (command == "disconnect" || command == "terminate") {
+            state.lock().await.terminated = true;
+            remove_session_record_by_id(&cache, &session_id);
+        }
         state.lock().await.sync_from_zed_request(&msg);
         if to_adapter_tx.send(msg).await.is_err() {
             break;
@@ -515,7 +526,11 @@ async fn handle_ipc_connection(
         }
         Ok(IpcRequest::Stop) => {
             let (mode, dev, vm, dt) = snapshot_meta(&state).await;
-            let session_id = state.lock().await.session_id.clone();
+            let session_id = {
+                let mut g = state.lock().await;
+                g.terminated = true;
+                g.session_id.clone()
+            };
             // Remove disk session record FIRST so any immediate CodeLens refresh sees no active session.
             remove_session_record_by_id(&cache, &session_id);
             let resp = IpcResponse {
@@ -948,6 +963,9 @@ async fn snapshot_meta(
 
 async fn persist_session(cache: &DiskCache, port: u16, state: &Arc<Mutex<ProxySessionState>>) {
     let guard = state.lock().await;
+    if guard.terminated {
+        return;
+    }
     let Some(root) = &guard.project_root else {
         return;
     };
@@ -1235,5 +1253,44 @@ mod tests {
             "Session record must be removed before Stop IPC response returns"
         );
         server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn terminated_session_removes_record_and_prevents_resurrection_on_trailing_events() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = DiskCache::with_root(dir.path().join(".cache"));
+        let proj_root = dir.path().join("app");
+        std::fs::create_dir_all(&proj_root).expect("mkdir");
+
+        let session_id = "test-terminated-no-resurrect".to_string();
+        let state = Arc::new(Mutex::new(ProxySessionState::new(session_id.clone())));
+        {
+            let mut g = state.lock().await;
+            g.project_root = Some(proj_root);
+            g.mode = "debug".to_string();
+        }
+
+        persist_session(&cache, 54321, &state).await;
+        assert_eq!(list_active_sessions(&cache).len(), 1);
+
+        // Simulate receiving `terminated` / `flutter.appStop` from adapter when user closes app window
+        {
+            let mut g = state.lock().await;
+            g.terminated = true;
+        }
+        remove_session_record_by_id(&cache, &session_id);
+        assert!(list_active_sessions(&cache).is_empty());
+
+        // Simulate a trailing event (e.g. `output` with DevTools URL or `dart.debuggerUris`)
+        // trying to call `persist_session` after termination
+        {
+            let mut g = state.lock().await;
+            g.devtools_uri = Some("http://127.0.0.1:9100".to_string());
+        }
+        persist_session(&cache, 54321, &state).await;
+        assert!(
+            list_active_sessions(&cache).is_empty(),
+            "Terminated session must never be written back to disk"
+        );
     }
 }

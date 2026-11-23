@@ -877,12 +877,17 @@ impl LanguageServer for FlutterLspBackend {
         let handle = tokio::spawn(async move {
             let mut last_sig = compute_external_state_signature(&cache);
             loop {
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                tokio::time::sleep(Duration::from_millis(500)).await;
                 if docs.is_empty() {
                     continue;
                 }
                 let cur_sig = compute_external_state_signature(&cache);
                 if cur_sig != last_sig {
+                    tracing::debug!(
+                        "External Flutter session/device state changed ({} -> {}), refreshing CodeLens",
+                        last_sig,
+                        cur_sig
+                    );
                     last_sig = cur_sig;
                     let _ = client.send_request::<CodeLensRefresh>(()).await;
                 }

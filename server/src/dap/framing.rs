@@ -30,6 +30,7 @@ pub struct ProxySessionState {
     pub mode: String,
     pub device_id: Option<String>,
     pub is_test: bool,
+    pub terminated: bool,
     pub vm_service_uri: Option<String>,
     pub devtools_uri: Option<String>,
     pub overlays: OverlayState,
@@ -52,6 +53,7 @@ impl ProxySessionState {
             mode: "debug".to_string(),
             device_id: None,
             is_test: false,
+            terminated: false,
             vm_service_uri: None,
             devtools_uri: None,
             overlays: OverlayState::default(),
@@ -519,6 +521,33 @@ pub fn inspect_adapter_event(msg: &Value, state: &mut ProxySessionState) -> bool
     changed
 }
 
+/// Determines whether an incoming message from `flutter`/`dart debug_adapter` indicates
+/// that the application or debug session has terminated, exited, stopped, or failed to launch.
+pub fn is_adapter_termination_event(msg: &Value) -> bool {
+    match msg.get("type").and_then(Value::as_str) {
+        Some("event") => {
+            let event = msg.get("event").and_then(Value::as_str).unwrap_or_default();
+            if matches!(event, "terminated" | "exited" | "flutter.appStop") {
+                return true;
+            }
+            if event == "flutter.forwardedEvent" {
+                let inner = msg
+                    .get("body")
+                    .and_then(|b| b.get("event"))
+                    .and_then(Value::as_str);
+                return inner == Some("app.stop");
+            }
+            false
+        }
+        Some("response") => {
+            let cmd = msg.get("command").and_then(Value::as_str).unwrap_or_default();
+            let success = msg.get("success").and_then(Value::as_bool).unwrap_or(true);
+            matches!(cmd, "launch" | "attach") && !success
+        }
+        _ => false,
+    }
+}
+
 fn extract_local_devtools_url(text: &str) -> Option<String> {
     for token in text.split_whitespace() {
         let cleaned = token.trim_matches(|c: char| matches!(c, '(' | ')' | ',' | '.' | '"' | '\''));
@@ -854,5 +883,62 @@ mod tests {
             custom_req["arguments"]["debugExternalPackageLibraries"],
             json!(true)
         );
+    }
+
+    #[test]
+    fn detects_adapter_termination_events_and_failed_launches() {
+        assert!(is_adapter_termination_event(&json!({
+            "type": "event",
+            "event": "terminated"
+        })));
+        assert!(is_adapter_termination_event(&json!({
+            "type": "event",
+            "event": "exited",
+            "body": { "exitCode": 0 }
+        })));
+        assert!(is_adapter_termination_event(&json!({
+            "type": "event",
+            "event": "flutter.appStop",
+            "body": { "appId": "app-1" }
+        })));
+        assert!(is_adapter_termination_event(&json!({
+            "type": "event",
+            "event": "flutter.forwardedEvent",
+            "body": { "event": "app.stop", "params": { "appId": "app-1" } }
+        })));
+        assert!(is_adapter_termination_event(&json!({
+            "type": "response",
+            "command": "launch",
+            "success": false,
+            "message": "Build failed"
+        })));
+        assert!(is_adapter_termination_event(&json!({
+            "type": "response",
+            "command": "attach",
+            "success": false,
+            "message": "VM Service unreachable"
+        })));
+
+        // Non-terminating events (especially breakpoint `stopped` and `output`) must return false!
+        assert!(!is_adapter_termination_event(&json!({
+            "type": "event",
+            "event": "stopped",
+            "body": { "reason": "breakpoint", "threadId": 1 }
+        })));
+        assert!(!is_adapter_termination_event(&json!({
+            "type": "event",
+            "event": "output",
+            "body": { "output": "Lost connection to device.\n" }
+        })));
+        assert!(!is_adapter_termination_event(&json!({
+            "type": "event",
+            "event": "flutter.forwardedEvent",
+            "body": { "event": "app.progress" }
+        })));
+        assert!(!is_adapter_termination_event(&json!({
+            "type": "response",
+            "command": "launch",
+            "success": true
+        })));
     }
 }
