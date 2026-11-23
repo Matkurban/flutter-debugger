@@ -570,14 +570,15 @@ fn tokenize_dart(src: &str) -> Vec<Token> {
     let mut str_stack: Vec<ActiveString> = Vec::new();
 
     while i < len {
-        // Continue scanning a string literal if we're not inside `${...}` interpolation
-        if let Some(top) = str_stack.last().map(|s| s.interp_brace_depth)
-            && top == 0
+        // Case 1: Inside string literal content (not inside `${...}` interpolation)
+        if let Some(top_depth) = str_stack.last().map(|s| s.interp_brace_depth)
+            && top_depth == 0
         {
-            let active = str_stack.last_mut().unwrap();
-            let quote = active.quote;
-            let triple = active.triple;
-            let raw = active.raw;
+            let is_outermost = str_stack.len() == 1;
+            let (quote, triple, raw) = {
+                let top = str_stack.last().unwrap();
+                (top.quote, top.triple, top.raw)
+            };
 
             if triple {
                 if i + 2 < len
@@ -588,30 +589,47 @@ fn tokenize_dart(src: &str) -> Vec<Token> {
                     i += 3;
                     col_utf16 += 3;
                     let finished = str_stack.pop().unwrap();
-                    tokens.push(Token {
-                        kind: TokenKind::StringLit(finished.value),
-                        line: finished.start_line,
-                        end_col_utf16: col_utf16,
-                        byte_end: i,
-                    });
+                    if str_stack.is_empty() {
+                        tokens.push(Token {
+                            kind: TokenKind::StringLit(finished.value),
+                            line: finished.start_line,
+                            end_col_utf16: col_utf16,
+                            byte_end: i,
+                        });
+                    } else {
+                        let q = quote as char;
+                        let outer = &mut str_stack[0].value;
+                        outer.push(q);
+                        outer.push(q);
+                        outer.push(q);
+                    }
                     continue;
                 }
             } else if bytes[i] == quote {
                 i += 1;
                 col_utf16 += 1;
                 let finished = str_stack.pop().unwrap();
-                tokens.push(Token {
-                    kind: TokenKind::StringLit(finished.value),
-                    line: finished.start_line,
-                    end_col_utf16: col_utf16,
-                    byte_end: i,
-                });
+                if str_stack.is_empty() {
+                    tokens.push(Token {
+                        kind: TokenKind::StringLit(finished.value),
+                        line: finished.start_line,
+                        end_col_utf16: col_utf16,
+                        byte_end: i,
+                    });
+                } else {
+                    str_stack[0].value.push(quote as char);
+                }
                 continue;
             }
 
             if !raw && bytes[i] == b'\\' && i + 1 < len {
                 let esc = src[i + 1..].chars().next().unwrap();
-                active.value.push(esc);
+                if is_outermost {
+                    str_stack[0].value.push(esc);
+                } else {
+                    str_stack[0].value.push('\\');
+                    str_stack[0].value.push(esc);
+                }
                 i += 1 + esc.len_utf8();
                 if esc == '\n' {
                     line += 1;
@@ -624,7 +642,8 @@ fn tokenize_dart(src: &str) -> Vec<Token> {
 
             // Enter `${...}` string interpolation
             if !raw && bytes[i] == b'$' && i + 1 < len && bytes[i + 1] == b'{' {
-                active.interp_brace_depth = 1;
+                str_stack.last_mut().unwrap().interp_brace_depth = 1;
+                str_stack[0].value.push_str("${");
                 i += 2;
                 col_utf16 += 2;
                 continue;
@@ -634,10 +653,10 @@ fn tokenize_dart(src: &str) -> Vec<Token> {
             if ch == '\n' {
                 line += 1;
                 col_utf16 = 0;
-                active.value.push('\n');
+                str_stack[0].value.push('\n');
             } else if ch != '\r' {
                 col_utf16 += ch.len_utf16() as u32;
-                active.value.push(ch);
+                str_stack[0].value.push(ch);
             }
             i += ch.len_utf8();
             continue;
@@ -645,6 +664,110 @@ fn tokenize_dart(src: &str) -> Vec<Token> {
 
         let b = bytes[i];
 
+        // Case 2: Inside `${...}` interpolation — track nested quotes/braces/comments and
+        // append interpolation source text into the outermost string without emitting tokens.
+        if !str_stack.is_empty() {
+            if b == b'\n' {
+                line += 1;
+                col_utf16 = 0;
+                str_stack[0].value.push('\n');
+                i += 1;
+                continue;
+            }
+            if b == b'\r' {
+                i += 1;
+                continue;
+            }
+            if b == b'/' && i + 1 < len && bytes[i + 1] == b'/' {
+                while i < len && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            if b == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
+                i += 2;
+                col_utf16 += 2;
+                let mut depth = 1u32;
+                while i < len && depth > 0 {
+                    if bytes[i] == b'\n' {
+                        line += 1;
+                        col_utf16 = 0;
+                        i += 1;
+                    } else if bytes[i] == b'\r' {
+                        i += 1;
+                    } else if bytes[i] == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
+                        depth += 1;
+                        i += 2;
+                        col_utf16 += 2;
+                    } else if bytes[i] == b'*' && i + 1 < len && bytes[i + 1] == b'/' {
+                        depth -= 1;
+                        i += 2;
+                        col_utf16 += 2;
+                    } else {
+                        let ch = src[i..].chars().next().unwrap();
+                        i += ch.len_utf8();
+                        col_utf16 += ch.len_utf16() as u32;
+                    }
+                }
+                continue;
+            }
+            if b == b'{' {
+                str_stack.last_mut().unwrap().interp_brace_depth += 1;
+                str_stack[0].value.push('{');
+                i += 1;
+                col_utf16 += 1;
+                continue;
+            }
+            if b == b'}' {
+                str_stack.last_mut().unwrap().interp_brace_depth -= 1;
+                str_stack[0].value.push('}');
+                i += 1;
+                col_utf16 += 1;
+                continue;
+            }
+            let is_raw_str =
+                b == b'r' && i + 1 < len && (bytes[i + 1] == b'\'' || bytes[i + 1] == b'"');
+            if is_raw_str || b == b'\'' || b == b'"' {
+                let start_line = line;
+                if is_raw_str {
+                    str_stack[0].value.push('r');
+                    i += 1;
+                    col_utf16 += 1;
+                }
+                let quote = bytes[i];
+                let triple = i + 2 < len && bytes[i + 1] == quote && bytes[i + 2] == quote;
+                if triple {
+                    let q = quote as char;
+                    let outer = &mut str_stack[0].value;
+                    outer.push(q);
+                    outer.push(q);
+                    outer.push(q);
+                    i += 3;
+                    col_utf16 += 3;
+                } else {
+                    str_stack[0].value.push(quote as char);
+                    i += 1;
+                    col_utf16 += 1;
+                }
+                str_stack.push(ActiveString {
+                    quote,
+                    triple,
+                    raw: is_raw_str,
+                    start_line,
+                    value: String::new(),
+                    interp_brace_depth: 0,
+                });
+                continue;
+            }
+
+            let ch = src[i..].chars().next().unwrap();
+            i += ch.len_utf8();
+            col_utf16 += ch.len_utf16() as u32;
+            str_stack[0].value.push(ch);
+            continue;
+        }
+
+        // Case 3: Top-level Dart code (not inside any string)
         // Whitespace (`\r` does NOT increment UTF-16 column)
         if b == b'\n' {
             line += 1;
@@ -695,40 +818,6 @@ fn tokenize_dart(src: &str) -> Vec<Token> {
                     i += ch.len_utf8();
                     col_utf16 += ch.len_utf16() as u32;
                 }
-            }
-            continue;
-        }
-
-        // Track `{` / `}` inside `${...}` interpolation
-        if b == b'{'
-            && let Some(top) = str_stack.last_mut()
-            && top.interp_brace_depth > 0
-        {
-            top.interp_brace_depth += 1;
-            i += 1;
-            col_utf16 += 1;
-            tokens.push(Token {
-                kind: TokenKind::LBrace,
-                line,
-                end_col_utf16: col_utf16,
-                byte_end: i,
-            });
-            continue;
-        }
-        if b == b'}'
-            && let Some(top) = str_stack.last_mut()
-            && top.interp_brace_depth > 0
-        {
-            top.interp_brace_depth -= 1;
-            i += 1;
-            col_utf16 += 1;
-            if top.interp_brace_depth > 0 {
-                tokens.push(Token {
-                    kind: TokenKind::RBrace,
-                    line,
-                    end_col_utf16: col_utf16,
-                    byte_end: i,
-                });
             }
             continue;
         }
@@ -887,7 +976,7 @@ class MyWidget extends StatelessWidget {
     }
 
     #[test]
-    fn parses_nested_groups_and_multiline_tests() {
+    fn parses_nested_groups_and_interpolated_test_names() {
         let code = r#"
 void main() {
   group('Auth', () {
@@ -895,12 +984,17 @@ void main() {
       'logs in with ${'nested'}',
       (tester) async {},
     );
+    test('adds ${count} items', () {});
   });
 }
 "#;
         let info = parse_dart_syntax(code, true);
         assert_eq!(info.main_line, Some(1));
-        assert_eq!(info.tests.len(), 2);
+        assert_eq!(info.tests.len(), 3);
         assert_eq!(info.tests[0].full_name, "Auth");
+        assert_eq!(info.tests[1].local_name, "logs in with ${'nested'}");
+        assert_eq!(info.tests[1].full_name, "Auth logs in with ${'nested'}");
+        assert_eq!(info.tests[2].local_name, "adds ${count} items");
+        assert_eq!(info.tests[2].full_name, "Auth adds ${count} items");
     }
 }

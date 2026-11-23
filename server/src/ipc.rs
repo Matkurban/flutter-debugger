@@ -97,6 +97,13 @@ impl Default for OverlayState {
 }
 
 impl OverlayState {
+    /// Computes `(service_extension_method, params, status_label)` for toggling `overlay`
+    /// without mutating `self`. Commit via `toggle(overlay)` only after the RPC succeeds.
+    pub fn preview_toggle(&self, overlay: ServiceOverlay) -> (&'static str, Value, String) {
+        let mut preview = self.clone();
+        preview.toggle(overlay)
+    }
+
     /// Flips the requested overlay and returns `(service_extension_method, params, status_label)`.
     pub fn toggle(&mut self, overlay: ServiceOverlay) -> (&'static str, Value, String) {
         match overlay {
@@ -551,6 +558,24 @@ mod tests {
         let (_, params2, label2) = state.toggle(ServiceOverlay::BrightnessOverride);
         assert_eq!(params2["value"], "Brightness.light");
         assert!(label2.contains("Light"));
+    }
+
+    #[test]
+    fn overlay_state_preview_does_not_mutate_until_committed() {
+        let mut state = OverlayState::default();
+        assert!(!state.inspector);
+
+        let (method, params, label) = state.preview_toggle(ServiceOverlay::Inspector);
+        assert_eq!(method, "ext.flutter.inspector.show");
+        assert_eq!(params["enabled"], "true");
+        assert!(label.contains("ON"));
+        assert!(!state.inspector);
+
+        let (m2, p2, l2) = state.toggle(ServiceOverlay::Inspector);
+        assert_eq!(m2, method);
+        assert_eq!(p2, params);
+        assert_eq!(l2, label);
+        assert!(state.inspector);
     }
 
     #[test]

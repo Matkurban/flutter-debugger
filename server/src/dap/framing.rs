@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::oneshot;
 
-use crate::cache::DiskCache;
+use crate::cache::{DiskCache, now_unix};
 use crate::ipc::OverlayState;
 use crate::project::{ProjectKind, find_project_for_path, resolve_sdk_executable};
 
@@ -22,6 +22,7 @@ pub struct ResolvedAdapterTarget {
 
 pub struct ProxySessionState {
     pub session_id: String,
+    pub started_at: u64,
     pub project_root: Option<PathBuf>,
     pub mode: String,
     pub device_id: Option<String>,
@@ -39,6 +40,7 @@ impl ProxySessionState {
     pub fn new(session_id: String) -> Self {
         Self {
             session_id,
+            started_at: now_unix(),
             project_root: None,
             mode: "debug".to_string(),
             device_id: None,

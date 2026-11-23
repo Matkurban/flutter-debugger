@@ -17,10 +17,22 @@ pub struct ProgressHandle {
 }
 
 impl ProgressHandle {
-    pub async fn begin(client: Client, title: impl Into<String>, message: Option<String>) -> Self {
+    pub fn allocate_token() -> NumberOrString {
         let id = NEXT_TOKEN_ID.fetch_add(1, Ordering::Relaxed);
-        let token = NumberOrString::String(format!("flutter-debugger-{id}"));
+        NumberOrString::String(format!("flutter-debugger-{id}"))
+    }
 
+    pub async fn begin(client: Client, title: impl Into<String>, message: Option<String>) -> Self {
+        let token = Self::allocate_token();
+        Self::begin_with_token(client, token, title, message).await
+    }
+
+    pub async fn begin_with_token(
+        client: Client,
+        token: NumberOrString,
+        title: impl Into<String>,
+        message: Option<String>,
+    ) -> Self {
         let _ = client
             .send_request::<WorkDoneProgressCreate>(WorkDoneProgressCreateParams {
                 token: token.clone(),
@@ -68,9 +80,13 @@ impl ProgressHandle {
 
     pub async fn end(mut self, message: Option<String>) {
         self.ended = true;
-        self.client
+        Self::end_token(&self.client, self.token.clone(), message).await;
+    }
+
+    pub async fn end_token(client: &Client, token: NumberOrString, message: Option<String>) {
+        client
             .send_notification::<Progress>(ProgressParams {
-                token: self.token.clone(),
+                token,
                 value: ProgressParamsValue::WorkDone(WorkDoneProgress::End(WorkDoneProgressEnd {
                     message,
                 })),

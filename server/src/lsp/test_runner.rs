@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use dashmap::DashMap;
 use serde_json::Value;
@@ -8,7 +9,8 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::Mutex;
 use tower_lsp_server::Client;
 use tower_lsp_server::ls_types::{
-    Diagnostic, DiagnosticSeverity, MessageType, Position, Range, Uri, request::CodeLensRefresh,
+    Diagnostic, DiagnosticSeverity, MessageType, NumberOrString, Position, Range, Uri,
+    request::CodeLensRefresh,
 };
 
 use crate::lsp::dart_file::DartTestEntry;
@@ -31,17 +33,41 @@ pub enum TestFilter {
     NameRegex(String),
 }
 
-/// Tracks per-test outcomes and active per-URI test tasks (allowing clean cancellation
-/// when re-running tests on the same file).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug)]
+struct ActiveTestRun {
+    run_id: u64,
+    abort_handle: tokio::task::AbortHandle,
+    progress_token: NumberOrString,
+}
+
+/// Tracks per-test outcomes and active per-URI test tasks (with monotonic run IDs so
+/// cancelling an older run immediately ends its progress indicator and never clears a newer run).
+#[derive(Debug, Clone)]
 pub struct TestRunStore {
     by_file: Arc<DashMap<String, HashMap<String, TestStatus>>>,
-    active_runs: Arc<DashMap<String, tokio::task::AbortHandle>>,
+    active_runs: Arc<DashMap<String, ActiveTestRun>>,
+    next_run_id: Arc<AtomicU64>,
+}
+
+impl Default for TestRunStore {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TestRunStore {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            by_file: Arc::new(DashMap::new()),
+            active_runs: Arc::new(DashMap::new()),
+            next_run_id: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    pub fn allocate_run(&self) -> (u64, NumberOrString) {
+        let run_id = self.next_run_id.fetch_add(1, Ordering::Relaxed);
+        let token = ProgressHandle::allocate_token();
+        (run_id, token)
     }
 
     pub fn get_file_results(&self, uri: &Uri) -> HashMap<String, TestStatus> {
@@ -67,15 +93,36 @@ impl TestRunStore {
         }
     }
 
-    /// Cancels any previous in-flight test run for `uri` and registers the new task handle.
-    pub fn register_active_run(&self, uri: &Uri, handle: tokio::task::AbortHandle) {
-        if let Some(prev) = self.active_runs.insert(uri.as_str().to_string(), handle) {
-            prev.abort();
+    /// Cancels any previous in-flight test run for `uri`, ends its LSP progress indicator
+    /// immediately, and registers the new task handle with its monotonic `run_id`.
+    pub async fn register_active_run(
+        &self,
+        uri: &Uri,
+        run_id: u64,
+        abort_handle: tokio::task::AbortHandle,
+        progress_token: NumberOrString,
+        client: &Client,
+    ) {
+        let prev = self.active_runs.insert(
+            uri.as_str().to_string(),
+            ActiveTestRun {
+                run_id,
+                abort_handle,
+                progress_token,
+            },
+        );
+        if let Some(prev) = prev {
+            prev.abort_handle.abort();
+            ProgressHandle::end_token(client, prev.progress_token, Some("Cancelled".to_string()))
+                .await;
         }
     }
 
-    pub fn clear_active_run(&self, uri: &Uri) {
-        self.active_runs.remove(uri.as_str());
+    /// Clears the active run entry for `uri` ONLY if its stored `run_id` matches,
+    /// preventing a finishing/aborted older task from removing a newer task's handle.
+    pub fn clear_active_run(&self, uri: &Uri, run_id: u64) {
+        self.active_runs
+            .remove_if(uri.as_str(), |_, active| active.run_id == run_id);
     }
 }
 
@@ -89,6 +136,7 @@ pub struct MachineTestParser {
     pub total_started: usize,
     pub total_done: usize,
     pub failed_count: usize,
+    pub load_errors: Vec<String>,
     pub plain_output: Vec<String>,
 }
 
@@ -146,7 +194,11 @@ impl MachineTestParser {
                     } else {
                         format!("{}\n{}", err_msg.trim(), first_stack_line.trim())
                     };
-                    self.id_to_errors.entry(id).or_default().push(combined);
+                    if self.id_to_name.contains_key(&id) {
+                        self.id_to_errors.entry(id).or_default().push(combined);
+                    } else {
+                        self.load_errors.push(combined);
+                    }
                 }
             }
             "testDone" => {
@@ -200,8 +252,16 @@ pub fn summarize_test_exit(
     source_text: &str,
 ) -> (String, Option<Diagnostic>) {
     if exit_code != 0 && parser.total_done == 0 {
+        let mut combined_err_parts: Vec<String> = Vec::new();
+        if !parser.load_errors.is_empty() {
+            combined_err_parts.push(parser.load_errors.join("\n"));
+        }
+        if !stderr.trim().is_empty() {
+            combined_err_parts.push(stderr.trim().to_string());
+        }
+        let combined_err = combined_err_parts.join("\n");
         let plain_stdout = parser.plain_output.join("\n");
-        let summary = extract_error_summary(stderr, &plain_stdout, exit_code);
+        let summary = extract_error_summary(&combined_err, &plain_stdout, exit_code);
         let target_line = main_line.unwrap_or(0);
         let end_col = utf16_line_len(source_text, target_line);
         let diag = Diagnostic {
@@ -288,6 +348,8 @@ pub async fn run_tests_streaming(
     client: Client,
     store: TestRunStore,
     uri: Uri,
+    run_id: u64,
+    progress_token: NumberOrString,
     project: ProjectInfo,
     relative_path: String,
     filter: TestFilter,
@@ -327,8 +389,9 @@ pub async fn run_tests_streaming(
         args.push(dev.clone());
     }
 
-    let progress = ProgressHandle::begin(
+    let progress = ProgressHandle::begin_with_token(
         client.clone(),
+        progress_token,
         "Flutter Test",
         Some(format!("Running {relative_path}...")),
     )
@@ -343,7 +406,7 @@ pub async fn run_tests_streaming(
     {
         Ok(c) => c,
         Err(err) => {
-            store.clear_active_run(&uri);
+            store.clear_active_run(&uri, run_id);
             progress.end(Some("Failed to start".to_string())).await;
             client
                 .show_message(MessageType::ERROR, format!("Failed to spawn `{exe}`: {err}"))
@@ -353,7 +416,8 @@ pub async fn run_tests_streaming(
     };
 
     let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
-        store.clear_active_run(&uri);
+        store.clear_active_run(&uri, run_id);
+        progress.end(Some("Failed to capture output".to_string())).await;
         return;
     };
 
@@ -410,7 +474,7 @@ pub async fn run_tests_streaming(
     let _ = client.send_request::<CodeLensRefresh>(()).await;
 
     progress.end(Some(summary)).await;
-    store.clear_active_run(&uri);
+    store.clear_active_run(&uri, run_id);
 }
 
 #[cfg(test)]
@@ -433,6 +497,31 @@ mod tests {
         assert_eq!(d.range.start.line, 0);
         assert_eq!(d.range.end.character, 13);
         assert!(d.message.contains("Expected ';'"));
+    }
+
+    #[test]
+    fn captures_loading_phase_json_error_as_file_diagnostic() {
+        let mut parser = MachineTestParser::default();
+        parser.feed_line(
+            r#"{"test":{"id":0,"name":"loading test/app_test.dart"},"type":"testStart","time":10}"#,
+        );
+        parser.feed_line(
+            r#"{"testID":0,"error":"Failed to load \"test/app_test.dart\": Error: Undefined name 'foo'.","stackTrace":"","isFailure":false,"type":"error","time":25}"#,
+        );
+        parser.feed_line(
+            r#"{"testID":0,"result":"error","skipped":false,"hidden":false,"type":"testDone","time":26}"#,
+        );
+
+        assert_eq!(parser.total_done, 0);
+        assert_eq!(parser.load_errors.len(), 1);
+        assert!(parser.load_errors[0].contains("Undefined name 'foo'"));
+
+        let src = "void main() {\n  test('a', () {});\n}\n";
+        let (summary, diag) = summarize_test_exit(1, &parser, "", Some(0), src);
+        assert!(summary.contains("Failed"));
+        let d = diag.expect("load error diagnostic");
+        assert_eq!(d.severity, Some(DiagnosticSeverity::ERROR));
+        assert!(d.message.contains("Undefined name 'foo'"));
     }
 
     #[test]

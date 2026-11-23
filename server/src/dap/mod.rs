@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::process::Child;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, Notify, mpsc};
 
 use crate::cache::{DiskCache, normalize_project_key, now_unix};
 use crate::dap::framing::{
@@ -45,12 +45,15 @@ pub async fn run_dap_proxy() -> Result<(), Box<dyn std::error::Error>> {
 
     let (to_adapter_tx, to_adapter_rx) = mpsc::channel::<Value>(128);
     let child_handle: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
+    let stop_notify = Arc::new(Notify::new());
 
     let ipc_state = Arc::clone(&state);
     let ipc_tx = to_adapter_tx.clone();
     let ipc_cache = cache.clone();
     let ipc_child = Arc::clone(&child_handle);
     let ipc_sdk = custom_sdk.clone();
+    let ipc_stdout = Arc::clone(&zed_stdout);
+    let ipc_stop = Arc::clone(&stop_notify);
     let ipc_handle = tokio::spawn(async move {
         while let Ok((stream, _)) = ipc_listener.accept().await {
             let state_ref = Arc::clone(&ipc_state);
@@ -58,8 +61,20 @@ pub async fn run_dap_proxy() -> Result<(), Box<dyn std::error::Error>> {
             let cache_ref = ipc_cache.clone();
             let child_ref = Arc::clone(&ipc_child);
             let sdk_ref = ipc_sdk.clone();
+            let stdout_ref = Arc::clone(&ipc_stdout);
+            let stop_ref = Arc::clone(&ipc_stop);
             tokio::spawn(async move {
-                handle_ipc_connection(stream, state_ref, tx, cache_ref, child_ref, sdk_ref).await;
+                handle_ipc_connection(
+                    stream,
+                    state_ref,
+                    tx,
+                    cache_ref,
+                    child_ref,
+                    sdk_ref,
+                    stdout_ref,
+                    stop_ref,
+                )
+                .await;
             });
         }
     });
@@ -72,7 +87,14 @@ pub async fn run_dap_proxy() -> Result<(), Box<dyn std::error::Error>> {
     let mut reader_task: Option<tokio::task::JoinHandle<()>> = None;
     let mut to_adapter_rx_opt = Some(to_adapter_rx);
 
-    while let Ok(Some(mut msg)) = read_dap_message(&mut zed_stdin).await {
+    loop {
+        let next_msg = tokio::select! {
+            _ = stop_notify.notified() => break,
+            res = read_dap_message(&mut zed_stdin) => res,
+        };
+        let Ok(Some(mut msg)) = next_msg else {
+            break;
+        };
         let msg_type = msg.get("type").and_then(Value::as_str).unwrap_or_default();
         let command = msg
             .get("command")
@@ -350,6 +372,7 @@ async fn inject_and_await(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_ipc_connection(
     mut stream: tokio::net::TcpStream,
     state: Arc<Mutex<ProxySessionState>>,
@@ -357,6 +380,8 @@ async fn handle_ipc_connection(
     cache: DiskCache,
     child_handle: Arc<Mutex<Option<Child>>>,
     custom_sdk: Option<String>,
+    zed_stdout: Arc<Mutex<tokio::io::Stdout>>,
+    stop_notify: Arc<Notify>,
 ) {
     let (read_half, mut write_half) = stream.split();
     let mut reader = BufReader::new(read_half);
@@ -455,11 +480,8 @@ async fn handle_ipc_connection(
         }
         Ok(IpcRequest::Stop) => {
             let (mode, dev, vm, dt) = snapshot_meta(&state).await;
-            let _ = inject_and_await(&state, &to_adapter_tx, "terminate", json!({}), 3).await;
-            if let Some(mut child) = child_handle.lock().await.take() {
-                terminate_child_tree(&mut child).await;
-            }
-            IpcResponse {
+            let session_id = state.lock().await.session_id.clone();
+            let resp = IpcResponse {
                 ok: true,
                 message: "Stopped Flutter debug session".to_string(),
                 duration_ms: None,
@@ -467,7 +489,28 @@ async fn handle_ipc_connection(
                 device_id: dev,
                 vm_service_uri: vm,
                 devtools_uri: dt,
+            };
+            if let Ok(mut payload) = serde_json::to_string(&resp) {
+                payload.push('\n');
+                let _ = write_half.write_all(payload.as_bytes()).await;
+                let _ = write_half.flush().await;
             }
+            let _ = inject_and_await(&state, &to_adapter_tx, "terminate", json!({}), 3).await;
+            if let Some(mut child) = child_handle.lock().await.take() {
+                terminate_child_tree(&mut child).await;
+            }
+            let terminated_event = json!({
+                "seq": 0,
+                "type": "event",
+                "event": "terminated"
+            });
+            {
+                let mut out = zed_stdout.lock().await;
+                let _ = write_dap_message(&mut *out, &terminated_event).await;
+            }
+            remove_session_record_by_id(&cache, &session_id);
+            stop_notify.notify_waiters();
+            return;
         }
         Ok(IpcRequest::ToggleOverlay { overlay }) => {
             handle_overlay_toggle(&state, &to_adapter_tx, overlay).await
@@ -656,7 +699,7 @@ async fn handle_overlay_toggle(
     overlay: ServiceOverlay,
 ) -> IpcResponse {
     let (mode, dev, vm, dt, method, params, status_label) = {
-        let mut guard = state.lock().await;
+        let guard = state.lock().await;
         if guard.mode == "release" {
             return IpcResponse {
                 ok: false,
@@ -668,7 +711,7 @@ async fn handle_overlay_toggle(
                 devtools_uri: guard.devtools_uri.clone(),
             };
         }
-        let (m, p, label) = guard.overlays.toggle(overlay);
+        let (m, p, label) = guard.overlays.preview_toggle(overlay);
         (
             guard.mode.clone(),
             guard.device_id.clone(),
@@ -689,20 +732,24 @@ async fn handle_overlay_toggle(
     )
     .await
     {
-        Ok((_, ms)) => IpcResponse {
-            ok: true,
-            message: status_label,
-            duration_ms: Some(ms),
-            mode: Some(mode),
-            device_id: dev,
-            vm_service_uri: vm,
-            devtools_uri: dt,
-        },
+        Ok((_, ms)) => {
+            state.lock().await.overlays.toggle(overlay);
+            IpcResponse {
+                ok: true,
+                message: status_label,
+                duration_ms: Some(ms),
+                mode: Some(mode),
+                device_id: dev,
+                vm_service_uri: vm,
+                devtools_uri: dt,
+            }
+        }
         Err(dap_err) => {
             if let Some(vm_uri) = vm.as_deref()
                 && let Ok(mut client) = VmServiceClient::connect(vm_uri).await
                 && client.call_service_extension(method, params).await.is_ok()
             {
+                state.lock().await.overlays.toggle(overlay);
                 return IpcResponse {
                     ok: true,
                     message: status_label,
@@ -752,7 +799,7 @@ async fn persist_session(cache: &DiskCache, port: u16, state: &Arc<Mutex<ProxySe
         ipc_port: port,
         vm_service_uri: guard.vm_service_uri.clone(),
         devtools_uri: guard.devtools_uri.clone(),
-        started_at: now_unix(),
+        started_at: guard.started_at,
         is_test: guard.is_test,
         kind: "dap".to_string(),
     };

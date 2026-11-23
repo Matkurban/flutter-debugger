@@ -125,7 +125,8 @@ impl CommandRunner {
             key: lock_key,
         };
 
-        let program = resolve_sdk_executable(&project.root, project.kind, custom_sdk_path);
+        let sdk_kind = sdk_kind_for_command(project.kind, cmd);
+        let program = resolve_sdk_executable(&project.root, sdk_kind, custom_sdk_path);
         let args = cmd.build_args();
         let command_line = format!("{program} {}", args.join(" "));
 
@@ -311,6 +312,17 @@ pub fn extract_error_summary(stderr: &str, stdout: &str, exit_code: i32) -> Stri
     }
 }
 
+pub fn sdk_kind_for_command(
+    project_kind: crate::project::ProjectKind,
+    cmd: &AllowedCommand,
+) -> crate::project::ProjectKind {
+    if matches!(cmd, AllowedCommand::Doctor) {
+        crate::project::ProjectKind::Flutter
+    } else {
+        project_kind
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -326,5 +338,17 @@ mod tests {
         let stderr = "Resolving dependencies...\nBecause app depends on foo ^9.0.0 which doesn't match any versions, version solving failed.\n";
         let summary = extract_error_summary(stderr, "", 1);
         assert!(summary.contains("version solving failed"));
+    }
+
+    #[test]
+    fn doctor_always_uses_flutter_sdk_even_in_pure_dart_projects() {
+        assert_eq!(
+            sdk_kind_for_command(crate::project::ProjectKind::Dart, &AllowedCommand::Doctor),
+            crate::project::ProjectKind::Flutter
+        );
+        assert_eq!(
+            sdk_kind_for_command(crate::project::ProjectKind::Dart, &AllowedCommand::PubGet),
+            crate::project::ProjectKind::Dart
+        );
     }
 }

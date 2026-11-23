@@ -113,7 +113,7 @@ impl FlutterLspBackend {
         let daemon = FlutterDaemonManager::new(cache.clone(), Arc::clone(&devices));
 
         let http = reqwest::Client::builder()
-            .user_agent("flutter-debugger-zed/0.1.0")
+            .user_agent(concat!("flutter-debugger-zed/", env!("CARGO_PKG_VERSION")))
             .timeout(Duration::from_secs(10))
             .build()
             .unwrap_or_default();
@@ -684,10 +684,14 @@ impl LanguageServer for FlutterLspBackend {
         tracing::info!("flutter-debugger-server LSP initialized");
         let cache = self.cache.clone();
         let client = self.client.clone();
+        let docs = Arc::clone(&self.docs);
         let handle = tokio::spawn(async move {
             let mut last_sig = compute_external_state_signature(&cache);
             loop {
                 tokio::time::sleep(Duration::from_secs(1)).await;
+                if docs.is_empty() {
+                    continue;
+                }
                 let cur_sig = compute_external_state_signature(&cache);
                 if cur_sig != last_sig {
                     last_sig = cur_sig;
@@ -1195,12 +1199,16 @@ impl LanguageServer for FlutterLspBackend {
                     let client = self.client.clone();
                     let store = self.test_results.clone();
                     let uri_clone = uri.clone();
+                    let (run_id, progress_token) = self.test_results.allocate_run();
+                    let task_token = progress_token.clone();
 
                     let task = tokio::spawn(async move {
                         run_tests_streaming(
                             client,
                             store,
                             uri_clone,
+                            run_id,
+                            task_token,
                             project,
                             rel,
                             filter,
@@ -1213,7 +1221,14 @@ impl LanguageServer for FlutterLspBackend {
                         .await;
                     });
                     self.test_results
-                        .register_active_run(&uri, task.abort_handle());
+                        .register_active_run(
+                            &uri,
+                            run_id,
+                            task.abort_handle(),
+                            progress_token,
+                            &self.client,
+                        )
+                        .await;
                 }
             }
             "flutterDebugger.stopApp" => {

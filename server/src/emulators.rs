@@ -59,6 +59,19 @@ pub async fn list_emulators(
         .await
         .map_err(|err| format!("Failed to run `{program} emulators`: {err}"))?;
 
+    if !output.status.success() {
+        let stderr = strip_ansi_codes(&String::from_utf8_lossy(&output.stderr));
+        let stdout = strip_ansi_codes(&String::from_utf8_lossy(&output.stdout));
+        let detail = if !stderr.trim().is_empty() {
+            stderr.trim().to_string()
+        } else if !stdout.trim().is_empty() {
+            stdout.trim().to_string()
+        } else {
+            format!("exited with code {}", output.status.code().unwrap_or(-1))
+        };
+        return Err(format!("`{program} emulators` failed: {detail}"));
+    }
+
     let stdout = strip_ansi_codes(&String::from_utf8_lossy(&output.stdout));
     Ok(parse_emulators_output(&stdout))
 }

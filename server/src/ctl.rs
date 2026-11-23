@@ -151,20 +151,30 @@ fn parse_flag_value(args: &[String], long_name: &str, short_name: Option<&str>) 
     None
 }
 
+fn resolve_session_for_ctl(
+    cache: &DiskCache,
+    project_flag: Option<&Path>,
+    root: &Path,
+) -> Option<ActiveSessionRecord> {
+    if project_flag.is_some() {
+        find_latest_session(cache, Some(root))
+    } else {
+        find_latest_session(cache, Some(root)).or_else(|| find_latest_session(cache, None))
+    }
+}
+
 async fn send_simple_session_cmd(
     project_flag: Option<&Path>,
     request: IpcRequest,
 ) -> Result<(), String> {
     let cache = DiskCache::default_location();
     let root = resolve_project_root(project_flag);
-    let session = find_latest_session(&cache, Some(&root))
-        .or_else(|| find_latest_session(&cache, None))
-        .ok_or_else(|| {
-            format!(
-                "No active Flutter session found for `{}`. Start with F4 (Debug) or `ctl run`.",
-                root.display()
-            )
-        })?;
+    let session = resolve_session_for_ctl(&cache, project_flag, &root).ok_or_else(|| {
+        format!(
+            "No active Flutter session found for `{}`. Start with F4 (Debug) or `ctl run`.",
+            root.display()
+        )
+    })?;
 
     match send_ipc_to_session(&cache, &session, &request).await {
         Some(resp) if resp.ok => {
@@ -210,9 +220,8 @@ async fn cmd_devtools(args: &[String]) -> Result<(), String> {
     let page = parse_flag_value(args, "--page", None);
     let cache = DiskCache::default_location();
     let root = resolve_project_root(project_flag.as_deref());
-    let session = find_latest_session(&cache, Some(&root))
-        .or_else(|| find_latest_session(&cache, None))
-        .ok_or_else(|| "No active Flutter session found.".to_string())?;
+    let session = resolve_session_for_ctl(&cache, project_flag.as_deref(), &root)
+        .ok_or_else(|| format!("No active Flutter session found for `{}`." , root.display()))?;
 
     match send_ipc_to_session(
         &cache,
@@ -250,7 +259,7 @@ async fn cmd_devtools(args: &[String]) -> Result<(), String> {
 
 async fn cmd_overlay(args: &[String]) -> Result<(), String> {
     let project_flag = parse_project_flag(args);
-    let name = args.iter().find(|a| !a.starts_with('-')).ok_or_else(|| {
+    let name = first_positional_arg(args).ok_or_else(|| {
         "Missing overlay name. Choices: inspector, performance, debug-paint, baselines, repaint, slow-anim, banner, oversized, platform, brightness".to_string()
     })?;
 
@@ -266,7 +275,6 @@ async fn cmd_overlay(args: &[String]) -> Result<(), String> {
 async fn cmd_screenshot(args: &[String]) -> Result<(), String> {
     let project_flag = parse_project_flag(args);
     let out_flag = parse_flag_value(args, "--out", Some("-o"));
-    let root = resolve_project_root(project_flag.as_deref());
 
     let output_path = out_flag.map(|o| {
         let p = PathBuf::from(&o);
@@ -279,7 +287,7 @@ async fn cmd_screenshot(args: &[String]) -> Result<(), String> {
         }
     });
 
-    send_simple_session_cmd(Some(&root), IpcRequest::Screenshot { output_path }).await
+    send_simple_session_cmd(project_flag.as_deref(), IpcRequest::Screenshot { output_path }).await
 }
 
 async fn fetch_devices_live(root: &Path) -> Result<Vec<FlutterDevice>, String> {
@@ -411,29 +419,57 @@ async fn cmd_launch_emulator(args: &[String]) -> Result<(), String> {
 /// Drives `flutter run --machine` over structured JSON-RPC while rendering rich ANSI-colored
 /// output in Zed's native terminal, measuring real Hot Reload/Restart latency, supporting all
 /// Flutter Service Extensions, auto-opening Profile DevTools, and cleaning up on Ctrl+C / SIGTERM.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedRunArgs {
+    project_flag: Option<PathBuf>,
+    mode: String,
+    target: String,
+    flavor: Option<String>,
+    dart_define_from_file: Option<String>,
+    device_flag: Option<String>,
+    extra_args: Vec<String>,
+}
+
+fn parse_run_args(args: &[String]) -> ParsedRunArgs {
+    let dashdash_idx = args.iter().position(|a| a == "--");
+    let ctl_args = match dashdash_idx {
+        Some(idx) => &args[..idx],
+        None => args,
+    };
+    let extra_args = dashdash_idx
+        .map(|idx| args[idx + 1..].to_vec())
+        .unwrap_or_default();
+
+    ParsedRunArgs {
+        project_flag: parse_project_flag(ctl_args),
+        mode: parse_flag_value(ctl_args, "--mode", Some("-m"))
+            .unwrap_or_else(|| "debug".to_string())
+            .to_ascii_lowercase(),
+        target: parse_flag_value(ctl_args, "--target", Some("-t"))
+            .unwrap_or_else(|| "lib/main.dart".into()),
+        flavor: parse_flag_value(ctl_args, "--flavor", None),
+        dart_define_from_file: parse_flag_value(ctl_args, "--dart-define-from-file", None),
+        device_flag: parse_flag_value(ctl_args, "--device", Some("-d")),
+        extra_args,
+    }
+}
+
 async fn cmd_run(args: &[String]) -> Result<(), String> {
-    let project_flag = parse_project_flag(args);
-    let project = resolve_project_info(project_flag.as_deref())?;
+    let parsed = parse_run_args(args);
+    let project = resolve_project_info(parsed.project_flag.as_deref())?;
     if project.kind != ProjectKind::Flutter {
         return Err("`ctl run` is only supported for Flutter projects.".to_string());
     }
 
-    let mode = parse_flag_value(args, "--mode", Some("-m"))
-        .unwrap_or_else(|| "debug".to_string())
-        .to_ascii_lowercase();
-    let target =
-        parse_flag_value(args, "--target", Some("-t")).unwrap_or_else(|| "lib/main.dart".into());
-    let flavor = parse_flag_value(args, "--flavor", None);
-    let dart_define_from_file = parse_flag_value(args, "--dart-define-from-file", None);
+    let mode = parsed.mode;
+    let target = parsed.target;
+    let flavor = parsed.flavor;
+    let dart_define_from_file = parsed.dart_define_from_file;
     let cache = DiskCache::default_location();
-    let device_id = parse_flag_value(args, "--device", Some("-d"))
+    let device_id = parsed
+        .device_flag
         .or_else(|| cache.get_selected_device(&project.root));
-
-    let extra_args: Vec<String> = args
-        .iter()
-        .position(|a| a == "--")
-        .map(|idx| args[idx + 1..].to_vec())
-        .unwrap_or_default();
+    let extra_args = parsed.extra_args;
 
     let mode_flag = match mode.as_str() {
         "profile" => "--profile",
@@ -495,6 +531,7 @@ async fn cmd_run(args: &[String]) -> Result<(), String> {
     let session_id = generate_session_id();
     let run_state = Arc::new(Mutex::new(RunSessionState {
         session_id: session_id.clone(),
+        started_at: now_unix(),
         project_root: project.root.clone(),
         device_id: device_id.clone(),
         mode: mode.clone(),
@@ -805,6 +842,7 @@ fn print_reload_banner(resp: &IpcResponse) {
 
 struct RunSessionState {
     session_id: String,
+    started_at: u64,
     project_root: PathBuf,
     device_id: Option<String>,
     mode: String,
@@ -826,7 +864,7 @@ async fn persist_run_session(cache: &DiskCache, port: u16, state: &Arc<Mutex<Run
         ipc_port: port,
         vm_service_uri: guard.vm_service_uri.clone(),
         devtools_uri: guard.devtools_uri.clone(),
-        started_at: now_unix(),
+        started_at: guard.started_at,
         is_test: false,
         kind: "run".to_string(),
     };
@@ -1032,8 +1070,7 @@ async fn handle_run_ipc(
             resp
         }
         Ok(IpcRequest::Stop) => {
-            let _ = stop_tx.send(()).await;
-            IpcResponse {
+            let resp = IpcResponse {
                 ok: true,
                 message: "Stopping Flutter application...".to_string(),
                 duration_ms: None,
@@ -1041,11 +1078,14 @@ async fn handle_run_ipc(
                 device_id: None,
                 vm_service_uri: None,
                 devtools_uri: None,
-            }
+            };
+            write_ipc_resp(&mut write_half, &resp).await;
+            let _ = stop_tx.send(()).await;
+            return;
         }
         Ok(IpcRequest::ToggleOverlay { overlay }) => {
             let (mode, dev, vm, dt, app_id, method, params, label) = {
-                let mut g = state.lock().await;
+                let g = state.lock().await;
                 if g.mode == "release" {
                     write_ipc_resp(
                         &mut write_half,
@@ -1054,7 +1094,7 @@ async fn handle_run_ipc(
                     .await;
                     return;
                 }
-                let (m, p, l) = g.overlays.toggle(overlay);
+                let (m, p, l) = g.overlays.preview_toggle(overlay);
                 (
                     g.mode.clone(),
                     g.device_id.clone(),
@@ -1087,6 +1127,7 @@ async fn handle_run_ipc(
             };
 
             if let Some((_, ms)) = rpc_ok {
+                state.lock().await.overlays.toggle(overlay);
                 IpcResponse {
                     ok: true,
                     message: label,
@@ -1100,6 +1141,7 @@ async fn handle_run_ipc(
                 && let Ok(mut client) = VmServiceClient::connect(vm_uri).await
                 && client.call_service_extension(method, params).await.is_ok()
             {
+                state.lock().await.overlays.toggle(overlay);
                 IpcResponse {
                     ok: true,
                     message: label,
@@ -1213,6 +1255,7 @@ async fn write_ipc_resp(write_half: &mut tokio::net::tcp::WriteHalf<'_>, resp: &
     if let Ok(mut payload) = serde_json::to_string(resp) {
         payload.push('\n');
         let _ = write_half.write_all(payload.as_bytes()).await;
+        let _ = write_half.flush().await;
     }
 }
 
@@ -1441,13 +1484,92 @@ mod tests {
     }
 
     #[test]
-    fn parses_project_and_positional_flags() {
+    fn parses_project_and_overlay_positional_arg() {
         let args = vec![
             "--project".to_string(),
-            "/tmp/my_app".to_string(),
-            "macos".to_string(),
+            "/path/to/app".to_string(),
+            "inspector".to_string(),
         ];
-        assert_eq!(parse_project_flag(&args), Some(PathBuf::from("/tmp/my_app")));
-        assert_eq!(first_positional_arg(&args), Some("macos"));
+        assert_eq!(
+            parse_project_flag(&args),
+            Some(PathBuf::from("/path/to/app"))
+        );
+        assert_eq!(first_positional_arg(&args), Some("inspector"));
+        assert_eq!(
+            ServiceOverlay::parse(first_positional_arg(&args).unwrap()),
+            Some(ServiceOverlay::Inspector)
+        );
+    }
+
+    #[test]
+    fn run_args_stops_flag_parsing_at_double_dash() {
+        let args: Vec<String> = vec![
+            "--project",
+            "/tmp/app",
+            "--mode",
+            "profile",
+            "--",
+            "--mode",
+            "release",
+            "--device",
+            "chrome",
+            "--target",
+            "lib/other.dart",
+            "--dart-define=FOO=1",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+
+        let parsed = parse_run_args(&args);
+        assert_eq!(parsed.project_flag, Some(PathBuf::from("/tmp/app")));
+        assert_eq!(parsed.mode, "profile");
+        assert_eq!(parsed.target, "lib/main.dart");
+        assert_eq!(parsed.device_flag, None);
+        assert_eq!(
+            parsed.extra_args,
+            vec![
+                "--mode",
+                "release",
+                "--device",
+                "chrome",
+                "--target",
+                "lib/other.dart",
+                "--dart-define=FOO=1",
+            ]
+        );
+    }
+
+    #[test]
+    fn explicit_project_flag_never_falls_back_to_other_project_session() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = DiskCache::with_root(dir.path().join(".cache"));
+        let proj_a = dir.path().join("app_a");
+        let proj_b = dir.path().join("app_b");
+        fs::create_dir_all(&proj_a).expect("mkdir a");
+        fs::create_dir_all(&proj_b).expect("mkdir b");
+
+        let rec = ActiveSessionRecord {
+            session_id: "sess-a".into(),
+            project_root: normalize_project_key(&proj_a),
+            device_id: Some("macos".into()),
+            mode: "debug".into(),
+            pid: std::process::id(),
+            ipc_port: 41234,
+            vm_service_uri: None,
+            devtools_uri: None,
+            started_at: 100,
+            is_test: false,
+            kind: "run".into(),
+        };
+        write_session_record(&cache, &rec).expect("write");
+
+        // Explicit --project app_b must NOT fall back to app_a
+        assert!(resolve_session_for_ctl(&cache, Some(&proj_b), &proj_b).is_none());
+        // Omitted --project falls back to latest active session
+        assert_eq!(
+            resolve_session_for_ctl(&cache, None, &proj_b).map(|s| s.session_id),
+            Some("sess-a".to_string())
+        );
     }
 }
