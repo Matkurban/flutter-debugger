@@ -1,13 +1,14 @@
 pub mod detail;
 pub mod table;
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use gpui_kit::{
     Context, Entity, IntoElement, ParentElement as _, SharedString, Styled as _,
     UniformListScrollHandle, Window,
+    assets::IconName,
     component::{
-        Selectable as _, Sizable as _,
+        Icon, Selectable as _, Sizable as _,
         button::Button,
         h_resizable,
         input::{Input, InputState},
@@ -81,6 +82,8 @@ pub struct NetworkTabState {
     pub search_query: String,
     pub filtered_indices: Vec<usize>,
     pub scroll_handle: UniformListScrollHandle,
+    pub detail_loading_id: Option<String>,
+    pub detail_errors: HashMap<String, String>,
     pub cached_detail_id: Option<String>,
     pub cached_req_body: Option<FormattedBody>,
     pub cached_resp_body: Option<FormattedBody>,
@@ -100,6 +103,8 @@ impl NetworkTabState {
             search_query: String::new(),
             filtered_indices: Vec::new(),
             scroll_handle: UniformListScrollHandle::new(),
+            detail_loading_id: None,
+            detail_errors: HashMap::new(),
             cached_detail_id: None,
             cached_req_body: None,
             cached_resp_body: None,
@@ -132,15 +137,60 @@ impl NetworkTabState {
 
     /// Merges an incremental batch of HTTP profile requests, deduplicating by `id`
     /// and preserving previously fetched request/response bodies.
-    pub fn merge_batch(&mut self, batch: Vec<HttpRequestRecord>) -> Option<String> {
+    pub fn merge_batch(
+        &mut self,
+        batch: Vec<HttpRequestRecord>,
+    ) -> Option<(String, Option<String>)> {
         let refetch_selected =
             merge_requests_into_deque(&mut self.requests, batch, self.selected_id.as_deref());
         self.rebuild_filtered_indices();
+        if let Some((ref id, _)) = refetch_selected
+            && self.selected_id.as_deref() == Some(id.as_str())
+        {
+            self.rebuild_selected_body_cache();
+        }
         refetch_selected
     }
 
-    pub fn apply_detail(&mut self, request_id: &str, detail: HttpRequestDetail) {
+    pub fn mark_detail_loading(&mut self, request_id: &str) {
+        self.detail_loading_id = Some(request_id.to_string());
+        self.detail_errors.remove(request_id);
+    }
+
+    pub fn apply_detail_error(&mut self, request_id: &str, error: String) {
+        if self.detail_loading_id.as_deref() == Some(request_id) {
+            self.detail_loading_id = None;
+        }
+        self.detail_errors.insert(request_id.to_string(), error);
+    }
+
+    pub fn apply_detail(&mut self, request_id: &str, mut detail: HttpRequestDetail) {
+        if self.detail_loading_id.as_deref() == Some(request_id) {
+            self.detail_loading_id = None;
+        }
+        self.detail_errors.remove(request_id);
+
         if let Some(rec) = self.requests.iter_mut().find(|r| r.id == request_id) {
+            if let Some(prev) = rec.detail.take() {
+                if detail.request_headers.is_empty() {
+                    detail.request_headers = prev.request_headers;
+                }
+                if detail.response_headers.is_empty() {
+                    detail.response_headers = prev.response_headers;
+                }
+                if detail.request_body.is_none() {
+                    detail.request_body = prev.request_body;
+                }
+                if detail.response_body.is_none() {
+                    detail.response_body = prev.response_body;
+                }
+                if detail.remote_address.is_none() {
+                    detail.remote_address = prev.remote_address;
+                }
+                if detail.local_port.is_none() {
+                    detail.local_port = prev.local_port;
+                }
+            }
             if rec.request_bytes == 0
                 && let Some(ref b) = detail.request_body
             {
@@ -151,27 +201,38 @@ impl NetworkTabState {
             {
                 rec.response_bytes = b.len() as u64;
             }
+            let has_body = detail.request_body.is_some() || detail.response_body.is_some();
             rec.detail = Some(detail);
-            rec.body_loaded = true;
+            if rec.response_complete || has_body {
+                rec.body_loaded = true;
+            }
         }
         if self.selected_id.as_deref() == Some(request_id) {
             self.rebuild_selected_body_cache();
         }
     }
 
-    pub fn select_request(&mut self, request_id: String) -> bool {
+    pub fn select_request(&mut self, request_id: String) -> Option<(String, Option<String>)> {
         self.selected_id = Some(request_id.clone());
         self.rebuild_selected_body_cache();
-        self.requests
-            .iter()
-            .find(|r| r.id == request_id)
-            .is_some_and(|r| !r.body_loaded)
+        let rec = self.requests.iter().find(|r| r.id == request_id)?;
+        let has_error = self.detail_errors.contains_key(&request_id);
+        if !rec.body_loaded || has_error {
+            let id = rec.id.clone();
+            let iso = rec.isolate_id.clone();
+            self.mark_detail_loading(&id);
+            Some((id, iso))
+        } else {
+            None
+        }
     }
 
     pub fn clear(&mut self) {
         self.requests.clear();
         self.filtered_indices.clear();
         self.selected_id = None;
+        self.detail_loading_id = None;
+        self.detail_errors.clear();
         self.cached_detail_id = None;
         self.cached_req_body = None;
         self.cached_resp_body = None;
@@ -259,10 +320,15 @@ impl RootView {
                                     .small()
                                     .compact()
                                     .selected(recording)
-                                    .label(if recording {
-                                        "● Recording"
+                                    .icon(Icon::new(if recording {
+                                        IconName::CircleDot
                                     } else {
-                                        "⏸ Paused"
+                                        IconName::Pause
+                                    }))
+                                    .label(if recording {
+                                        "Recording"
+                                    } else {
+                                        "Paused"
                                     })
                                     .tooltip("Toggle HTTP traffic capture")
                                     .on_click(cx.listener(|this, _, _, cx| {
@@ -277,6 +343,7 @@ impl RootView {
                                 Button::new("net-clear-btn")
                                     .small()
                                     .compact()
+                                    .icon(Icon::new(IconName::Trash))
                                     .label("Clear")
                                     .tooltip("Clear captured HTTP requests")
                                     .on_click(cx.listener(|this, _, _, cx| {
@@ -322,9 +389,45 @@ impl RootView {
                                     .child(format!("{filtered_count} / {total_count} requests")),
                             )
                             .child(
+                                Button::new("net-copy-all-btn")
+                                    .small()
+                                    .compact()
+                                    .icon(Icon::new(IconName::ClipboardCopy))
+                                    .label("Copy All")
+                                    .tooltip("Copy complete request & response report (General, Headers, and Bodies)")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        if let Some(rec) = this.network.selected_record().cloned() {
+                                            if !rec.body_loaded {
+                                                this.network.mark_detail_loading(&rec.id);
+                                                this.send_cmd(
+                                                    BackendCommand::FetchHttpRequestDetail {
+                                                        request_id: rec.id.clone(),
+                                                        isolate_id: rec.isolate_id.clone(),
+                                                    },
+                                                );
+                                            }
+                                            let report = rec.to_full_text_report();
+                                            this.copy_to_clipboard(
+                                                report,
+                                                "Copied complete HTTP request & response info",
+                                                window,
+                                                cx,
+                                            );
+                                        } else {
+                                            this.show_toast(
+                                                "Select a request first to copy all details",
+                                                true,
+                                                window,
+                                                cx,
+                                            );
+                                        }
+                                    })),
+                            )
+                            .child(
                                 Button::new("net-copy-curl-btn")
                                     .small()
                                     .compact()
+                                    .icon(Icon::new(IconName::Copy))
                                     .label("Copy as cURL")
                                     .tooltip("Copy selected HTTP request as a cURL command")
                                     .on_click(cx.listener(|this, _, window, cx| {
@@ -367,14 +470,18 @@ pub(crate) fn merge_requests_into_deque(
     requests: &mut VecDeque<HttpRequestRecord>,
     batch: Vec<HttpRequestRecord>,
     selected_id: Option<&str>,
-) -> Option<String> {
+) -> Option<(String, Option<String>)> {
     let mut refetch_selected = None;
     for incoming in batch {
         if let Some(existing) = requests.iter_mut().find(|r| r.id == incoming.id) {
             let prev_complete = existing.response_complete;
             let prev_detail = existing.detail.take();
             let prev_body_loaded = existing.body_loaded;
+            let prev_iso = existing.isolate_id.take();
             *existing = incoming;
+            if existing.isolate_id.is_none() {
+                existing.isolate_id = prev_iso;
+            }
             if !prev_complete && existing.response_complete {
                 existing.body_loaded = false;
                 if existing.detail.is_none() {
@@ -390,7 +497,7 @@ pub(crate) fn merge_requests_into_deque(
                 && !existing.body_loaded
                 && (existing.response_complete || !existing.is_pending())
             {
-                refetch_selected = Some(existing.id.clone());
+                refetch_selected = Some((existing.id.clone(), existing.isolate_id.clone()));
             }
         } else {
             if requests.len() >= MAX_NETWORK_REQUESTS {
@@ -432,7 +539,10 @@ mod tests {
         assert!(completed.response_complete);
 
         let refetch = merge_requests_into_deque(&mut deque, vec![completed], Some("req-stream-1"));
-        assert_eq!(refetch.as_deref(), Some("req-stream-1"));
+        assert_eq!(
+            refetch.as_ref().map(|(id, _)| id.as_str()),
+            Some("req-stream-1")
+        );
         assert!(!deque[0].body_loaded);
     }
 }

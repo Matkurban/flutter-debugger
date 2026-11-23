@@ -21,9 +21,9 @@ use crate::debug_config::run_init_zed;
 use crate::devtools::resolve_or_start_devtools_url;
 use crate::emulators::{launch_emulator, list_emulators};
 use crate::ipc::{
-    ActiveSessionRecord, IpcRequest, IpcResponse, OverlayState, ServiceOverlay, find_latest_session,
-    generate_session_id, list_active_sessions, remove_session_record_by_id, send_ipc_to_session,
-    write_session_record,
+    ActiveSessionRecord, DebugLibraryScope, ExceptionPauseMode, IpcRequest, IpcResponse,
+    OverlayState, ServiceOverlay, find_latest_session, generate_session_id, list_active_sessions,
+    remove_session_record_by_id, send_ipc_to_session, write_session_record,
 };
 use crate::process_util::{build_command, terminate_child_tree};
 use crate::project::{ProjectInfo, ProjectKind, find_project_for_path, resolve_sdk_executable};
@@ -646,6 +646,8 @@ async fn cmd_run(args: &[String]) -> Result<(), String> {
         vm_service_uri: None,
         devtools_uri: None,
         overlays: OverlayState::default(),
+        exception_pause_mode: ExceptionPauseMode::None,
+        debug_library_scope: DebugLibraryScope::MyCodeOnly,
         pending_rpc: HashMap::new(),
     }));
     let next_rpc_id = Arc::new(AtomicI64::new(1));
@@ -957,6 +959,8 @@ struct RunSessionState {
     vm_service_uri: Option<String>,
     devtools_uri: Option<String>,
     overlays: OverlayState,
+    exception_pause_mode: ExceptionPauseMode,
+    debug_library_scope: DebugLibraryScope,
     pending_rpc: HashMap<i64, oneshot::Sender<Value>>,
 }
 
@@ -1089,6 +1093,7 @@ async fn execute_machine_restart(
                     device_id: dev,
                     vm_service_uri: vm,
                     devtools_uri: dt,
+                    ..Default::default()
                 }
             } else {
                 let err_msg = result
@@ -1103,6 +1108,7 @@ async fn execute_machine_restart(
                     device_id: dev,
                     vm_service_uri: vm,
                     devtools_uri: dt,
+                    ..Default::default()
                 }
             }
         }
@@ -1143,6 +1149,7 @@ async fn execute_open_devtools(
             device_id: None,
             vm_service_uri: vm,
             devtools_uri: Some(url),
+            ..Default::default()
         }
     } else {
         IpcResponse::err("DevTools URI is not ready yet")
@@ -1177,14 +1184,12 @@ async fn handle_run_ipc(
             resp
         }
         Ok(IpcRequest::Stop) => {
+            let session_id = state.lock().await.session_id.clone();
+            remove_session_record_by_id(&cache, &session_id);
             let resp = IpcResponse {
                 ok: true,
                 message: "Stopping Flutter application...".to_string(),
-                duration_ms: None,
-                mode: None,
-                device_id: None,
-                vm_service_uri: None,
-                devtools_uri: None,
+                ..Default::default()
             };
             write_ipc_resp(&mut write_half, &resp).await;
             let _ = stop_tx.send(()).await;
@@ -1243,6 +1248,7 @@ async fn handle_run_ipc(
                     device_id: dev,
                     vm_service_uri: vm,
                     devtools_uri: dt,
+                    ..Default::default()
                 }
             } else if let Some(vm_uri) = vm.as_deref()
                 && let Ok(mut client) = VmServiceClient::connect(vm_uri).await
@@ -1257,6 +1263,7 @@ async fn handle_run_ipc(
                     device_id: dev,
                     vm_service_uri: vm,
                     devtools_uri: dt,
+                    ..Default::default()
                 }
             } else {
                 IpcResponse::err(format!("Failed to toggle {}", overlay.label()))
@@ -1286,11 +1293,8 @@ async fn handle_run_ipc(
                 IpcResponse {
                     ok: true,
                     message: format!("Called `{method}`"),
-                    duration_ms: None,
-                    mode: None,
-                    device_id: None,
                     vm_service_uri: vm,
-                    devtools_uri: None,
+                    ..Default::default()
                 }
             } else if let Some(vm_uri) = vm.as_deref()
                 && let Ok(mut client) = VmServiceClient::connect(vm_uri).await
@@ -1299,11 +1303,8 @@ async fn handle_run_ipc(
                 IpcResponse {
                     ok: true,
                     message: format!("Called `{method}`"),
-                    duration_ms: None,
-                    mode: None,
-                    device_id: None,
                     vm_service_uri: vm,
-                    devtools_uri: None,
+                    ..Default::default()
                 }
             } else {
                 IpcResponse::err(format!("Service extension `{method}` failed"))
@@ -1330,14 +1331,56 @@ async fn handle_run_ipc(
                 IpcResponse {
                     ok: true,
                     message: format!("Screenshot saved to {out_file}"),
-                    duration_ms: None,
-                    mode: None,
-                    device_id: None,
                     vm_service_uri: vm,
-                    devtools_uri: None,
+                    ..Default::default()
                 }
             } else {
                 IpcResponse::err("Could not capture screenshot via VM Service")
+            }
+        }
+        Ok(IpcRequest::SetExceptionPauseMode { mode }) => {
+            let vm = state.lock().await.vm_service_uri.clone();
+            if let Some(vm_uri) = vm.as_deref()
+                && let Ok(mut client) = VmServiceClient::connect(vm_uri).await
+                && let Ok(isolate_id) = client.get_main_isolate_id().await
+                && client
+                    .call(
+                        "setIsolatePauseMode",
+                        json!({
+                            "isolateId": isolate_id,
+                            "exceptionPauseMode": mode.vm_service_mode()
+                        }),
+                    )
+                    .await
+                    .is_ok()
+            {
+                let mut g = state.lock().await;
+                g.exception_pause_mode = mode;
+                IpcResponse {
+                    ok: true,
+                    message: format!("Exception pause mode: {}", mode.description()),
+                    exception_pause_mode: Some(mode),
+                    debug_library_scope: Some(g.debug_library_scope),
+                    ..Default::default()
+                }
+            } else {
+                IpcResponse::err(
+                    "Exception breakpoints require an active DAP Debug session (or VM Service connection)",
+                )
+            }
+        }
+        Ok(IpcRequest::SetDebugLibraryScope { scope }) => {
+            let mut g = state.lock().await;
+            g.debug_library_scope = scope;
+            IpcResponse {
+                ok: true,
+                message: format!(
+                    "Debug library scope set to {} (applies to DAP breakpoint stepping)",
+                    scope.description()
+                ),
+                exception_pause_mode: Some(g.exception_pause_mode),
+                debug_library_scope: Some(scope),
+                ..Default::default()
             }
         }
         Ok(IpcRequest::Status) => {
@@ -1350,6 +1393,8 @@ async fn handle_run_ipc(
                 device_id: g.device_id.clone(),
                 vm_service_uri: g.vm_service_uri.clone(),
                 devtools_uri: g.devtools_uri.clone(),
+                exception_pause_mode: Some(g.exception_pause_mode),
+                debug_library_scope: Some(g.debug_library_scope),
             }
         }
         Err(e) => IpcResponse::err(format!("Invalid IPC request: {e}")),

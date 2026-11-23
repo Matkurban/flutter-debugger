@@ -3,7 +3,8 @@ use std::ops::Range;
 use gpui_kit::{
     Context, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
     StatefulInteractiveElement as _, Styled as _, Window,
-    component::scroll::ScrollableElement as _,
+    assets::IconName,
+    component::{Icon, Sizable as _, scroll::ScrollableElement as _},
     div,
     prelude::FluentBuilder as _,
     px, uniform_list,
@@ -24,11 +25,18 @@ pub fn render_requests_table(
     let row_count = view.network.filtered_indices.len();
     let scroll_handle = view.network.scroll_handle.clone();
 
-    let sort_arrow = |col: NetworkSortColumn| -> &'static str {
+    let sort_icon = |col: NetworkSortColumn| -> Option<Icon> {
         if sort_col == col {
-            if sort_asc { " ▲" } else { " ▼" }
+            Some(
+                Icon::new(if sort_asc {
+                    IconName::ArrowUp
+                } else {
+                    IconName::ArrowDown
+                })
+                .xsmall(),
+            )
         } else {
-            ""
+            None
         }
     };
 
@@ -56,11 +64,15 @@ pub fn render_requests_table(
                         .id("col-method")
                         .w(px(64.0))
                         .cursor_pointer()
+                        .flex()
+                        .items_center()
+                        .gap_1()
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.network.toggle_sort(NetworkSortColumn::Method);
                             cx.notify();
                         }))
-                        .child(format!("Method{}", sort_arrow(NetworkSortColumn::Method))),
+                        .child("Method")
+                        .when_some(sort_icon(NetworkSortColumn::Method), |el, ic| el.child(ic)),
                 )
                 .child(
                     div()
@@ -68,69 +80,90 @@ pub fn render_requests_table(
                         .flex_1()
                         .min_w(px(140.0))
                         .cursor_pointer()
+                        .flex()
+                        .items_center()
+                        .gap_1()
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.network.toggle_sort(NetworkSortColumn::Address);
                             cx.notify();
                         }))
-                        .child(format!("Address{}", sort_arrow(NetworkSortColumn::Address))),
+                        .child("Address")
+                        .when_some(sort_icon(NetworkSortColumn::Address), |el, ic| el.child(ic)),
                 )
                 .child(
                     div()
                         .id("col-status")
                         .w(px(68.0))
                         .cursor_pointer()
+                        .flex()
+                        .items_center()
+                        .gap_1()
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.network.toggle_sort(NetworkSortColumn::Status);
                             cx.notify();
                         }))
-                        .child(format!("Status{}", sort_arrow(NetworkSortColumn::Status))),
+                        .child("Status")
+                        .when_some(sort_icon(NetworkSortColumn::Status), |el, ic| el.child(ic)),
                 )
                 .child(
                     div()
                         .id("col-type")
                         .w(px(56.0))
                         .cursor_pointer()
+                        .flex()
+                        .items_center()
+                        .gap_1()
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.network.toggle_sort(NetworkSortColumn::Type);
                             cx.notify();
                         }))
-                        .child(format!("Type{}", sort_arrow(NetworkSortColumn::Type))),
+                        .child("Type")
+                        .when_some(sort_icon(NetworkSortColumn::Type), |el, ic| el.child(ic)),
                 )
                 .child(
                     div()
                         .id("col-duration")
                         .w(px(82.0))
                         .cursor_pointer()
+                        .flex()
+                        .items_center()
+                        .gap_1()
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.network.toggle_sort(NetworkSortColumn::Duration);
                             cx.notify();
                         }))
-                        .child(format!(
-                            "Duration{}",
-                            sort_arrow(NetworkSortColumn::Duration)
-                        )),
+                        .child("Duration")
+                        .when_some(sort_icon(NetworkSortColumn::Duration), |el, ic| el.child(ic)),
                 )
                 .child(
                     div()
                         .id("col-size")
                         .w(px(76.0))
                         .cursor_pointer()
+                        .flex()
+                        .items_center()
+                        .gap_1()
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.network.toggle_sort(NetworkSortColumn::Size);
                             cx.notify();
                         }))
-                        .child(format!("Size{}", sort_arrow(NetworkSortColumn::Size))),
+                        .child("Size")
+                        .when_some(sort_icon(NetworkSortColumn::Size), |el, ic| el.child(ic)),
                 )
                 .child(
                     div()
                         .id("col-time")
                         .w(px(92.0))
                         .cursor_pointer()
+                        .flex()
+                        .items_center()
+                        .gap_1()
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.network.toggle_sort(NetworkSortColumn::Timestamp);
                             cx.notify();
                         }))
-                        .child(format!("Time{}", sort_arrow(NetworkSortColumn::Timestamp))),
+                        .child("Time")
+                        .when_some(sort_icon(NetworkSortColumn::Timestamp), |el, ic| el.child(ic)),
                 ),
         )
         .child(if row_count == 0 {
@@ -216,10 +249,10 @@ fn render_single_request_row(
             el.hover(|h| h.bg(DevToolsTheme::bg_hover()))
         })
         .on_click(cx.listener(move |this, _, _, cx| {
-            let needs_fetch = this.network.select_request(req_id.clone());
-            if needs_fetch {
+            if let Some((id, isolate_id)) = this.network.select_request(req_id.clone()) {
                 this.send_cmd(BackendCommand::FetchHttpRequestDetail {
-                    request_id: req_id.clone(),
+                    request_id: id,
+                    isolate_id,
                 });
             }
             cx.notify();

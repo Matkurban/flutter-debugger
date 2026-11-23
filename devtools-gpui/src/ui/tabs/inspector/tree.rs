@@ -3,7 +3,8 @@ use std::ops::Range;
 use gpui_kit::{
     Context, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
     StatefulInteractiveElement as _, Styled as _, Window,
-    component::scroll::ScrollableElement as _,
+    assets::IconName,
+    component::{Icon, Sizable as _, scroll::ScrollableElement as _},
     div,
     prelude::FluentBuilder as _,
     px, uniform_list,
@@ -33,7 +34,7 @@ pub fn render_widget_tree_list(
             .text_xs()
             .text_color(DevToolsTheme::text_muted())
             .child("No Widget tree loaded yet.")
-            .child("Click '↻ Refresh Tree' once your Flutter application is running.")
+            .child("Click 'Refresh Tree' once your Flutter application is running.")
             .into_any_element();
     }
 
@@ -80,11 +81,8 @@ fn render_single_widget_row(
     let vid = row.value_id.clone();
     let vid_toggle = row.value_id.clone();
     let indent_px = (row.depth as f32) * 16.0 + 8.0;
-    let arrow = if row.has_children {
-        if row.expanded { "▾" } else { "▸" }
-    } else {
-        "·"
-    };
+    let has_children = row.has_children;
+    let is_expanded = row.expanded;
 
     div()
         .id(SharedString::from(format!(
@@ -128,6 +126,9 @@ fn render_single_widget_row(
                     div()
                         .id(SharedString::from(format!("widget-arrow-{idx}")))
                         .w(px(16.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
                         .text_color(DevToolsTheme::text_secondary())
                         .on_click(cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
@@ -139,7 +140,16 @@ fn render_single_widget_row(
                             }
                             cx.notify();
                         }))
-                        .child(arrow),
+                        .when(has_children, |el| {
+                            el.child(
+                                Icon::new(if is_expanded {
+                                    IconName::ChevronDown
+                                } else {
+                                    IconName::ChevronRight
+                                })
+                                .xsmall(),
+                            )
+                        }),
                 )
                 .child(
                     div()
@@ -186,11 +196,15 @@ fn render_single_widget_row(
                         DevToolsTheme::text_secondary()
                     })
                     .hover(|h| h.bg(DevToolsTheme::bg_selected()))
+                    .flex()
+                    .items_center()
+                    .gap_1()
                     .on_click(cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
                         this.jump_to_zed(loc_jump.clone());
                     }))
-                    .child(format!("↗ {}", loc.short_label())),
+                    .child(Icon::new(IconName::ExternalLink).xsmall())
+                    .child(loc.short_label()),
             )
         })
 }

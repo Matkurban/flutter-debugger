@@ -8,7 +8,7 @@ use tokio::sync::oneshot;
 use crate::cache::{
     DiskCache, extract_device_flag_from_args, now_unix, resolve_effective_device,
 };
-use crate::ipc::OverlayState;
+use crate::ipc::{DebugLibraryScope, ExceptionPauseMode, OverlayState};
 use crate::project::{ProjectKind, find_project_for_path, resolve_sdk_executable};
 
 /// Resolved target info computed lazily when `launch` or `attach` arrives.
@@ -33,6 +33,8 @@ pub struct ProxySessionState {
     pub vm_service_uri: Option<String>,
     pub devtools_uri: Option<String>,
     pub overlays: OverlayState,
+    pub exception_pause_mode: ExceptionPauseMode,
+    pub debug_library_scope: DebugLibraryScope,
     pub service_extension_isolates: HashMap<String, String>,
     pub main_isolate_id: Option<String>,
     pub suppressed_seqs: HashSet<i64>,
@@ -53,12 +55,53 @@ impl ProxySessionState {
             vm_service_uri: None,
             devtools_uri: None,
             overlays: OverlayState::default(),
+            exception_pause_mode: ExceptionPauseMode::None,
+            debug_library_scope: DebugLibraryScope::MyCodeOnly,
             service_extension_isolates: HashMap::new(),
             main_isolate_id: None,
             suppressed_seqs: HashSet::new(),
             pending_injected: HashMap::new(),
             next_injected_seq: 900_000,
             next_proxy_seq: 800_000,
+        }
+    }
+
+    pub fn sync_from_zed_request(&mut self, msg: &Value) {
+        if msg.get("type").and_then(Value::as_str) != Some("request") {
+            return;
+        }
+        let cmd = msg.get("command").and_then(Value::as_str).unwrap_or_default();
+        let Some(args) = msg.get("arguments").and_then(Value::as_object) else {
+            return;
+        };
+
+        match cmd {
+            "launch" | "attach" => {
+                let debug_sdk = args
+                    .get("debugSdkLibraries")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let debug_pkg = args
+                    .get("debugExternalPackageLibraries")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                self.debug_library_scope =
+                    DebugLibraryScope::from_dap_flags(debug_sdk, debug_pkg);
+            }
+            "setExceptionBreakpoints" => {
+                let filters: Vec<String> = args
+                    .get("filters")
+                    .and_then(Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(Value::as_str)
+                            .map(ToOwned::to_owned)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                self.exception_pause_mode = ExceptionPauseMode::from_dap_filters(&filters);
+            }
+            _ => {}
         }
     }
 
@@ -161,7 +204,7 @@ pub fn build_synthetic_initialize_response(proxy_seq: i64, request_seq: i64) -> 
             "supportsDelayedStackTraceLoading": true,
             "exceptionBreakpointFilters": [
                 { "filter": "All", "label": "All Exceptions", "default": false },
-                { "filter": "Unhandled", "label": "Uncaught Exceptions", "default": true }
+                { "filter": "Unhandled", "label": "Uncaught Exceptions", "default": false }
             ]
         }
     })
@@ -353,6 +396,14 @@ pub fn resolve_and_enrich_launch_or_attach(
 
     if need_release_flag && !args.contains_key("noDebug") {
         args.insert("noDebug".to_string(), json!(true));
+    }
+
+    // Default to VS Code Flutter "Debug my code" mode when not explicitly configured
+    if !args.contains_key("debugSdkLibraries") {
+        args.insert("debugSdkLibraries".to_string(), json!(false));
+    }
+    if !args.contains_key("debugExternalPackageLibraries") {
+        args.insert("debugExternalPackageLibraries".to_string(), json!(false));
     }
 
     if inject_device_flag
@@ -750,5 +801,58 @@ mod tests {
         assert_eq!(resolved.project_root, subpkg);
         assert_eq!(resolved.project_kind, ProjectKind::Dart);
         assert!(resolved.is_test);
+    }
+
+    #[test]
+    fn defaults_exception_breakpoints_off_and_injects_just_my_code_flags() {
+        let init = build_synthetic_initialize_response(800_000, 1);
+        let filters = init["body"]["exceptionBreakpointFilters"]
+            .as_array()
+            .expect("filters array");
+        assert!(
+            filters
+                .iter()
+                .all(|f| f.get("default").and_then(Value::as_bool) == Some(false)),
+            "Both All and Unhandled exception breakpoint filters must default to false"
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = DiskCache::with_root(dir.path().join(".cache"));
+        make_flutter_project(dir.path(), &["macos"]);
+
+        let mut req = json!({
+            "seq": 2,
+            "type": "request",
+            "command": "launch",
+            "arguments": {
+                "program": "lib/main.dart"
+            }
+        });
+        let _ = resolve_and_enrich_launch_or_attach(&mut req, &cache, dir.path(), None)
+            .expect("launch");
+        assert_eq!(req["arguments"]["debugSdkLibraries"], json!(false));
+        assert_eq!(
+            req["arguments"]["debugExternalPackageLibraries"],
+            json!(false)
+        );
+
+        // User explicit true must be respected
+        let mut custom_req = json!({
+            "seq": 3,
+            "type": "request",
+            "command": "launch",
+            "arguments": {
+                "program": "lib/main.dart",
+                "debugSdkLibraries": true,
+                "debugExternalPackageLibraries": true
+            }
+        });
+        let _ = resolve_and_enrich_launch_or_attach(&mut custom_req, &cache, dir.path(), None)
+            .expect("custom launch");
+        assert_eq!(custom_req["arguments"]["debugSdkLibraries"], json!(true));
+        assert_eq!(
+            custom_req["arguments"]["debugExternalPackageLibraries"],
+            json!(true)
+        );
     }
 }

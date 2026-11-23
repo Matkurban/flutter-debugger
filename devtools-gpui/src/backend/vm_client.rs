@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-use flutter_debugger_protocol::{OverlayState, ServiceOverlay};
+use flutter_debugger_protocol::{ExceptionPauseMode, OverlayState, ServiceOverlay};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
@@ -39,6 +39,7 @@ pub struct DartVmClient {
     pending: PendingRpcMap,
     next_id: Arc<AtomicU64>,
     main_isolate_id: Arc<RwLock<String>>,
+    isolate_ids: Arc<RwLock<Vec<String>>>,
     extension_rpcs: Arc<RwLock<HashSet<String>>>,
     process_memory_supported: Arc<AtomicBool>,
 }
@@ -101,6 +102,7 @@ impl DartVmClient {
         let client = Self {
             ws_uri, write_tx, pending, next_id: Arc::new(AtomicU64::new(1)),
             main_isolate_id: Arc::new(RwLock::new(String::new())),
+            isolate_ids: Arc::new(RwLock::new(Vec::new())),
             extension_rpcs: Arc::new(RwLock::new(HashSet::new())),
             process_memory_supported: Arc::new(AtomicBool::new(true)),
         };
@@ -133,10 +135,22 @@ impl DartVmClient {
             .map_err(|_| DevToolsError::Rpc { method: method.into(), message: "cancelled".into() })?
     }
 
-    pub async fn call_isolate(&self, method: &str, mut params: Value) -> Result<Value, DevToolsError> {
+    pub async fn call_isolate(&self, method: &str, params: Value) -> Result<Value, DevToolsError> {
         let isolate_id = self.main_isolate_id().await;
         if isolate_id.is_empty() {
             return Err(DevToolsError::Protocol("No active main isolate ID".into()));
+        }
+        self.call_specific_isolate(&isolate_id, method, params).await
+    }
+
+    pub async fn call_specific_isolate(
+        &self,
+        isolate_id: &str,
+        method: &str,
+        mut params: Value,
+    ) -> Result<Value, DevToolsError> {
+        if isolate_id.is_empty() {
+            return Err(DevToolsError::Protocol("Empty isolate ID".into()));
         }
         if let Some(obj) = params.as_object_mut() {
             obj.insert("isolateId".to_string(), json!(isolate_id));
@@ -144,6 +158,23 @@ impl DartVmClient {
             params = json!({ "isolateId": isolate_id });
         }
         self.call(method, params).await
+    }
+
+    async fn candidate_isolate_ids(&self, preferred: Option<&str>) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(pref) = preferred.filter(|s| !s.is_empty()) {
+            out.push(pref.to_string());
+        }
+        let main_id = self.main_isolate_id().await;
+        if !main_id.is_empty() && !out.contains(&main_id) {
+            out.push(main_id);
+        }
+        for id in self.isolate_ids.read().await.iter() {
+            if !id.is_empty() && !out.contains(id) {
+                out.push(id.clone());
+            }
+        }
+        out
     }
 
     async fn initialize_session(&self) -> Result<VmMetadata, DevToolsError> {
@@ -167,6 +198,13 @@ impl DartVmClient {
         let isolates = vm.get("isolates").and_then(Value::as_array)
             .ok_or_else(|| DevToolsError::Protocol("`getVM` returned no isolates".into()))?;
 
+        let all_ids: Vec<String> = isolates
+            .iter()
+            .filter_map(|iso| iso.get("id").and_then(Value::as_str))
+            .map(ToOwned::to_owned)
+            .collect();
+        *self.isolate_ids.write().await = all_ids.clone();
+
         let chosen = isolates
             .iter()
             .find(|iso| iso.get("name").and_then(Value::as_str).is_some_and(|n| n.contains("main")))
@@ -178,18 +216,41 @@ impl DartVmClient {
         let main_isolate_name = chosen.get("name").and_then(Value::as_str).unwrap_or("main").to_string();
 
         *self.main_isolate_id.write().await = main_isolate_id.clone();
-        if let Ok(detail) = self.call("getIsolate", json!({ "isolateId": main_isolate_id })).await
-            && let Some(arr) = detail.get("extensionRPCs").and_then(Value::as_array)
-        {
-            *self.extension_rpcs.write().await = arr.iter().filter_map(Value::as_str).map(ToOwned::to_owned).collect();
+        let mut rpcs = HashSet::new();
+        for iso_id in &all_ids {
+            if let Ok(detail) = self.call("getIsolate", json!({ "isolateId": iso_id })).await
+                && let Some(arr) = detail.get("extensionRPCs").and_then(Value::as_array)
+            {
+                for rpc in arr.iter().filter_map(Value::as_str) {
+                    rpcs.insert(rpc.to_string());
+                }
+            }
         }
+        *self.extension_rpcs.write().await = rpcs;
         self.set_http_timeline_logging(true).await;
         Ok(VmMetadata { main_isolate_name, target_cpu, arch_bits })
     }
 
     pub async fn set_http_timeline_logging(&self, enabled: bool) {
-        if self.call_isolate("ext.dart.io.httpEnableTimelineLogging", json!({ "enabled": enabled })).await.is_err() {
-            let _ = self.call_isolate("httpEnableTimelineLogging", json!({ "enabled": enabled })).await;
+        let enabled_str = if enabled { "true" } else { "false" };
+        for iso_id in self.candidate_isolate_ids(None).await {
+            if self
+                .call_specific_isolate(
+                    &iso_id,
+                    "ext.dart.io.httpEnableTimelineLogging",
+                    json!({ "enabled": enabled_str }),
+                )
+                .await
+                .is_err()
+            {
+                let _ = self
+                    .call_specific_isolate(
+                        &iso_id,
+                        "httpEnableTimelineLogging",
+                        json!({ "enabled": enabled }),
+                    )
+                    .await;
+            }
         }
     }
 
@@ -197,36 +258,116 @@ impl DartVmClient {
         if !self.has_extension_rpc("ext.dart.io.getHttpProfile").await {
             return Ok((0, Vec::new()));
         }
-        let mut params = json!({});
-        if let Some(ts) = updated_since { params["updatedSince"] = json!(ts); }
-        let resp = match self.call_isolate("ext.dart.io.getHttpProfile", params.clone()).await {
-            Ok(v) => v,
-            Err(_) => self.call_isolate("getHttpProfile", params).await?,
-        };
-        let timestamp = resp.get("timestamp").and_then(Value::as_u64).unwrap_or(0);
-        let requests = resp.get("requests").and_then(Value::as_array)
-            .map(|arr| arr.iter().filter_map(HttpRequestRecord::parse_from_profile_entry).collect())
-            .unwrap_or_default();
-        Ok((timestamp, requests))
+        let mut str_params = json!({});
+        let mut num_params = json!({});
+        if let Some(ts) = updated_since {
+            str_params["updatedSince"] = json!(ts.to_string());
+            num_params["updatedSince"] = json!(ts);
+        }
+
+        let mut max_timestamp = 0u64;
+        let mut all_requests = Vec::new();
+        let mut any_ok = false;
+
+        for iso_id in self.candidate_isolate_ids(None).await {
+            let resp_res = match self
+                .call_specific_isolate(&iso_id, "ext.dart.io.getHttpProfile", str_params.clone())
+                .await
+            {
+                Ok(v) => Ok(v),
+                Err(_) => {
+                    self.call_specific_isolate(&iso_id, "getHttpProfile", num_params.clone())
+                        .await
+                }
+            };
+            if let Ok(resp) = resp_res {
+                any_ok = true;
+                let root = resp.get("result").filter(|r| r.is_object()).unwrap_or(&resp);
+                let ts = root
+                    .get("timestamp")
+                    .and_then(|v| {
+                        v.as_u64()
+                            .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+                    })
+                    .unwrap_or(0);
+                max_timestamp = max_timestamp.max(ts);
+                if let Some(arr) = root.get("requests").and_then(Value::as_array) {
+                    for entry in arr {
+                        if let Some(mut rec) = HttpRequestRecord::parse_from_profile_entry(entry) {
+                            if rec.isolate_id.is_none() {
+                                rec.isolate_id = Some(iso_id.clone());
+                            }
+                            all_requests.push(rec);
+                        }
+                    }
+                }
+            }
+        }
+
+        if !any_ok {
+            return Ok((0, Vec::new()));
+        }
+        Ok((max_timestamp, all_requests))
     }
 
-    pub async fn get_http_profile_request(&self, id: &str) -> Result<HttpRequestDetail, DevToolsError> {
-        let params = json!({ "id": id });
-        let resp = match self.call_isolate("ext.dart.io.getHttpProfileRequest", params.clone()).await {
-            Ok(v) => v,
-            Err(_) => self.call_isolate("getHttpProfileRequest", params).await?,
-        };
-        Ok(HttpRequestRecord::parse_detail_from_response(&resp))
+    pub async fn get_http_profile_request(
+        &self,
+        id: &str,
+        preferred_isolate_id: Option<&str>,
+    ) -> Result<HttpRequestDetail, DevToolsError> {
+        let params = json!({ "id": id.to_string() });
+        let candidates = self.candidate_isolate_ids(preferred_isolate_id).await;
+        let mut last_err = None;
+
+        for iso_id in candidates {
+            match self
+                .call_specific_isolate(&iso_id, "ext.dart.io.getHttpProfileRequest", params.clone())
+                .await
+            {
+                Ok(resp) => return Ok(HttpRequestRecord::parse_detail_from_response(&resp)),
+                Err(e1) => {
+                    match self
+                        .call_specific_isolate(&iso_id, "getHttpProfileRequest", params.clone())
+                        .await
+                    {
+                        Ok(resp) => return Ok(HttpRequestRecord::parse_detail_from_response(&resp)),
+                        Err(_) => last_err = Some(e1),
+                    }
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| DevToolsError::Rpc {
+            method: "ext.dart.io.getHttpProfileRequest".into(),
+            message: format!("Unable to find HTTP profile request `{id}` in any active isolate"),
+        }))
     }
 
     pub async fn clear_http_profile(&self) {
-        if self.call_isolate("ext.dart.io.clearHttpProfile", json!({})).await.is_err() {
-            let _ = self.call_isolate("clearHttpProfile", json!({})).await;
+        for iso_id in self.candidate_isolate_ids(None).await {
+            if self
+                .call_specific_isolate(&iso_id, "ext.dart.io.clearHttpProfile", json!({}))
+                .await
+                .is_err()
+            {
+                let _ = self
+                    .call_specific_isolate(&iso_id, "clearHttpProfile", json!({}))
+                    .await;
+            }
         }
     }
 
     pub async fn set_pub_root_directories(&self, project_root: &Path) {
-        let _ = self.call_isolate("ext.flutter.inspector.setPubRootDirectories", build_pub_root_directories_params(project_root)).await;
+        let params = build_pub_root_directories_params(project_root);
+        if self
+            .call_isolate("ext.flutter.inspector.addPubRootDirectories", params.clone())
+            .await
+            .is_err()
+        {
+            let _ = self
+                .call_isolate("ext.flutter.inspector.setPubRootDirectories", params)
+                .await;
+        }
     }
 
     pub async fn dispose_inspector_group(&self, group_name: &str) {
@@ -256,8 +397,65 @@ impl DartVmClient {
     }
 
     pub async fn get_selected_summary_widget(&self, group_name: &str) -> Result<WidgetTreeNode, DevToolsError> {
-        let resp = self.call_isolate("ext.flutter.inspector.getSelectedSummaryWidget", json!({ "objectGroup": group_name })).await?;
-        WidgetTreeNode::parse_from_json(&resp).ok_or_else(|| DevToolsError::Protocol("No selected widget".into()))
+        if let Ok(resp) = self
+            .call_isolate(
+                "ext.flutter.inspector.getSelectedSummaryWidget",
+                json!({ "objectGroup": group_name }),
+            )
+            .await
+            && let Some(node) = WidgetTreeNode::parse_from_json(&resp)
+        {
+            return Ok(node);
+        }
+        let fallback_resp = self
+            .call_isolate(
+                "ext.flutter.inspector.getSelectedWidget",
+                json!({ "objectGroup": group_name }),
+            )
+            .await?;
+        WidgetTreeNode::parse_from_json(&fallback_resp)
+            .ok_or_else(|| DevToolsError::Protocol("No selected widget".into()))
+    }
+
+    pub async fn set_isolate_exception_pause_mode(
+        &self,
+        mode: ExceptionPauseMode,
+    ) -> Result<(), DevToolsError> {
+        let mode_str = mode.vm_service_mode();
+        let candidates = self.candidate_isolate_ids(None).await;
+        if candidates.is_empty() {
+            return Err(DevToolsError::Protocol("No active Dart isolate".into()));
+        }
+        let mut any_ok = false;
+        for iso_id in candidates {
+            if self
+                .call_specific_isolate(
+                    &iso_id,
+                    "setIsolatePauseMode",
+                    json!({ "exceptionPauseMode": mode_str }),
+                )
+                .await
+                .is_ok()
+                || self
+                    .call_specific_isolate(
+                        &iso_id,
+                        "setExceptionPauseMode",
+                        json!({ "mode": mode_str }),
+                    )
+                    .await
+                    .is_ok()
+            {
+                any_ok = true;
+            }
+        }
+        if any_ok {
+            Ok(())
+        } else {
+            Err(DevToolsError::Rpc {
+                method: "setIsolatePauseMode".into(),
+                message: "VM Service rejected exceptionPauseMode update".into(),
+            })
+        }
     }
 
     pub async fn fetch_widget_properties(&self, value_id: &str, group_name: &str) -> Result<Vec<WidgetProperty>, DevToolsError> {
@@ -388,7 +586,9 @@ fn handle_stream_notify(params: &Value, push_tx: &mpsc::UnboundedSender<VmPushEv
                     let _ = push_tx.send(VmPushEvent::ServiceExtensionAdded { rpc: rpc.into() });
                 }
             }
-            "IsolateReload" | "IsolateRunnable" => { let _ = push_tx.send(VmPushEvent::IsolateReloaded); }
+            "IsolateStart" | "IsolateReload" | "IsolateRunnable" => {
+                let _ = push_tx.send(VmPushEvent::IsolateReloaded);
+            }
             _ => {}
         },
         _ => {}

@@ -1,7 +1,9 @@
 use gpui_kit::{
-    Context, InteractiveElement as _, IntoElement, ParentElement as _, Styled as _,
+    Context, InteractiveElement as _, IntoElement, ParentElement as _, SharedString, Styled as _,
+    assets::IconName,
+    base::SelectableText,
     component::{
-        Sizable as _,
+        Icon, Sizable as _,
         button::Button,
         scroll::ScrollableElement as _,
     },
@@ -80,18 +82,22 @@ pub fn render_widget_properties_pane(
                         .font_family(DevToolsTheme::MONO_FONT)
                         .text_xs()
                         .text_color(DevToolsTheme::text_secondary())
-                        .child(format!(
-                            "Description: {} · ID: {}",
-                            node.description,
-                            if node.value_id.is_empty() {
-                                "-"
-                            } else {
-                                &node.value_id
-                            }
+                        .child(SelectableText::new(
+                            SharedString::from(format!("prop-desc-{}", node.value_id)),
+                            format!(
+                                "Description: {} · ID: {}",
+                                node.description,
+                                if node.value_id.is_empty() {
+                                    "-"
+                                } else {
+                                    &node.value_id
+                                }
+                            ),
                         )),
                 )
-                .when_some(node.location, |el, loc| {
+                .when_some(view.inspector.resolve_jump_location(&node), |el, loc| {
                     let loc_click = loc.clone();
+                    let loc_str = format!("{}:{}:{}", loc.uri, loc.line, loc.column);
                     el.child(
                         div()
                             .mt_1()
@@ -104,17 +110,22 @@ pub fn render_widget_properties_pane(
                             .gap_2()
                             .child(
                                 div()
+                                    .flex_1()
+                                    .min_w_0()
                                     .font_family(DevToolsTheme::MONO_FONT)
                                     .text_xs()
                                     .text_color(DevToolsTheme::accent_cyan())
-                                    .truncate()
-                                    .child(format!("{}:{}:{}", loc.uri, loc.line, loc.column)),
+                                    .child(SelectableText::new(
+                                        SharedString::from(format!("prop-loc-{}", node.value_id)),
+                                        loc_str,
+                                    )),
                             )
                             .child(
                                 Button::new("btn-open-widget-in-zed")
                                     .small()
                                     .compact()
-                                    .label("↗ Open in Zed")
+                                    .icon(Icon::new(IconName::ExternalLink))
+                                    .label("Open in Zed")
                                     .on_click(cx.listener(move |this, _, _, _| {
                                         this.jump_to_zed(loc_click.clone());
                                     })),
@@ -148,7 +159,10 @@ pub fn render_widget_properties_pane(
                             .child("No diagnostic properties reported for this widget."),
                     )
                 })
-                .children(properties.into_iter().map(|prop| {
+                .children(properties.into_iter().enumerate().map(|(prop_idx, prop)| {
+                    let vid = &node.value_id;
+                    let key_id = SharedString::from(format!("wprop-k-{vid}-{prop_idx}"));
+                    let val_id = SharedString::from(format!("wprop-v-{vid}-{prop_idx}-{}", prop.value));
                     div()
                         .w_full()
                         .py_1()
@@ -164,11 +178,12 @@ pub fn render_widget_properties_pane(
                                 .w(px(140.0))
                                 .flex_shrink_0()
                                 .text_color(DevToolsTheme::text_secondary())
-                                .child(prop.name),
+                                .child(SelectableText::new(key_id, prop.name)),
                         )
                         .child(
                             div()
                                 .flex_1()
+                                .min_w_0()
                                 .flex()
                                 .items_center()
                                 .gap_2()
@@ -187,8 +202,10 @@ pub fn render_widget_properties_pane(
                                 })
                                 .child(
                                     div()
+                                        .flex_1()
+                                        .min_w_0()
                                         .text_color(DevToolsTheme::text_primary())
-                                        .child(prop.value),
+                                        .child(SelectableText::new(val_id, prop.value)),
                                 ),
                         )
                 })),

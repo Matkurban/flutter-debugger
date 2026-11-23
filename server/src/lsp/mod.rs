@@ -91,6 +91,7 @@ pub struct FlutterLspBackend {
     client: Client,
     docs: Arc<DashMap<Uri, OpenDocument>>,
     config: Arc<RwLock<ServerConfig>>,
+    workspace_roots: Arc<RwLock<Vec<PathBuf>>>,
     cache: DiskCache,
     devices: Arc<RwLock<Vec<FlutterDevice>>>,
     daemon: FlutterDaemonManager,
@@ -123,6 +124,7 @@ impl FlutterLspBackend {
             client,
             docs: Arc::new(DashMap::new()),
             config: Arc::new(RwLock::new(ServerConfig::default())),
+            workspace_roots: Arc::new(RwLock::new(Vec::new())),
             cache,
             devices,
             daemon,
@@ -136,6 +138,43 @@ impl FlutterLspBackend {
             runner: CommandRunner::new(),
             http,
         }
+    }
+
+    async fn log_info(&self, msg: impl Into<String>) {
+        let text = msg.into();
+        tracing::info!("{text}");
+        self.client.log_message(MessageType::INFO, text).await;
+    }
+
+    async fn log_warn(&self, msg: impl Into<String>) {
+        let text = msg.into();
+        tracing::warn!("{text}");
+        self.client.log_message(MessageType::WARNING, text).await;
+    }
+
+    fn start_device_daemon_for_project(&self, root: PathBuf, custom_sdk: Option<String>) {
+        let client_ref = self.client.clone();
+        self.daemon.ensure_started(
+            root,
+            custom_sdk,
+            Some(Arc::new(move |devices| {
+                let names: Vec<String> = devices
+                    .iter()
+                    .map(|d| format!("{} ({})", d.name, d.id))
+                    .collect();
+                let summary = format!(
+                    "Flutter daemon updated devices ({}): [{}]",
+                    devices.len(),
+                    names.join(", ")
+                );
+                tracing::info!("{summary}");
+                let c = client_ref.clone();
+                tokio::spawn(async move {
+                    c.log_message(MessageType::INFO, summary).await;
+                    let _ = c.send_request::<CodeLensRefresh>(()).await;
+                });
+            })),
+        );
     }
 
     fn selected_device_label_sync(
@@ -198,6 +237,17 @@ impl FlutterLspBackend {
         {
             Ok(output) if output.success() => {
                 if let Ok(parsed) = serde_json::from_str::<Vec<FlutterDevice>>(&output.stdout) {
+                    let names: Vec<String> = parsed
+                        .iter()
+                        .map(|d| format!("{} ({})", d.name, d.id))
+                        .collect();
+                    self.log_info(format!(
+                        "Device scan in `{}` found {} device(s): [{}]",
+                        cwd.display(),
+                        parsed.len(),
+                        names.join(", ")
+                    ))
+                    .await;
                     self.cache.save_devices(&parsed);
                     *self.devices.write().await = parsed.clone();
                     progress
@@ -205,6 +255,8 @@ impl FlutterLspBackend {
                         .await;
                     let _ = self.client.send_request::<CodeLensRefresh>(()).await;
                 } else {
+                    self.log_warn("Unable to parse `flutter devices --machine` JSON output")
+                        .await;
                     progress
                         .end(Some("Unable to parse device list".to_string()))
                         .await;
@@ -213,6 +265,8 @@ impl FlutterLspBackend {
             Ok(output) => {
                 let summary =
                     extract_error_summary(&output.stderr, &output.stdout, output.exit_code);
+                self.log_warn(format!("Device scan failed: {summary}"))
+                    .await;
                 progress.end(Some("Device scan failed".to_string())).await;
                 if force {
                     self.report_command_failure("flutter devices", &summary, output.log_path)
@@ -220,6 +274,7 @@ impl FlutterLspBackend {
                 }
             }
             Err(err) => {
+                self.log_warn(format!("Device scan error: {err}")).await;
                 progress.end(Some("Device scan failed".to_string())).await;
                 if force {
                     self.client
@@ -388,14 +443,36 @@ impl FlutterLspBackend {
             return;
         };
 
-        let devices = self.devices.read().await.clone();
-        if devices.is_empty() {
-            self.maybe_scan_devices_in_background(root.clone(), true)
-                .await;
+        let mut devices = self.devices.read().await.clone();
+        if devices.len() <= 1
+            && let Some(cached) = self.cache.load_devices()
+        {
+            devices = merge_unique_devices(&devices, &cached.devices);
+            if !devices.is_empty() {
+                *self.devices.write().await = devices.clone();
+            }
         }
 
-        let devices = self.devices.read().await.clone();
+        if devices.len() <= 1 {
+            self.log_info(format!(
+                "cycle_selected_device: only {} device(s) in memory/cache; triggering live `flutter devices --machine` scan...",
+                devices.len()
+            ))
+            .await;
+            let prior = devices.clone();
+            self.maybe_scan_devices_in_background(root.clone(), true)
+                .await;
+            let scanned = self.devices.read().await.clone();
+            devices = if scanned.len() >= prior.len() {
+                scanned
+            } else {
+                merge_unique_devices(&scanned, &prior)
+            };
+        }
+
         if devices.is_empty() {
+            self.log_warn("cycle_selected_device: no Flutter devices found after live scan")
+                .await;
             self.client
                 .show_message(
                     MessageType::WARNING,
@@ -403,6 +480,19 @@ impl FlutterLspBackend {
                         .to_string(),
                 )
                 .await;
+            return;
+        }
+
+        if devices.len() == 1 {
+            let only_device = &devices[0];
+            self.cache.set_selected_device(&root, &only_device.id);
+            let _ = self.client.send_request::<CodeLensRefresh>(()).await;
+            let msg = format!(
+                "Only 1 Flutter device available: {}. Start an emulator or connect another device to switch.",
+                only_device.display_label()
+            );
+            self.log_info(&msg).await;
+            self.client.show_message(MessageType::INFO, msg).await;
             return;
         }
 
@@ -419,35 +509,52 @@ impl FlutterLspBackend {
         self.cache.set_selected_device(&root, &next_device.id);
 
         let _ = self.client.send_request::<CodeLensRefresh>(()).await;
-        self.client
-            .show_message(
-                MessageType::INFO,
-                format!(
-                    "Flutter target device set to: {}",
-                    next_device.display_label()
-                ),
-            )
-            .await;
+        let msg = format!(
+            "Flutter target device set to: {} ({}/{})",
+            next_device.display_label(),
+            next_idx + 1,
+            devices.len()
+        );
+        self.log_info(&msg).await;
+        self.client.show_message(MessageType::INFO, msg).await;
     }
 
     async fn stop_active_session(&self, uri: &Uri) {
         let Some(root) = self.resolve_project_root_for_uri(uri) else {
+            let _ = self.client.send_request::<CodeLensRefresh>(()).await;
             return;
         };
 
-        match send_ipc_request(&self.cache, &root, &IpcRequest::Stop).await {
+        self.log_info(format!("Stopping active Flutter session for `{}`", root.display()))
+            .await;
+
+        let ipc_res = send_ipc_request(&self.cache, &root, &IpcRequest::Stop).await;
+        // Always refresh CodeLens immediately on all paths
+        let _ = self.client.send_request::<CodeLensRefresh>(()).await;
+
+        match ipc_res {
             Some(resp) if resp.ok => {
-                let _ = self.client.send_request::<CodeLensRefresh>(()).await;
+                self.log_info(format!("Stop session succeeded: {}", resp.message))
+                    .await;
                 self.client
                     .show_message(MessageType::INFO, resp.message)
                     .await;
+                let client_delayed = self.client.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    let _ = client_delayed.send_request::<CodeLensRefresh>(()).await;
+                });
             }
             Some(resp) => {
+                self.log_warn(format!("Stop session returned warning: {}", resp.message))
+                    .await;
                 self.client
                     .show_message(MessageType::WARNING, resp.message)
                     .await;
             }
             None => {
+                self.log_warn("Stop session: no active Flutter session found for project")
+                    .await;
                 self.client
                     .show_message(
                         MessageType::WARNING,
@@ -664,6 +771,34 @@ impl LanguageServer for FlutterLspBackend {
             self.config.write().await.apply_json_patch(&opts);
         }
 
+        let mut roots: Vec<PathBuf> = Vec::new();
+        if let Some(folders) = params.workspace_folders {
+            for folder in folders {
+                if let Some(path) = uri_to_file_path(&folder.uri)
+                    && !roots.contains(&path)
+                {
+                    roots.push(path);
+                }
+            }
+        }
+        #[allow(deprecated)]
+        if roots.is_empty()
+            && let Some(ref root_uri) = params.root_uri
+            && let Some(path) = uri_to_file_path(root_uri)
+        {
+            roots.push(path);
+        }
+        if roots.is_empty()
+            && let Ok(cwd) = std::env::current_dir()
+        {
+            roots.push(cwd);
+        }
+        tracing::info!(
+            "flutter-debugger LSP initialize: workspace_roots={:?}",
+            roots
+        );
+        *self.workspace_roots.write().await = roots;
+
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
@@ -686,7 +821,7 @@ impl LanguageServer for FlutterLspBackend {
                 ..Default::default()
             },
             server_info: Some(ServerInfo {
-                name: "flutter-debugger-server".to_string(),
+                name: "flutter-debugger".to_string(),
                 version: Some(env!("CARGO_PKG_VERSION").to_string()),
             }),
             ..Default::default()
@@ -694,7 +829,48 @@ impl LanguageServer for FlutterLspBackend {
     }
 
     async fn initialized(&self, _params: InitializedParams) {
-        tracing::info!("flutter-debugger-server LSP initialized");
+        let roots = self.workspace_roots.read().await.clone();
+        let discovered = discover_flutter_projects_in_roots(&roots);
+        let cached_devices = self.devices.read().await.clone();
+        let device_names: Vec<String> = cached_devices
+            .iter()
+            .map(|d| format!("{} ({})", d.name, d.id))
+            .collect();
+        let proj_summary: Vec<String> = discovered
+            .iter()
+            .map(|p| format!("{} ({:?})", p.root.display(), p.kind))
+            .collect();
+
+        self.log_info(format!(
+            "flutter-debugger v{} initialized | workspaces={} | projects=[{}] | cached_devices={} [{}]",
+            env!("CARGO_PKG_VERSION"),
+            roots.len(),
+            proj_summary.join(", "),
+            cached_devices.len(),
+            device_names.join(", ")
+        ))
+        .await;
+
+        if let Some(flutter_proj) = discovered
+            .into_iter()
+            .find(|p| p.kind == ProjectKind::Flutter)
+        {
+            let root = flutter_proj.root;
+            let custom_sdk = self.config.read().await.flutter_sdk_path.clone();
+            self.log_info(format!(
+                "Starting Flutter device daemon eagerly for `{}`",
+                root.display()
+            ))
+            .await;
+            self.start_device_daemon_for_project(root.clone(), custom_sdk);
+            if cached_devices.len() <= 1 {
+                let this = self.clone_handle();
+                tokio::spawn(async move {
+                    this.maybe_scan_devices_in_background(root, false).await;
+                });
+            }
+        }
+
         let cache = self.cache.clone();
         let client = self.client.clone();
         let docs = Arc::clone(&self.docs);
@@ -716,6 +892,8 @@ impl LanguageServer for FlutterLspBackend {
     }
 
     async fn shutdown(&self) -> RpcResult<()> {
+        self.log_info("flutter-debugger LSP shutting down and terminating flutter daemon")
+            .await;
         if let Some(h) = self.watcher_abort.lock().await.take() {
             h.abort();
         }
@@ -741,6 +919,7 @@ impl LanguageServer for FlutterLspBackend {
         self.publish_pubspec_diagnostics_if_needed(&uri, &doc).await;
 
         let project = doc.project.clone();
+        let main_line = doc.dart.as_ref().and_then(|d| d.main_line);
         let hosted_packages: Vec<String> = doc
             .pubspec
             .as_ref()
@@ -753,27 +932,27 @@ impl LanguageServer for FlutterLspBackend {
             })
             .unwrap_or_default();
 
-        self.docs.insert(uri, doc);
+        self.docs.insert(uri.clone(), doc);
 
         let Some(project) = project else {
             return;
         };
 
+        if let Some(line) = main_line {
+            self.log_info(format!(
+                "Opened `{}` with main() at line {} (project: `{}`)",
+                uri.as_str(),
+                line + 1,
+                project.root.display()
+            ))
+            .await;
+        }
+
         if project.kind == ProjectKind::Flutter {
             let root = project.root.clone();
             let was_started = self.daemon.is_started();
             let custom_sdk = self.config.read().await.flutter_sdk_path.clone();
-            let client_ref = self.client.clone();
-            self.daemon.ensure_started(
-                root.clone(),
-                custom_sdk,
-                Some(Arc::new(move |_devices| {
-                    let c = client_ref.clone();
-                    tokio::spawn(async move {
-                        let _ = c.send_request::<CodeLensRefresh>(()).await;
-                    });
-                })),
-            );
+            self.start_device_daemon_for_project(root.clone(), custom_sdk);
             let has_devices = !self.devices.read().await.is_empty();
             if !was_started && !has_devices {
                 let this = self.clone_handle();
@@ -1140,6 +1319,13 @@ impl LanguageServer for FlutterLspBackend {
             return Ok(None);
         };
 
+        self.log_info(format!(
+            "Executing LSP command `{}` on `{}`",
+            params.command,
+            uri.as_str()
+        ))
+        .await;
+
         match params.command.as_str() {
             "flutterDebugger.pubGet" => {
                 self.execute_project_cli(&uri, AllowedCommand::PubGet).await;
@@ -1303,6 +1489,7 @@ impl FlutterLspBackend {
             client: self.client.clone(),
             docs: Arc::clone(&self.docs),
             config: Arc::clone(&self.config),
+            workspace_roots: Arc::clone(&self.workspace_roots),
             cache: self.cache.clone(),
             devices: Arc::clone(&self.devices),
             daemon: self.daemon.clone(),
@@ -1317,6 +1504,66 @@ impl FlutterLspBackend {
             http: self.http.clone(),
         }
     }
+}
+
+fn merge_unique_devices(primary: &[FlutterDevice], secondary: &[FlutterDevice]) -> Vec<FlutterDevice> {
+    let mut map: HashMap<String, FlutterDevice> = HashMap::new();
+    for d in secondary {
+        map.insert(d.id.clone(), d.clone());
+    }
+    for d in primary {
+        map.insert(d.id.clone(), d.clone());
+    }
+    let mut out: Vec<FlutterDevice> = map.into_values().collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
+    out
+}
+
+fn discover_flutter_projects_in_roots(roots: &[PathBuf]) -> Vec<ProjectInfo> {
+    let mut projects: Vec<ProjectInfo> = Vec::new();
+    let mut seen_roots: Vec<PathBuf> = Vec::new();
+
+    let mut check_dir = |dir: &Path| {
+        if let Some(proj) = find_project_for_path(dir)
+            && !seen_roots.contains(&proj.root)
+        {
+            seen_roots.push(proj.root.clone());
+            projects.push(proj);
+        }
+    };
+
+    for root in roots {
+        check_dir(root);
+        let Ok(entries) = std::fs::read_dir(root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with('.') || name_str == "build" || name_str == "target" {
+                continue;
+            }
+            if path.join("pubspec.yaml").is_file() {
+                check_dir(&path);
+                continue;
+            }
+            // Check 1 deeper level for monorepos (`apps/<app>/pubspec.yaml`, `packages/<pkg>/pubspec.yaml`)
+            if let Ok(sub_entries) = std::fs::read_dir(&path) {
+                for sub in sub_entries.flatten() {
+                    let sub_path = sub.path();
+                    if sub_path.is_dir() && sub_path.join("pubspec.yaml").is_file() {
+                        check_dir(&sub_path);
+                    }
+                }
+            }
+        }
+    }
+
+    projects
 }
 
 fn compute_external_state_signature(cache: &DiskCache) -> String {
@@ -1363,4 +1610,55 @@ pub async fn run_lsp_server() {
 
     let (service, socket) = LspService::new(FlutterLspBackend::new);
     Server::new(stdin, stdout, socket).serve(service).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merges_unique_devices_preserving_cached_entries() {
+        let mem = vec![FlutterDevice {
+            id: "macos".into(),
+            name: "macOS".into(),
+            target_platform: "darwin".into(),
+            emulator: false,
+            sdk: "macOS 15".into(),
+        }];
+        let cached = vec![
+            FlutterDevice {
+                id: "macos".into(),
+                name: "macOS".into(),
+                target_platform: "darwin".into(),
+                emulator: false,
+                sdk: "macOS 15".into(),
+            },
+            FlutterDevice {
+                id: "chrome".into(),
+                name: "Chrome".into(),
+                target_platform: "web-javascript".into(),
+                emulator: false,
+                sdk: "Google Chrome".into(),
+            },
+        ];
+        let merged = merge_unique_devices(&mem, &cached);
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn discovers_flutter_projects_in_workspace_root_and_subdirectories() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sub_app = dir.path().join("apps").join("mobile");
+        std::fs::create_dir_all(&sub_app).expect("mkdir");
+        std::fs::write(
+            sub_app.join("pubspec.yaml"),
+            "name: mobile\nflutter:\n  uses-material-design: true\n",
+        )
+        .expect("write pubspec");
+
+        let found = discover_flutter_projects_in_roots(&[dir.path().to_path_buf()]);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].root, sub_app);
+        assert_eq!(found[0].kind, ProjectKind::Flutter);
+    }
 }

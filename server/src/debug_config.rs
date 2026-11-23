@@ -216,6 +216,10 @@ pub fn build_debug_presets(project: &ProjectInfo) -> Vec<Value> {
             };
 
             entries.push(make_app("Flutter: Debug", "debug", &primary_entry, None));
+            let mut run_no_debug =
+                make_app("Flutter: Run (No Debug)", "debug", &primary_entry, None);
+            run_no_debug["noDebug"] = json!(true);
+            entries.push(run_no_debug);
             entries.push(make_app("Flutter: Profile", "profile", &primary_entry, None));
             entries.push(make_app("Flutter: Release", "release", &primary_entry, None));
 

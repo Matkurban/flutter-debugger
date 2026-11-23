@@ -1,9 +1,12 @@
-use flutter_debugger_protocol::{ServiceOverlay, default_sessions_dir};
+use flutter_debugger_protocol::{
+    DebugLibraryScope, ExceptionPauseMode, ServiceOverlay, default_sessions_dir,
+};
 use gpui_kit::{
     Anchor, Context, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
     StatefulInteractiveElement as _, Styled as _, Window,
+    assets::IconName,
     component::{
-        Selectable as _, Sizable as _,
+        Icon, Selectable as _, Sizable as _,
         button::Button,
         popover::Popover,
     },
@@ -24,6 +27,8 @@ pub fn render_topbar(
 ) -> impl IntoElement {
     let active_page = view.active_page;
     let inspector_active = view.overlays.inspector;
+    let exc_mode = view.exception_pause_mode;
+    let lib_scope = view.debug_library_scope;
 
     let session_label: SharedString = match view.active_session() {
         Some(s) => s.display_label().into(),
@@ -35,6 +40,8 @@ pub fn render_topbar(
     let overlays_snapshot = view.overlays.clone();
     let entity = cx.entity().downgrade();
     let entity_for_overlays = cx.entity().downgrade();
+    let entity_for_exc = cx.entity().downgrade();
+    let entity_for_scope = cx.entity().downgrade();
 
     div()
         .w_full()
@@ -114,6 +121,7 @@ pub fn render_topbar(
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.switch_tab(page, cx);
                         }))
+                        .child(Icon::new(page.icon_name()).xsmall())
                         .child(
                             div()
                                 .text_xs()
@@ -251,10 +259,9 @@ pub fn render_topbar(
                                         )
                                         .when(is_selected, |el| {
                                             el.child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(DevToolsTheme::success_green())
-                                                    .child("●"),
+                                                Icon::new(IconName::Check)
+                                                    .xsmall()
+                                                    .text_color(DevToolsTheme::success_green()),
                                             )
                                         })
                                 }))
@@ -264,7 +271,8 @@ pub fn render_topbar(
                     Button::new("btn-hot-reload")
                         .small()
                         .compact()
-                        .label("⚡ Reload")
+                        .icon(Icon::new(IconName::Zap))
+                        .label("Reload")
                         .tooltip("Hot Reload (⌘R)")
                         .on_click(cx.listener(|this, _, _, _| {
                             this.send_cmd(BackendCommand::HotReload);
@@ -274,7 +282,8 @@ pub fn render_topbar(
                     Button::new("btn-hot-restart")
                         .small()
                         .compact()
-                        .label("🔄 Restart")
+                        .icon(Icon::new(IconName::RotateCw))
+                        .label("Restart")
                         .tooltip("Hot Restart (⌘⇧R)")
                         .on_click(cx.listener(|this, _, _, _| {
                             this.send_cmd(BackendCommand::HotRestart);
@@ -285,11 +294,219 @@ pub fn render_topbar(
                         .small()
                         .compact()
                         .selected(inspector_active)
-                        .label("🎯 Inspect")
+                        .icon(Icon::new(IconName::Crosshair))
+                        .label("Inspect")
                         .tooltip("Toggle Select Widget Mode on device (ext.flutter.inspector.show)")
                         .on_click(cx.listener(|this, _, _, _| {
                             this.toggle_overlay(ServiceOverlay::Inspector);
                         })),
+                )
+                .child(
+                    Popover::new("exc-pause-mode-popover")
+                        .anchor(Anchor::TopRight)
+                        .trigger(
+                            Button::new("btn-exc-pause-mode")
+                                .small()
+                                .compact()
+                                .dropdown_caret(true)
+                                .selected(exc_mode != ExceptionPauseMode::None)
+                                .icon(Icon::new(
+                                    if exc_mode == ExceptionPauseMode::None {
+                                        IconName::Shield
+                                    } else {
+                                        IconName::ShieldAlert
+                                    },
+                                ))
+                                .label(exc_mode.label())
+                                .tooltip("Configure Dart Exception Breakpoints (Off / Uncaught / All)"),
+                        )
+                        .content(move |_, _, _| {
+                            let entity_exc = entity_for_exc.clone();
+                            let current_exc = exc_mode;
+                            let choices = [
+                                (
+                                    ExceptionPauseMode::None,
+                                    DevToolsTheme::text_secondary(),
+                                ),
+                                (
+                                    ExceptionPauseMode::Unhandled,
+                                    DevToolsTheme::warning_yellow(),
+                                ),
+                                (
+                                    ExceptionPauseMode::All,
+                                    DevToolsTheme::error_red(),
+                                ),
+                            ];
+
+                            div()
+                                .w(px(260.0))
+                                .p_1p5()
+                                .flex()
+                                .flex_col()
+                                .gap_0p5()
+                                .child(
+                                    div()
+                                        .px_2()
+                                        .py_1()
+                                        .text_xs()
+                                        .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                        .text_color(DevToolsTheme::text_secondary())
+                                        .child("Exception Breakpoints"),
+                                )
+                                .children(choices.into_iter().map(|(mode, color)| {
+                                    let is_active = mode == current_exc;
+                                    let entity_click = entity_exc.clone();
+                                    div()
+                                        .id(SharedString::from(format!(
+                                            "exc-mode-item-{}",
+                                            mode.vm_service_mode()
+                                        )))
+                                        .px_2()
+                                        .py_1p5()
+                                        .rounded(px(4.0))
+                                        .cursor_pointer()
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .when(is_active, |el| el.bg(DevToolsTheme::bg_selected()))
+                                        .when(!is_active, |el| {
+                                            el.hover(|h| h.bg(DevToolsTheme::bg_hover()))
+                                        })
+                                        .on_click(move |_, _, cx| {
+                                            let _ = entity_click.update(cx, |this, cx| {
+                                                this.exception_pause_mode = mode;
+                                                this.send_cmd(
+                                                    BackendCommand::SetExceptionPauseMode(mode),
+                                                );
+                                                cx.notify();
+                                            });
+                                        })
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .flex_col()
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                                        .text_color(color)
+                                                        .child(mode.label()),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(DevToolsTheme::text_secondary())
+                                                        .child(mode.description()),
+                                                ),
+                                        )
+                                        .when(is_active, |el| {
+                                            el.child(
+                                                Icon::new(IconName::Check)
+                                                    .xsmall()
+                                                    .text_color(DevToolsTheme::success_green()),
+                                            )
+                                        })
+                                }))
+                        }),
+                )
+                .child(
+                    Popover::new("debug-scope-popover")
+                        .anchor(Anchor::TopRight)
+                        .trigger(
+                            Button::new("btn-debug-scope")
+                                .small()
+                                .compact()
+                                .dropdown_caret(true)
+                                .selected(lib_scope != DebugLibraryScope::MyCodeOnly)
+                                .icon(Icon::new(
+                                    if lib_scope == DebugLibraryScope::MyCodeOnly {
+                                        IconName::Code
+                                    } else {
+                                        IconName::Bug
+                                    },
+                                ))
+                                .label(lib_scope.label())
+                                .tooltip("Configure Debug Library Stepping Scope (My Code / +Packages / +SDK)"),
+                        )
+                        .content(move |_, _, _| {
+                            let entity_sc = entity_for_scope.clone();
+                            let current_sc = lib_scope;
+                            let scopes = [
+                                DebugLibraryScope::MyCodeOnly,
+                                DebugLibraryScope::MyCodeAndPackages,
+                                DebugLibraryScope::AllCode,
+                            ];
+
+                            div()
+                                .w(px(280.0))
+                                .p_1p5()
+                                .flex()
+                                .flex_col()
+                                .gap_0p5()
+                                .child(
+                                    div()
+                                        .px_2()
+                                        .py_1()
+                                        .text_xs()
+                                        .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                        .text_color(DevToolsTheme::text_secondary())
+                                        .child("Debug Library Scope"),
+                                )
+                                .children(scopes.into_iter().map(|scope| {
+                                    let is_active = scope == current_sc;
+                                    let entity_click = entity_sc.clone();
+                                    div()
+                                        .id(SharedString::from(format!(
+                                            "debug-scope-item-{}",
+                                            scope.label()
+                                        )))
+                                        .px_2()
+                                        .py_1p5()
+                                        .rounded(px(4.0))
+                                        .cursor_pointer()
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .when(is_active, |el| el.bg(DevToolsTheme::bg_selected()))
+                                        .when(!is_active, |el| {
+                                            el.hover(|h| h.bg(DevToolsTheme::bg_hover()))
+                                        })
+                                        .on_click(move |_, _, cx| {
+                                            let _ = entity_click.update(cx, |this, cx| {
+                                                this.debug_library_scope = scope;
+                                                this.send_cmd(
+                                                    BackendCommand::SetDebugLibraryScope(scope),
+                                                );
+                                                cx.notify();
+                                            });
+                                        })
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .flex_col()
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                                        .text_color(DevToolsTheme::text_primary())
+                                                        .child(scope.label()),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(DevToolsTheme::text_secondary())
+                                                        .child(scope.description()),
+                                                ),
+                                        )
+                                        .when(is_active, |el| {
+                                            el.child(
+                                                Icon::new(IconName::Check)
+                                                    .xsmall()
+                                                    .text_color(DevToolsTheme::success_green()),
+                                            )
+                                        })
+                                }))
+                        }),
                 )
                 .child(
                     Popover::new("overlays-menu-popover")
@@ -299,7 +516,8 @@ pub fn render_topbar(
                                 .small()
                                 .compact()
                                 .dropdown_caret(true)
-                                .label("🧩 Overlays")
+                                .icon(Icon::new(IconName::Layers))
+                                .label("Overlays")
                                 .tooltip("Toggle Flutter Service Extension Overlays"),
                         )
                         .content(move |_, _, _| {
@@ -379,7 +597,7 @@ pub fn render_topbar(
                     Button::new("btn-screenshot")
                         .small()
                         .compact()
-                        .label("📸")
+                        .icon(Icon::new(IconName::Camera))
                         .tooltip("Capture Screenshot from active Flutter session")
                         .on_click(cx.listener(|this, _, _, _| {
                             this.send_cmd(BackendCommand::TakeScreenshot);
@@ -389,7 +607,8 @@ pub fn render_topbar(
                     Button::new("btn-web-devtools")
                         .small()
                         .compact()
-                        .label("🌐 Web")
+                        .icon(Icon::new(IconName::Globe))
+                        .label("Web")
                         .tooltip("Open official Web DevTools in browser (for CPU Flame Chart)")
                         .on_click(cx.listener(|this, _, _, _| {
                             this.send_cmd(BackendCommand::OpenWebDevTools {

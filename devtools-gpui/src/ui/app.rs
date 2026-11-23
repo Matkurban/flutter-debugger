@@ -1,6 +1,7 @@
 use async_channel::{Receiver, Sender};
 use flutter_debugger_protocol::{
-    ActiveSessionRecord, OverlayState, ServiceOverlay, default_sessions_dir,
+    ActiveSessionRecord, DebugLibraryScope, ExceptionPauseMode, OverlayState, ServiceOverlay,
+    default_sessions_dir,
 };
 use gpui_kit::{
     AppContext as _, ClipboardItem, Context, FocusHandle, InteractiveElement as _, IntoElement,
@@ -45,6 +46,8 @@ pub struct RootView {
     pub active_session_id: Option<String>,
     pub connection: ConnectionStatus,
     pub overlays: OverlayState,
+    pub exception_pause_mode: ExceptionPauseMode,
+    pub debug_library_scope: DebugLibraryScope,
     pub toast_banner: Option<(String, bool)>,
     pub focus_handle: FocusHandle,
     pub network: NetworkTabState,
@@ -141,6 +144,8 @@ impl RootView {
             active_session_id: None,
             connection: ConnectionStatus::WaitingForSession,
             overlays: OverlayState::default(),
+            exception_pause_mode: ExceptionPauseMode::None,
+            debug_library_scope: DebugLibraryScope::MyCodeOnly,
             toast_banner: None,
             focus_handle,
             network: NetworkTabState::new(net_search),
@@ -222,14 +227,28 @@ impl RootView {
             BackendEvent::OverlayStateUpdated(overlays) => {
                 self.overlays = overlays;
             }
+            BackendEvent::DebugOptionsUpdated {
+                exception_pause_mode,
+                debug_library_scope,
+            } => {
+                self.exception_pause_mode = exception_pause_mode;
+                self.debug_library_scope = debug_library_scope;
+            }
             BackendEvent::HttpRequestsBatch(batch) => {
                 let newly_selected = self.network.merge_batch(batch);
-                if let Some(id) = newly_selected {
-                    self.send_cmd(BackendCommand::FetchHttpRequestDetail { request_id: id });
+                if let Some((id, isolate_id)) = newly_selected {
+                    self.network.mark_detail_loading(&id);
+                    self.send_cmd(BackendCommand::FetchHttpRequestDetail {
+                        request_id: id,
+                        isolate_id,
+                    });
                 }
             }
             BackendEvent::HttpRequestDetailLoaded { request_id, detail } => {
                 self.network.apply_detail(&request_id, detail);
+            }
+            BackendEvent::HttpRequestDetailFailed { request_id, error } => {
+                self.network.apply_detail_error(&request_id, error);
             }
             BackendEvent::WidgetTreeLoaded(root) => {
                 let first_id = self.inspector.set_root_tree(root);
@@ -248,9 +267,17 @@ impl RootView {
                 selected_node,
                 properties,
             } => {
-                self.inspector
-                    .apply_device_selection(tree, selected_node, properties);
+                self.inspector.apply_device_selection(
+                    tree,
+                    selected_node.clone(),
+                    properties,
+                );
                 self.active_page = DevToolsPage::Inspector;
+                if self.inspector.auto_jump_to_source
+                    && let Some(loc) = self.inspector.resolve_jump_location(&selected_node)
+                {
+                    self.jump_to_zed(loc);
+                }
             }
             BackendEvent::WidgetPropertiesLoaded {
                 value_id,

@@ -34,6 +34,7 @@ echo "==> [4/6] Building release flutter-debugger-server..."
 cargo build --release
 
 mkdir -p "$INSTALL_DIR"
+rm -f "$INSTALLED_SERVER_BIN"
 cp "$REPO_ROOT/server/target/release/flutter-debugger-server" "$INSTALLED_SERVER_BIN"
 chmod +x "$INSTALLED_SERVER_BIN"
 
@@ -43,6 +44,7 @@ if [[ "$SERVER_ONLY" -eq 0 ]]; then
   cargo clippy --all-targets -- -D warnings
   cargo test --all-targets
   cargo build --release
+  rm -f "$INSTALLED_GUI_BIN"
   cp "$REPO_ROOT/devtools-gpui/target/release/flutter-devtools-gpui" "$INSTALLED_GUI_BIN"
   chmod +x "$INSTALLED_GUI_BIN"
 else

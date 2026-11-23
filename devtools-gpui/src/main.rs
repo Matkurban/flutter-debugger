@@ -11,7 +11,7 @@ use backend::{BackendCommand, spawn_backend_worker};
 use cli::{CliLaunchArgs, print_usage};
 use gpui_kit::{
     AppContext as _, Bounds, KeyBinding, WindowBounds, WindowOptions,
-    assets::Assets,
+    assets::AllAssets,
     component::{Theme, ThemeMode},
     px, size,
 };
@@ -55,7 +55,7 @@ fn main() {
     let (cmd_tx, event_rx) = spawn_backend_worker(launch_args.clone());
 
     gpui_kit::application()
-        .with_assets(Assets)
+        .with_assets(AllAssets)
         .run(move |cx| {
             gpui_kit::init(cx);
             Theme::change(ThemeMode::Dark, None, cx);

@@ -42,10 +42,10 @@ pub fn format_and_tokenize_json(raw: &str) -> FormattedBody {
     };
 
     let all_lines: Vec<&str> = pretty.lines().collect();
-    let total_lines = all_lines.len();
-    let truncated = raw_len > MAX_HIGHLIGHT_BYTES || total_lines > MAX_HIGHLIGHT_LINES;
+    let total_lines = all_lines.len().max(if raw.is_empty() { 0 } else { 1 });
+    let mut truncated = raw_len > MAX_HIGHLIGHT_BYTES || total_lines > MAX_HIGHLIGHT_LINES;
 
-    let display_slice = if total_lines > MAX_HIGHLIGHT_LINES {
+    let display_slice = if all_lines.len() > MAX_HIGHLIGHT_LINES {
         &all_lines[..MAX_HIGHLIGHT_LINES]
     } else {
         &all_lines[..]
@@ -54,7 +54,17 @@ pub fn format_and_tokenize_json(raw: &str) -> FormattedBody {
     let mut lines = Vec::with_capacity(display_slice.len());
     let mut byte_budget = 0usize;
     for &line in display_slice {
-        if byte_budget + line.len() > MAX_HIGHLIGHT_BYTES {
+        let remaining = MAX_HIGHLIGHT_BYTES.saturating_sub(byte_budget);
+        if remaining == 0 {
+            truncated = true;
+            break;
+        }
+        if line.len() > remaining {
+            let cut = line.floor_char_boundary(remaining);
+            if cut > 0 {
+                lines.push(tokenize_pretty_json_line(&line[..cut]));
+            }
+            truncated = true;
             break;
         }
         byte_budget += line.len();
@@ -67,6 +77,35 @@ pub fn format_and_tokenize_json(raw: &str) -> FormattedBody {
         truncated,
         full_copy_text: pretty,
         lines,
+    }
+}
+
+impl FormattedBody {
+    /// Assembles all visible highlighted lines into a single contiguous multi-line string
+    /// together with non-overlapping UTF-8 byte ranges and their [`JsonTokenKind`],
+    /// suitable for `gpui_kit::base::SelectableText::new(...).highlights(...)`.
+    pub fn to_selectable_text_and_highlights(
+        &self,
+    ) -> (String, Vec<(std::ops::Range<usize>, JsonTokenKind)>) {
+        let mut text = String::new();
+        let mut highlights = Vec::new();
+
+        for (line_idx, line) in self.lines.iter().enumerate() {
+            if line_idx > 0 {
+                text.push('\n');
+            }
+            for (kind, span_str) in &line.spans {
+                if span_str.is_empty() {
+                    continue;
+                }
+                let start = text.len();
+                text.push_str(span_str);
+                let end = text.len();
+                highlights.push((start..end, *kind));
+            }
+        }
+
+        (text, highlights)
     }
 }
 
@@ -142,4 +181,32 @@ fn tokenize_json_value_tail(val_str: &str) -> Vec<(JsonTokenKind, String)> {
         out.push((JsonTokenKind::Punctuation, ",".to_string()));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn single_line_exceeding_max_highlight_bytes_is_truncated_instead_of_rendering_empty() {
+        let huge_single_line = "x".repeat(MAX_HIGHLIGHT_BYTES + 10_000);
+        let formatted = format_and_tokenize_json(&huge_single_line);
+        assert!(formatted.truncated);
+        assert_eq!(formatted.lines.len(), 1);
+        let (text, highlights) = formatted.to_selectable_text_and_highlights();
+        assert_eq!(text.len(), MAX_HIGHLIGHT_BYTES);
+        assert!(!highlights.is_empty());
+    }
+
+    #[test]
+    fn builds_contiguous_selectable_text_and_highlight_ranges() {
+        let formatted = format_and_tokenize_json(r#"{"name":"flutter","count":42,"ok":true}"#);
+        assert!(!formatted.truncated);
+        let (text, highlights) = formatted.to_selectable_text_and_highlights();
+        assert!(text.contains("\"name\": \"flutter\""));
+        assert!(text.contains("\"count\": 42"));
+        for (range, _) in &highlights {
+            assert!(text.get(range.clone()).is_some());
+        }
+    }
 }

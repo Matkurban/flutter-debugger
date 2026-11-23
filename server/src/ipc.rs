@@ -8,8 +8,8 @@ use tokio::net::TcpStream;
 use crate::cache::{DiskCache, normalize_project_key, now_unix};
 
 pub use flutter_debugger_protocol::{
-    ActiveSessionRecord, IpcRequest, IpcResponse, OverlayState, ServiceOverlay, is_pid_alive,
-    list_active_sessions_in,
+    ActiveSessionRecord, DebugLibraryScope, ExceptionPauseMode, IpcRequest, IpcResponse,
+    OverlayState, ServiceOverlay, is_pid_alive, list_active_sessions_in,
 };
 
 pub fn generate_session_id() -> String {

@@ -2,9 +2,11 @@ use std::collections::VecDeque;
 
 use gpui_kit::{
     Bounds, ContentMask, Context, IntoElement, ParentElement as _, PathBuilder, Pixels, Point,
-    Styled as _, Window, canvas,
+    Styled as _, Window,
+    assets::IconName,
+    canvas,
     component::{
-        Selectable as _, Sizable as _,
+        Icon, Selectable as _, Sizable as _,
         button::Button,
     },
     div, point, px,
@@ -88,10 +90,15 @@ impl RootView {
                                     .small()
                                     .compact()
                                     .selected(polling)
-                                    .label(if polling {
-                                        "● Live Polling (1s)"
+                                    .icon(Icon::new(if polling {
+                                        IconName::CircleDot
                                     } else {
-                                        "⏸ Paused"
+                                        IconName::Pause
+                                    }))
+                                    .label(if polling {
+                                        "Live Polling (1s)"
+                                    } else {
+                                        "Paused"
                                     })
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.memory.polling = !this.memory.polling;
@@ -105,7 +112,8 @@ impl RootView {
                                 Button::new("mem-gc-btn")
                                     .small()
                                     .compact()
-                                    .label("🗑 Force GC")
+                                    .icon(Icon::new(IconName::Trash))
+                                    .label("Force GC")
                                     .tooltip("Trigger full Dart VM Garbage Collection (getAllocationProfile gc: true)")
                                     .on_click(cx.listener(|this, _, _, _| {
                                         this.send_cmd(BackendCommand::ForceGc);
@@ -115,6 +123,7 @@ impl RootView {
                                 Button::new("mem-clear-btn")
                                     .small()
                                     .compact()
+                                    .icon(Icon::new(IconName::Ban))
                                     .label("Clear")
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.memory.snapshots.clear();

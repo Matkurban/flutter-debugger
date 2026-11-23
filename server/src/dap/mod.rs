@@ -124,6 +124,7 @@ pub async fn run_dap_proxy() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             if msg_type != "request" || (command != "launch" && command != "attach") {
+                state.lock().await.sync_from_zed_request(&msg);
                 pre_launch_queue.push(msg);
                 continue;
             }
@@ -134,6 +135,7 @@ pub async fn run_dap_proxy() -> Result<(), Box<dyn std::error::Error>> {
                 &default_cwd,
                 custom_sdk.as_deref(),
             );
+            state.lock().await.sync_from_zed_request(&msg);
 
             let (proj_root, executable, is_test, mode, device_id, device_notice) = match resolved {
                 Some(r) => (
@@ -202,6 +204,9 @@ pub async fn run_dap_proxy() -> Result<(), Box<dyn std::error::Error>> {
 
             let out_state = Arc::clone(&state);
             let out_cache = cache.clone();
+            let cache_for_reader = cache.clone();
+            let session_id_for_reader = session_id.clone();
+            let stop_notify_for_reader = Arc::clone(&stop_notify);
             let out_stdout = Arc::clone(&zed_stdout);
             let out_sdk = custom_sdk.clone();
             reader_task = Some(tokio::spawn(async move {
@@ -268,6 +273,9 @@ pub async fn run_dap_proxy() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
+
+                remove_session_record_by_id(&cache_for_reader, &session_id_for_reader);
+                stop_notify_for_reader.notify_one();
             }));
 
             if let Some(init_msg) = saved_initialize.take() {
@@ -307,6 +315,7 @@ pub async fn run_dap_proxy() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
 
+        state.lock().await.sync_from_zed_request(&msg);
         if to_adapter_tx.send(msg).await.is_err() {
             break;
         }
@@ -420,6 +429,7 @@ async fn handle_ipc_connection(
                     device_id: dev,
                     vm_service_uri: vm,
                     devtools_uri: dt,
+                    ..Default::default()
                 }
             } else {
                 match inject_and_await(
@@ -439,6 +449,7 @@ async fn handle_ipc_connection(
                         device_id: dev,
                         vm_service_uri: vm,
                         devtools_uri: dt,
+                        ..Default::default()
                     },
                     Err(err) => IpcResponse {
                         ok: false,
@@ -448,6 +459,7 @@ async fn handle_ipc_connection(
                         device_id: dev,
                         vm_service_uri: vm,
                         devtools_uri: dt,
+                        ..Default::default()
                     },
                 }
             }
@@ -463,6 +475,7 @@ async fn handle_ipc_connection(
                     device_id: dev,
                     vm_service_uri: vm,
                     devtools_uri: dt,
+                    ..Default::default()
                 }
             } else {
                 match inject_and_await(
@@ -482,6 +495,7 @@ async fn handle_ipc_connection(
                         device_id: dev,
                         vm_service_uri: vm,
                         devtools_uri: dt,
+                        ..Default::default()
                     },
                     Err(err) => IpcResponse {
                         ok: false,
@@ -491,6 +505,7 @@ async fn handle_ipc_connection(
                         device_id: dev,
                         vm_service_uri: vm,
                         devtools_uri: dt,
+                        ..Default::default()
                     },
                 }
             }
@@ -498,6 +513,8 @@ async fn handle_ipc_connection(
         Ok(IpcRequest::Stop) => {
             let (mode, dev, vm, dt) = snapshot_meta(&state).await;
             let session_id = state.lock().await.session_id.clone();
+            // Remove disk session record FIRST so any immediate CodeLens refresh sees no active session.
+            remove_session_record_by_id(&cache, &session_id);
             let resp = IpcResponse {
                 ok: true,
                 message: "Stopped Flutter debug session".to_string(),
@@ -506,6 +523,7 @@ async fn handle_ipc_connection(
                 device_id: dev,
                 vm_service_uri: vm,
                 devtools_uri: dt,
+                ..Default::default()
             };
             if let Ok(mut payload) = serde_json::to_string(&resp) {
                 payload.push('\n');
@@ -561,6 +579,7 @@ async fn handle_ipc_connection(
                     device_id: dev,
                     vm_service_uri: vm,
                     devtools_uri: dt,
+                    ..Default::default()
                 },
                 Err(dap_err) => {
                     if let Some(vm_uri) = vm.as_deref()
@@ -575,6 +594,7 @@ async fn handle_ipc_connection(
                             device_id: dev,
                             vm_service_uri: vm,
                             devtools_uri: dt,
+                            ..Default::default()
                         }
                     } else {
                         IpcResponse {
@@ -585,6 +605,7 @@ async fn handle_ipc_connection(
                             device_id: dev,
                             vm_service_uri: vm,
                             devtools_uri: dt,
+                            ..Default::default()
                         }
                     }
                 }
@@ -617,6 +638,7 @@ async fn handle_ipc_connection(
                     device_id: dev,
                     vm_service_uri: vm,
                     devtools_uri: Some(url),
+                    ..Default::default()
                 }
             } else {
                 IpcResponse {
@@ -627,6 +649,7 @@ async fn handle_ipc_connection(
                     device_id: dev,
                     vm_service_uri: vm,
                     devtools_uri: dt,
+                    ..Default::default()
                 }
             }
         }
@@ -658,6 +681,7 @@ async fn handle_ipc_connection(
                     device_id: dev,
                     vm_service_uri: vm,
                     devtools_uri: dt,
+                    ..Default::default()
                 }
             } else {
                 let exe = crate::project::resolve_sdk_executable(
@@ -682,6 +706,7 @@ async fn handle_ipc_connection(
                         device_id: dev,
                         vm_service_uri: vm,
                         devtools_uri: dt,
+                        ..Default::default()
                     },
                     Ok(out) => IpcResponse {
                         ok: false,
@@ -694,13 +719,97 @@ async fn handle_ipc_connection(
                         device_id: dev,
                         vm_service_uri: vm,
                         devtools_uri: dt,
+                        ..Default::default()
                     },
                     Err(err) => IpcResponse::err(format!("Failed to run screenshot: {err}")),
                 }
             }
         }
-        Ok(IpcRequest::Status) => {
+        Ok(IpcRequest::SetExceptionPauseMode { mode: pause_mode }) => {
             let (mode, dev, vm, dt) = snapshot_meta(&state).await;
+            let filters = pause_mode.dap_filters();
+            match inject_and_await(
+                &state,
+                &to_adapter_tx,
+                "setExceptionBreakpoints",
+                json!({ "filters": filters }),
+                8,
+            )
+            .await
+            {
+                Ok((_, ms)) => {
+                    let scope = {
+                        let mut g = state.lock().await;
+                        g.exception_pause_mode = pause_mode;
+                        g.debug_library_scope
+                    };
+                    IpcResponse {
+                        ok: true,
+                        message: format!("Exception breakpoints: {}", pause_mode.description()),
+                        duration_ms: Some(ms),
+                        mode: Some(mode),
+                        device_id: dev,
+                        vm_service_uri: vm,
+                        devtools_uri: dt,
+                        exception_pause_mode: Some(pause_mode),
+                        debug_library_scope: Some(scope),
+                    }
+                }
+                Err(err) => IpcResponse::err(format!(
+                    "Failed to update exception breakpoints: {err}"
+                )),
+            }
+        }
+        Ok(IpcRequest::SetDebugLibraryScope { scope }) => {
+            let (mode, dev, vm, dt) = snapshot_meta(&state).await;
+            let (debug_sdk, debug_pkg) = scope.dap_flags();
+            match inject_and_await(
+                &state,
+                &to_adapter_tx,
+                "updateDebugOptions",
+                json!({
+                    "debugSdkLibraries": debug_sdk,
+                    "debugExternalPackageLibraries": debug_pkg
+                }),
+                8,
+            )
+            .await
+            {
+                Ok((_, ms)) => {
+                    let pause_mode = {
+                        let mut g = state.lock().await;
+                        g.debug_library_scope = scope;
+                        g.exception_pause_mode
+                    };
+                    IpcResponse {
+                        ok: true,
+                        message: format!("Debug scope: {}", scope.description()),
+                        duration_ms: Some(ms),
+                        mode: Some(mode),
+                        device_id: dev,
+                        vm_service_uri: vm,
+                        devtools_uri: dt,
+                        exception_pause_mode: Some(pause_mode),
+                        debug_library_scope: Some(scope),
+                    }
+                }
+                Err(err) => {
+                    IpcResponse::err(format!("Failed to update debug library scope: {err}"))
+                }
+            }
+        }
+        Ok(IpcRequest::Status) => {
+            let (mode, dev, vm, dt, pause_mode, scope) = {
+                let g = state.lock().await;
+                (
+                    g.mode.clone(),
+                    g.device_id.clone(),
+                    g.vm_service_uri.clone(),
+                    g.devtools_uri.clone(),
+                    g.exception_pause_mode,
+                    g.debug_library_scope,
+                )
+            };
             IpcResponse {
                 ok: true,
                 message: "active".to_string(),
@@ -709,6 +818,8 @@ async fn handle_ipc_connection(
                 device_id: dev,
                 vm_service_uri: vm,
                 devtools_uri: dt,
+                exception_pause_mode: Some(pause_mode),
+                debug_library_scope: Some(scope),
             }
         }
         Err(err) => IpcResponse::err(format!("Invalid IPC request: {err}")),
@@ -750,6 +861,7 @@ async fn handle_overlay_toggle(
                 device_id: guard.device_id.clone(),
                 vm_service_uri: guard.vm_service_uri.clone(),
                 devtools_uri: guard.devtools_uri.clone(),
+                ..Default::default()
             };
         }
         let (m, p, label) = guard.overlays.preview_toggle(overlay);
@@ -785,6 +897,7 @@ async fn handle_overlay_toggle(
                 device_id: dev,
                 vm_service_uri: vm,
                 devtools_uri: dt,
+                ..Default::default()
             }
         }
         Err(dap_err) => {
@@ -801,6 +914,7 @@ async fn handle_overlay_toggle(
                     device_id: dev,
                     vm_service_uri: vm,
                     devtools_uri: dt,
+                    ..Default::default()
                 };
             }
             IpcResponse {
@@ -811,6 +925,7 @@ async fn handle_overlay_toggle(
                 device_id: dev,
                 vm_service_uri: vm,
                 devtools_uri: dt,
+                ..Default::default()
             }
         }
     }
@@ -885,4 +1000,67 @@ pub fn open_url_in_browser(url: &str) {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ipc::{list_active_sessions, send_ipc_request};
+
+    #[tokio::test]
+    async fn stop_ipc_removes_session_record_before_returning_ok_response() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = DiskCache::with_root(dir.path().join(".cache"));
+        let proj_root = dir.path().join("app");
+        std::fs::create_dir_all(&proj_root).expect("mkdir");
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+
+        let session_id = "test-stop-immediate-1".to_string();
+        let state = Arc::new(Mutex::new(ProxySessionState::new(session_id.clone())));
+        {
+            let mut g = state.lock().await;
+            g.project_root = Some(proj_root.clone());
+            g.mode = "debug".to_string();
+        }
+        persist_session(&cache, port, &state).await;
+        assert_eq!(list_active_sessions(&cache).len(), 1);
+
+        // Keep `to_adapter_rx` open WITHOUT responding to `"terminate"`, so `inject_and_await`
+        // after `write_half` will wait up to 3s — proving `list_active_sessions` is already empty
+        // the instant `send_ipc_request` receives `IpcResponse { ok: true }`!
+        let (to_adapter_tx, _to_adapter_rx) = mpsc::channel::<Value>(16);
+        let child_handle: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
+        let zed_stdout = Arc::new(Mutex::new(tokio::io::stdout()));
+        let stop_notify = Arc::new(Notify::new());
+
+        let state_srv = Arc::clone(&state);
+        let cache_srv = cache.clone();
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            handle_ipc_connection(
+                stream,
+                state_srv,
+                to_adapter_tx,
+                cache_srv,
+                child_handle,
+                None,
+                zed_stdout,
+                stop_notify,
+            )
+            .await;
+        });
+
+        let resp = send_ipc_request(&cache, &proj_root, &IpcRequest::Stop)
+            .await
+            .expect("stop response");
+        assert!(resp.ok);
+        // At the exact instant the client receives `ok: true`, the session record MUST already be gone.
+        assert!(
+            list_active_sessions(&cache).is_empty(),
+            "Session record must be removed before Stop IPC response returns"
+        );
+        server_task.abort();
+    }
 }

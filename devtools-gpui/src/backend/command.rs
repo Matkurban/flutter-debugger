@@ -1,4 +1,6 @@
-use flutter_debugger_protocol::{ActiveSessionRecord, OverlayState, ServiceOverlay};
+use flutter_debugger_protocol::{
+    ActiveSessionRecord, DebugLibraryScope, ExceptionPauseMode, OverlayState, ServiceOverlay,
+};
 
 use crate::protocol::{
     FrameTiming, HttpRequestDetail, HttpRequestRecord, LogEntry, MemorySnapshot, SourceLocation,
@@ -34,6 +36,8 @@ pub enum BackendCommand {
     HotReload,
     HotRestart,
     ToggleOverlay(ServiceOverlay),
+    SetExceptionPauseMode(ExceptionPauseMode),
+    SetDebugLibraryScope(DebugLibraryScope),
     TakeScreenshot,
     OpenWebDevTools {
         page: Option<String>,
@@ -42,6 +46,7 @@ pub enum BackendCommand {
     ClearNetworkProfile,
     FetchHttpRequestDetail {
         request_id: String,
+        isolate_id: Option<String>,
     },
     RefreshWidgetTree,
     SelectWidgetNode {
@@ -69,10 +74,18 @@ pub enum BackendEvent {
         is_error: bool,
     },
     OverlayStateUpdated(OverlayState),
+    DebugOptionsUpdated {
+        exception_pause_mode: ExceptionPauseMode,
+        debug_library_scope: DebugLibraryScope,
+    },
     HttpRequestsBatch(Vec<HttpRequestRecord>),
     HttpRequestDetailLoaded {
         request_id: String,
         detail: HttpRequestDetail,
+    },
+    HttpRequestDetailFailed {
+        request_id: String,
+        error: String,
     },
     WidgetTreeLoaded(WidgetTreeNode),
     WidgetChildrenLoaded {

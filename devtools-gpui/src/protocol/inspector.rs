@@ -121,14 +121,30 @@ pub fn parse_widget_children_from_json(v: &Value) -> Vec<WidgetTreeNode> {
         .collect()
 }
 
-/// Constructs official Flutter Widget Inspector `setPubRootDirectories` varargs map (`{ "arg0": "file:///..." }`).
+/// Constructs official Flutter Widget Inspector `addPubRootDirectories` / `setPubRootDirectories`
+/// varargs map (`{ "arg0": "file:///...", "arg1": "file:///..." }`), including both the raw path
+/// and its canonicalized path so macOS symlinks (e.g. `/var` vs `/private/var`) match seamlessly.
 pub fn build_pub_root_directories_params(project_root: &Path) -> Value {
-    let uri = url::Url::from_file_path(project_root)
-        .map(|u| u.to_string())
-        .unwrap_or_else(|_| format!("file://{}", project_root.display()));
-    json!({
-        "arg0": uri
-    })
+    let mut uris: Vec<String> = Vec::new();
+    let to_file_uri = |p: &Path| -> String {
+        url::Url::from_file_path(p)
+            .map(|u| u.to_string().trim_end_matches('/').to_string())
+            .unwrap_or_else(|_| format!("file://{}", p.display()))
+    };
+
+    uris.push(to_file_uri(project_root));
+    if let Ok(canon) = std::fs::canonicalize(project_root) {
+        let canon_uri = to_file_uri(&canon);
+        if !uris.contains(&canon_uri) {
+            uris.push(canon_uri);
+        }
+    }
+
+    let mut obj = serde_json::Map::new();
+    for (idx, uri) in uris.into_iter().enumerate() {
+        obj.insert(format!("arg{idx}"), json!(uri));
+    }
+    Value::Object(obj)
 }
 
 fn parse_creation_location(loc: Option<&Value>) -> Option<SourceLocation> {

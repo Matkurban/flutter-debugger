@@ -4,7 +4,7 @@ pub mod ipc;
 pub mod overlay;
 pub mod session;
 
-pub use ipc::{IpcRequest, IpcResponse};
+pub use ipc::{DebugLibraryScope, ExceptionPauseMode, IpcRequest, IpcResponse};
 pub use overlay::{OverlayState, ServiceOverlay};
 pub use session::{
     ActiveSessionRecord, default_cache_dir, default_sessions_dir, is_pid_alive,

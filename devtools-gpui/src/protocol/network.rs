@@ -1,6 +1,9 @@
+use std::io::Read as _;
+
+use flate2::read::{DeflateDecoder, GzDecoder, ZlibDecoder};
 use serde_json::Value;
 
-use crate::theme::format_micros_local_hms;
+use crate::theme::{format_bytes, format_duration_ms, format_micros_local_hms};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpTimingEvent {
@@ -21,6 +24,7 @@ pub struct HttpRequestDetail {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpRequestRecord {
     pub id: String,
+    pub isolate_id: Option<String>,
     pub method: String,
     pub uri: String,
     pub path_and_query: String,
@@ -39,7 +43,7 @@ pub struct HttpRequestRecord {
     pub error: Option<String>,
     pub events: Vec<HttpTimingEvent>,
     pub detail: Option<HttpRequestDetail>,
-    /// `true` only after `ext.dart.io.getHttpProfileRequest` (or explicit `requestBody`/`responseBody`)
+    /// `true` only after `ext.dart.io.getHttpProfileRequest` (or explicit non-null `requestBody`/`responseBody`)
     /// has been fetched, distinguishing summary headers from full body payloads.
     pub body_loaded: bool,
     /// `true` only when `response.endTime` is present or an error occurred.
@@ -58,12 +62,21 @@ impl HttpRequestRecord {
     /// Parses an entry from `ext.dart.io.getHttpProfile` (`HttpProfileRequestRef` / `HttpProfileRequest`).
     /// Primarily reads official Dart SDK keys `"request"` and `"response"`, with fallback to
     /// legacy `"requestData"` / `"responseData"`.
-    pub fn parse_from_profile_entry(v: &Value) -> Option<Self> {
+    pub fn parse_from_profile_entry(raw_v: &Value) -> Option<Self> {
+        let v = raw_v
+            .get("result")
+            .filter(|r| r.is_object())
+            .unwrap_or(raw_v);
         let id = match v.get("id") {
             Some(Value::String(s)) => s.clone(),
             Some(Value::Number(n)) => n.to_string(),
             _ => return None,
         };
+        let isolate_id = v
+            .get("isolateId")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned);
         let method = v.get("method").and_then(Value::as_str).unwrap_or("GET").to_ascii_uppercase();
         let uri = v.get("uri").and_then(Value::as_str)?.to_string();
         let (host, path_and_query) = split_uri_host_and_path(&uri);
@@ -140,7 +153,10 @@ impl HttpRequestRecord {
             }
         }
 
-        let body_loaded = v.get("requestBody").is_some() || v.get("responseBody").is_some();
+        let is_full_type = v.get("type").and_then(Value::as_str) == Some("HttpProfileRequest");
+        let has_non_null_body = v.get("requestBody").is_some_and(|b| !b.is_null())
+            || v.get("responseBody").is_some_and(|b| !b.is_null());
+        let body_loaded = is_full_type || has_non_null_body;
         let response_complete = end_time_micros.is_some() || error.is_some();
         let has_any_detail = body_loaded || !req_headers.is_empty() || !resp_headers.is_empty();
         let detail = has_any_detail.then(|| Self::parse_detail_from_response(v));
@@ -158,6 +174,7 @@ impl HttpRequestRecord {
 
         Some(Self {
             id,
+            isolate_id,
             method,
             uri,
             path_and_query,
@@ -181,16 +198,36 @@ impl HttpRequestRecord {
         })
     }
 
-    pub fn parse_detail_from_response(v: &Value) -> HttpRequestDetail {
+    pub fn parse_detail_from_response(raw_v: &Value) -> HttpRequestDetail {
+        let v = raw_v
+            .get("result")
+            .filter(|r| r.is_object())
+            .unwrap_or(raw_v);
         let req_obj = v.get("request").or_else(|| v.get("requestData"));
         let resp_obj = v.get("response").or_else(|| v.get("responseData"));
 
         let request_headers = extract_headers_map(req_obj.and_then(|r| r.get("headers")));
         let response_headers = extract_headers_map(resp_obj.and_then(|r| r.get("headers")));
-        let request_body = decode_body_field(v.get("requestBody"))
-            .or_else(|| decode_body_field(req_obj.and_then(|r| r.get("body"))));
-        let response_body = decode_body_field(v.get("responseBody"))
-            .or_else(|| decode_body_field(resp_obj.and_then(|r| r.get("body"))));
+        let req_encoding = find_header_ci(&request_headers, "content-encoding");
+        let resp_encoding = find_header_ci(&response_headers, "content-encoding");
+
+        let request_body =
+            decode_body_field_with_encoding(v.get("requestBody"), req_encoding.as_deref()).or_else(
+                || {
+                    decode_body_field_with_encoding(
+                        req_obj.and_then(|r| r.get("body")),
+                        req_encoding.as_deref(),
+                    )
+                },
+            );
+        let response_body =
+            decode_body_field_with_encoding(v.get("responseBody"), resp_encoding.as_deref())
+                .or_else(|| {
+                    decode_body_field_with_encoding(
+                        resp_obj.and_then(|r| r.get("body")),
+                        resp_encoding.as_deref(),
+                    )
+                });
 
         let conn_info = resp_obj
             .and_then(|r| r.get("connectionInfo"))
@@ -235,6 +272,90 @@ impl HttpRequestRecord {
             }
         }
         parts.join(" ")
+    }
+
+    /// Formats the complete HTTP request and response (General, Request Headers, Request Body,
+    /// Response Headers, Response Body) into a structured plain-text report for one-click copying.
+    pub fn to_full_text_report(&self) -> String {
+        let status_text = match (self.status_code, self.reason_phrase.as_deref()) {
+            (Some(code), Some(phrase)) if !phrase.is_empty() => format!("{code} {phrase}"),
+            (Some(code), _) => code.to_string(),
+            (None, _) if self.error.is_some() => "Error".to_string(),
+            (None, _) => "Pending".to_string(),
+        };
+        let detail = self.detail.as_ref();
+
+        let mut out = String::with_capacity(1024);
+        out.push_str("=== General ===\n");
+        out.push_str(&format!("Request Method: {}\n", self.method));
+        out.push_str(&format!("Request URL: {}\n", self.uri));
+        out.push_str(&format!("Status: {status_text}\n"));
+        out.push_str(&format!(
+            "Content-Type: {}\n",
+            self.content_type.as_deref().unwrap_or("-")
+        ));
+        out.push_str(&format!("Duration: {}\n", format_duration_ms(self.duration_ms)));
+        out.push_str(&format!("Timestamp: {}\n", self.timestamp_hms));
+        out.push_str(&format!("Request Size: {}\n", format_bytes(self.request_bytes)));
+        out.push_str(&format!("Response Size: {}\n", format_bytes(self.response_bytes)));
+        if let Some(addr) = detail.and_then(|d| d.remote_address.as_deref()) {
+            out.push_str(&format!("Remote Address: {addr}\n"));
+        }
+        if let Some(err) = self.error.as_deref() {
+            out.push_str(&format!("Error: {err}\n"));
+        }
+
+        out.push_str("\n=== Request Headers ===\n");
+        if let Some(d) = detail
+            && !d.request_headers.is_empty()
+        {
+            for (k, v) in &d.request_headers {
+                out.push_str(&format!("{k}: {v}\n"));
+            }
+        } else {
+            out.push_str("<none>\n");
+        }
+
+        out.push_str("\n=== Request Body ===\n");
+        match detail
+            .and_then(|d| d.request_body.as_deref())
+            .filter(|s| !s.is_empty())
+        {
+            Some(body) => {
+                out.push_str(body);
+                if !body.ends_with('\n') {
+                    out.push('\n');
+                }
+            }
+            None => out.push_str("<empty>\n"),
+        }
+
+        out.push_str("\n=== Response Headers ===\n");
+        if let Some(d) = detail
+            && !d.response_headers.is_empty()
+        {
+            for (k, v) in &d.response_headers {
+                out.push_str(&format!("{k}: {v}\n"));
+            }
+        } else {
+            out.push_str("<none>\n");
+        }
+
+        out.push_str("\n=== Response Body ===\n");
+        match detail
+            .and_then(|d| d.response_body.as_deref())
+            .filter(|s| !s.is_empty())
+        {
+            Some(body) => {
+                out.push_str(body);
+                if !body.ends_with('\n') {
+                    out.push('\n');
+                }
+            }
+            None => out.push_str("<empty>\n"),
+        }
+
+        out
     }
 }
 
@@ -320,27 +441,81 @@ fn shorten_mime_type(content_type: Option<&str>, path: &str) -> String {
 
 /// Decodes `requestBody` / `responseBody` from `ext.dart.io.getHttpProfileRequest`.
 /// Official Dart VM Service protocol transmits bodies as `Vec<u8>` byte arrays (`Uint8List`).
+/// Transparently decompresses `gzip` (by magic bytes `[0x1f, 0x8b]` or `Content-Encoding: gzip`)
+/// and `deflate` (`Content-Encoding: deflate`) payloads before UTF-8 decoding.
+#[cfg(test)]
 fn decode_body_field(val: Option<&Value>) -> Option<String> {
+    decode_body_field_with_encoding(val, None)
+}
+
+fn decode_body_field_with_encoding(
+    val: Option<&Value>,
+    content_encoding: Option<&str>,
+) -> Option<String> {
     let val = val?;
     match val {
         Value::Array(arr) if !arr.is_empty() => {
-            let bytes: Vec<u8> = arr
+            let raw_bytes: Vec<u8> = arr
                 .iter()
                 .filter_map(Value::as_u64)
                 .filter_map(|n| u8::try_from(n).ok())
                 .collect();
-            if bytes.is_empty() {
+            if raw_bytes.is_empty() {
                 return None;
             }
+            let bytes = maybe_decompress_bytes(&raw_bytes, content_encoding);
+            if bytes.contains(&0) {
+                return Some(format_binary_preview(&bytes));
+            }
             match String::from_utf8(bytes) {
-                Ok(s) if !s.chars().any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t')) => Some(s),
-                Ok(s) => Some(format_binary_preview(s.as_bytes())),
+                Ok(s) => {
+                    let total_chars = s.chars().count().max(1);
+                    let ctrl_chars = s
+                        .chars()
+                        .filter(|&c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
+                        .count();
+                    if ctrl_chars * 20 <= total_chars {
+                        Some(s)
+                    } else {
+                        Some(format_binary_preview(s.as_bytes()))
+                    }
+                }
                 Err(err) => Some(format_binary_preview(err.as_bytes())),
             }
         }
         Value::String(s) if !s.is_empty() => Some(s.clone()),
         _ => None,
     }
+}
+
+fn maybe_decompress_bytes(raw: &[u8], content_encoding: Option<&str>) -> Vec<u8> {
+    let enc_lower = content_encoding
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    let is_gzip_magic = raw.len() >= 2 && raw[0] == 0x1f && raw[1] == 0x8b;
+
+    if is_gzip_magic || enc_lower.contains("gzip") {
+        let mut decoder = GzDecoder::new(raw);
+        let mut out = Vec::new();
+        if decoder.read_to_end(&mut out).is_ok() && !out.is_empty() {
+            return out;
+        }
+    }
+
+    if enc_lower.contains("deflate") {
+        let mut zlib = ZlibDecoder::new(raw);
+        let mut out = Vec::new();
+        if zlib.read_to_end(&mut out).is_ok() && !out.is_empty() {
+            return out;
+        }
+        out.clear();
+        let mut raw_deflate = DeflateDecoder::new(raw);
+        if raw_deflate.read_to_end(&mut out).is_ok() && !out.is_empty() {
+            return out;
+        }
+    }
+
+    raw.to_vec()
 }
 
 fn format_binary_preview(bytes: &[u8]) -> String {
@@ -423,5 +598,53 @@ mod tests {
             let decoded = decode_body_field(Some(&Value::String(plain.to_string())));
             assert_eq!(decoded.as_deref(), Some(plain));
         }
+    }
+
+    #[test]
+    fn decompresses_gzip_response_body_and_generates_full_text_report() {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        use std::io::Write as _;
+
+        let raw_payload = r#"{"greeting":"hello from gzip","items":[1,2,3]}"#;
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(raw_payload.as_bytes()).expect("write gz");
+        let gz_bytes = encoder.finish().expect("finish gz");
+
+        let full_json = json!({
+            "type": "HttpProfileRequest",
+            "id": "gz-42",
+            "isolateId": "isolates/999",
+            "method": "GET",
+            "uri": "https://api.example.com/v1/compressed",
+            "startTime": 1_700_000_000_000_000u64,
+            "request": {
+                "headers": { "accept-encoding": ["gzip"] }
+            },
+            "response": {
+                "statusCode": 200,
+                "reasonPhrase": "OK",
+                "endTime": 1_700_000_000_050_000u64,
+                "headers": {
+                    "content-type": ["application/json"],
+                    "content-encoding": ["gzip"]
+                }
+            },
+            "requestBody": [],
+            "responseBody": gz_bytes
+        });
+
+        let rec = HttpRequestRecord::parse_from_profile_entry(&full_json).expect("parse gz");
+        assert_eq!(rec.isolate_id.as_deref(), Some("isolates/999"));
+        assert!(rec.body_loaded);
+        let detail = rec.detail.as_ref().expect("detail");
+        assert_eq!(detail.response_body.as_deref(), Some(raw_payload));
+
+        let report = rec.to_full_text_report();
+        assert!(report.contains("=== General ==="));
+        assert!(report.contains("Request URL: https://api.example.com/v1/compressed"));
+        assert!(report.contains("=== Request Headers ===\naccept-encoding: gzip"));
+        assert!(report.contains("=== Request Body ===\n<empty>"));
+        assert!(report.contains("=== Response Body ===\n{\"greeting\":\"hello from gzip\""));
     }
 }

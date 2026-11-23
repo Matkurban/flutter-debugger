@@ -4,8 +4,10 @@ use std::ops::Range;
 use gpui_kit::{
     Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
     StatefulInteractiveElement as _, Styled as _, UniformListScrollHandle, Window,
+    assets::IconName,
+    base::SelectableText,
     component::{
-        Selectable as _, Sizable as _,
+        Icon, Selectable as _, Sizable as _,
         button::Button,
         h_resizable,
         input::{Input, InputState},
@@ -150,7 +152,12 @@ impl RootView {
                                     .small()
                                     .compact()
                                     .selected(!paused)
-                                    .label(if paused { "▶ Resume" } else { "⏸ Live" })
+                                    .icon(Icon::new(if paused {
+                                        IconName::Play
+                                    } else {
+                                        IconName::Pause
+                                    }))
+                                    .label(if paused { "Resume" } else { "Live" })
                                     .tooltip("Pause or resume live log stream capture")
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.logging.paused = !this.logging.paused;
@@ -161,6 +168,7 @@ impl RootView {
                                 Button::new("log-clear-btn")
                                     .small()
                                     .compact()
+                                    .icon(Icon::new(IconName::Trash))
                                     .label("Clear")
                                     .tooltip("Clear log buffer")
                                     .on_click(cx.listener(|this, _, _, cx| {
@@ -365,11 +373,19 @@ fn render_log_detail_pane(selected: Option<LogEntry>, cx: &mut Context<RootView>
                         ),
                 )
                 .child(
-                    Button::new("btn-copy-log-entry").small().compact().label("Copy Log").on_click(
-                        cx.listener(move |this, _, window, cx| {
-                            this.copy_to_clipboard(copy_text.clone(), "Copied log entry to clipboard", window, cx);
-                        }),
-                    ),
+                    Button::new("btn-copy-log-entry")
+                        .small()
+                        .compact()
+                        .icon(Icon::new(IconName::Copy))
+                        .label("Copy Log")
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.copy_to_clipboard(
+                                copy_text.clone(),
+                                "Copied log entry to clipboard",
+                                window,
+                                cx,
+                            );
+                        })),
                 ),
         )
         .child(
@@ -382,7 +398,10 @@ fn render_log_detail_pane(selected: Option<LogEntry>, cx: &mut Context<RootView>
                 .font_family(DevToolsTheme::MONO_FONT)
                 .text_xs()
                 .text_color(DevToolsTheme::text_primary())
-                .child(entry.full_text.clone()),
+                .child(SelectableText::new(
+                    SharedString::from(format!("log-full-text-{}", entry.seq)),
+                    entry.full_text.clone(),
+                )),
         )
         .when(!entry.source_refs.is_empty(), |el| {
             el.child(
@@ -395,7 +414,13 @@ fn render_log_detail_pane(selected: Option<LogEntry>, cx: &mut Context<RootView>
                     .flex()
                     .flex_col()
                     .gap_1p5()
-                    .child(div().text_xs().font_weight(gpui_kit::FontWeight::SEMIBOLD).text_color(DevToolsTheme::accent_blue()).child("Jump to Source in Zed"))
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                            .text_color(DevToolsTheme::accent_blue())
+                            .child("Jump to Source in Zed"),
+                    )
                     .children(entry.source_refs.into_iter().enumerate().map(|(idx, loc)| {
                         let loc_click = loc.clone();
                         div()
@@ -409,12 +434,19 @@ fn render_log_detail_pane(selected: Option<LogEntry>, cx: &mut Context<RootView>
                             .font_family(DevToolsTheme::MONO_FONT)
                             .text_xs()
                             .text_color(DevToolsTheme::accent_cyan())
-                            .on_click(cx.listener(move |this, _, _, _| this.jump_to_zed(loc_click.clone())))
-                            .child(format!("↗ {}:{}:{}", loc.uri, loc.line, loc.column))
+                            .flex()
+                            .items_center()
+                            .gap_1p5()
+                            .on_click(cx.listener(move |this, _, _, _| {
+                                this.jump_to_zed(loc_click.clone())
+                            }))
+                            .child(Icon::new(IconName::ExternalLink).xsmall())
+                            .child(format!("{}:{}:{}", loc.uri, loc.line, loc.column))
                     })),
             )
         })
         .when_some(entry.stack_trace, |el, stack| {
+            let seq = entry.seq;
             el.child(
                 div()
                     .p_3()
@@ -424,25 +456,47 @@ fn render_log_detail_pane(selected: Option<LogEntry>, cx: &mut Context<RootView>
                     .border_color(DevToolsTheme::border())
                     .flex()
                     .flex_col()
-                    .gap_1()
-                    .child(div().text_xs().font_weight(gpui_kit::FontWeight::SEMIBOLD).text_color(DevToolsTheme::error_red()).child("Stack Trace"))
-                    .children(stack.lines().enumerate().map(|(line_idx, line)| {
-                        let first_loc = extract_source_locations_from_text(line).into_iter().next();
-                        let line_str = line.to_string();
+                    .gap_1p5()
+                    .child(
                         div()
-                            .id(SharedString::from(format!("stack-line-{line_idx}")))
-                            .py(px(1.5))
-                            .px_1()
-                            .rounded(px(3.0))
+                            .text_xs()
+                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                            .text_color(DevToolsTheme::error_red())
+                            .child("Stack Trace"),
+                    )
+                    .child(
+                        div()
                             .font_family(DevToolsTheme::MONO_FONT)
                             .text_xs()
-                            .when_some(first_loc, |row, loc| {
-                                row.cursor_pointer()
-                                    .text_color(DevToolsTheme::accent_blue())
-                                    .hover(|h| h.bg(DevToolsTheme::bg_selected()))
-                                    .on_click(cx.listener(move |this, _, _, _| this.jump_to_zed(loc.clone())))
-                            })
-                            .child(line_str)
+                            .text_color(DevToolsTheme::text_primary())
+                            .child(SelectableText::new(
+                                SharedString::from(format!("log-stack-sel-{seq}")),
+                                stack.clone(),
+                            )),
+                    )
+                    .children(stack.lines().enumerate().filter_map(|(line_idx, line)| {
+                        let loc = extract_source_locations_from_text(line).into_iter().next()?;
+                        let line_str = line.trim().to_string();
+                        Some(
+                            div()
+                                .id(SharedString::from(format!("stack-line-{seq}-{line_idx}")))
+                                .py(px(1.5))
+                                .px_1p5()
+                                .rounded(px(3.0))
+                                .font_family(DevToolsTheme::MONO_FONT)
+                                .text_xs()
+                                .cursor_pointer()
+                                .text_color(DevToolsTheme::accent_blue())
+                                .hover(|h| h.bg(DevToolsTheme::bg_selected()))
+                                .flex()
+                                .items_center()
+                                .gap_1p5()
+                                .on_click(cx.listener(move |this, _, _, _| {
+                                    this.jump_to_zed(loc.clone())
+                                }))
+                                .child(Icon::new(IconName::ExternalLink).xsmall())
+                                .child(line_str),
+                        )
                     })),
             )
         })

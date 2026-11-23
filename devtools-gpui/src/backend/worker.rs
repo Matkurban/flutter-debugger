@@ -6,7 +6,8 @@ use std::time::{Duration, Instant};
 
 use async_channel::{Receiver, Sender};
 use flutter_debugger_protocol::{
-    ActiveSessionRecord, IpcRequest, OverlayState, default_sessions_dir, list_active_sessions_in, select_best_session,
+    ActiveSessionRecord, DebugLibraryScope, ExceptionPauseMode, IpcRequest, OverlayState,
+    default_sessions_dir, list_active_sessions_in, select_best_session,
 };
 use tokio::sync::{Mutex, mpsc};
 
@@ -33,6 +34,7 @@ struct WorkerState {
     preferred_project: Option<String>, preferred_session_id: Option<String>,
     explicit_vm_uri: Option<String>, connected_vm_uri: Option<String>,
     vm_client: Option<DartVmClient>, overlays: Arc<Mutex<OverlayState>>,
+    exception_pause_mode: ExceptionPauseMode, debug_library_scope: DebugLibraryScope,
     network_recording: bool, memory_polling: bool,
     http_updated_since: Arc<AtomicU64>, http_poll_in_flight: Arc<AtomicBool>, memory_poll_in_flight: Arc<AtomicBool>,
     log_seq: Arc<AtomicU64>, tree_group_seq: u64, props_group_seq: u64,
@@ -63,6 +65,8 @@ async fn run_worker_loop(initial_args: CliLaunchArgs, cmd_rx: Receiver<BackendCo
         preferred_project: initial_args.project, preferred_session_id: initial_args.session_id,
         explicit_vm_uri: initial_args.vm_uri, connected_vm_uri: None, vm_client: None,
         overlays: Arc::new(Mutex::new(OverlayState::default())),
+        exception_pause_mode: ExceptionPauseMode::None,
+        debug_library_scope: DebugLibraryScope::MyCodeOnly,
         network_recording: true, memory_polling: true,
         http_updated_since: Arc::new(AtomicU64::new(0)),
         http_poll_in_flight: Arc::new(AtomicBool::new(false)),
@@ -158,11 +162,22 @@ async fn connect_to_vm(raw_uri: &str, state: &mut WorkerState, event_tx: &Sender
                 target_cpu: meta.target_cpu, arch_bits: meta.arch_bits,
             }));
             let project_root = state.active_session.as_ref().map(|s| PathBuf::from(&s.project_root)).or_else(|| state.preferred_project.as_ref().map(PathBuf::from));
+            let active_sess_for_status = state.active_session.clone();
             let (tree_group, prev_tree_group) = state.next_tree_group();
             let overlays_lock = Arc::clone(&state.overlays);
             let since_atom = Arc::clone(&state.http_updated_since);
             let tx = event_tx.clone();
             tokio::spawn(async move {
+                if let Some(ref sess) = active_sess_for_status
+                    && let Ok(status_resp) = send_ipc_to_session(sess, &IpcRequest::Status).await
+                {
+                    let exc = status_resp.exception_pause_mode.unwrap_or_default();
+                    let scope = status_resp.debug_library_scope.unwrap_or_default();
+                    let _ = tx.try_send(BackendEvent::DebugOptionsUpdated {
+                        exception_pause_mode: exc,
+                        debug_library_scope: scope,
+                    });
+                }
                 if let Some(ref root) = project_root { client.set_pub_root_directories(root).await; }
                 let base_ov = overlays_lock.lock().await.clone();
                 let synced = client.query_initial_overlay_state(&base_ov).await;
@@ -200,7 +215,7 @@ async fn handle_backend_command(cmd: BackendCommand, state: &mut WorkerState, ev
             let (client_opt, (tree_group, prev_tree_group), tx) = (state.vm_client.clone(), state.next_tree_group(), event_tx.clone());
             tokio::spawn(async move {
                 let started = Instant::now();
-                let (req, label) = if is_restart { (IpcRequest::HotRestart, "🔄 Hot Restart") } else { (IpcRequest::HotReload, "⚡ Hot Reload") };
+                let (req, label) = if is_restart { (IpcRequest::HotRestart, "Hot Restart") } else { (IpcRequest::HotReload, "Hot Reload") };
                 match send_ipc_to_session(&session, &req).await {
                     Ok(resp) => {
                         let ms = resp.duration_ms.unwrap_or_else(|| started.elapsed().as_millis() as u64);
@@ -245,6 +260,95 @@ async fn handle_backend_command(cmd: BackendCommand, state: &mut WorkerState, ev
                 });
             }
         }
+        BackendCommand::SetExceptionPauseMode(mode) => {
+            state.exception_pause_mode = mode;
+            let current_scope = state.debug_library_scope;
+            let (session_opt, client_opt, tx) = (
+                state.active_session.clone(),
+                state.vm_client.clone(),
+                event_tx.clone(),
+            );
+            tokio::spawn(async move {
+                if let Some(session) = session_opt
+                    && let Ok(resp) = send_ipc_to_session(
+                        &session,
+                        &IpcRequest::SetExceptionPauseMode { mode },
+                    )
+                    .await
+                    && resp.ok
+                {
+                    let _ = tx.try_send(BackendEvent::DebugOptionsUpdated {
+                        exception_pause_mode: resp.exception_pause_mode.unwrap_or(mode),
+                        debug_library_scope: resp.debug_library_scope.unwrap_or(current_scope),
+                    });
+                    send_toast(&tx, resp.message, false);
+                    return;
+                }
+                if let Some(client) = client_opt {
+                    match client.set_isolate_exception_pause_mode(mode).await {
+                        Ok(()) => {
+                            let _ = tx.try_send(BackendEvent::DebugOptionsUpdated {
+                                exception_pause_mode: mode,
+                                debug_library_scope: current_scope,
+                            });
+                            send_toast(
+                                &tx,
+                                format!("Exception pause mode: {}", mode.description()),
+                                false,
+                            );
+                        }
+                        Err(err) => send_toast(&tx, err.to_string(), true),
+                    }
+                } else {
+                    send_toast(&tx, "No active Flutter session connected", true);
+                }
+            });
+        }
+        BackendCommand::SetDebugLibraryScope(scope) => {
+            state.debug_library_scope = scope;
+            let current_exc = state.exception_pause_mode;
+            let (session_opt, tx) = (state.active_session.clone(), event_tx.clone());
+            tokio::spawn(async move {
+                if let Some(session) = session_opt {
+                    match send_ipc_to_session(
+                        &session,
+                        &IpcRequest::SetDebugLibraryScope { scope },
+                    )
+                    .await
+                    {
+                        Ok(resp) => {
+                            if resp.ok {
+                                let _ = tx.try_send(BackendEvent::DebugOptionsUpdated {
+                                    exception_pause_mode: resp
+                                        .exception_pause_mode
+                                        .unwrap_or(current_exc),
+                                    debug_library_scope: resp
+                                        .debug_library_scope
+                                        .unwrap_or(scope),
+                                });
+                            }
+                            send_toast(&tx, resp.message, !resp.ok);
+                        }
+                        Err(err) => {
+                            send_toast(&tx, format!("Failed to update debug scope: {err}"), true)
+                        }
+                    }
+                } else {
+                    let _ = tx.try_send(BackendEvent::DebugOptionsUpdated {
+                        exception_pause_mode: current_exc,
+                        debug_library_scope: scope,
+                    });
+                    send_toast(
+                        &tx,
+                        format!(
+                            "Debug scope set to {} (connect a DAP Debug session to apply live)",
+                            scope.description()
+                        ),
+                        false,
+                    );
+                }
+            });
+        }
         BackendCommand::TakeScreenshot => {
             let Some(session) = state.active_session.clone() else { send_toast(event_tx, "No active session to capture screenshot", true); return; };
             let tx = event_tx.clone();
@@ -276,12 +380,29 @@ async fn handle_backend_command(cmd: BackendCommand, state: &mut WorkerState, ev
             state.http_updated_since.store(0, Ordering::Release);
             if let Some(c) = state.vm_client.clone() { tokio::spawn(async move { c.clear_http_profile().await }); }
         }
-        BackendCommand::FetchHttpRequestDetail { request_id } => {
+        BackendCommand::FetchHttpRequestDetail {
+            request_id,
+            isolate_id,
+        } => {
             if let Some(c) = state.vm_client.clone() {
                 let tx = event_tx.clone();
                 tokio::spawn(async move {
-                    if let Ok(detail) = c.get_http_profile_request(&request_id).await {
-                        let _ = tx.try_send(BackendEvent::HttpRequestDetailLoaded { request_id, detail });
+                    match c
+                        .get_http_profile_request(&request_id, isolate_id.as_deref())
+                        .await
+                    {
+                        Ok(detail) => {
+                            let _ = tx.try_send(BackendEvent::HttpRequestDetailLoaded {
+                                request_id,
+                                detail,
+                            });
+                        }
+                        Err(err) => {
+                            let _ = tx.try_send(BackendEvent::HttpRequestDetailFailed {
+                                request_id,
+                                error: err.to_string(),
+                            });
+                        }
                     }
                 });
             }
@@ -392,10 +513,20 @@ async fn handle_vm_push_event(ev: VmPushEvent, state: &mut WorkerState, event_tx
         }
         VmPushEvent::IsolateReloaded => {
             if let Some(c) = state.vm_client.clone() {
+                let project_root = state
+                    .active_session
+                    .as_ref()
+                    .map(|s| PathBuf::from(&s.project_root))
+                    .or_else(|| state.preferred_project.as_ref().map(PathBuf::from));
                 let ((tree_group, prev_group), tx) = (state.next_tree_group(), event_tx.clone());
                 tokio::spawn(async move {
                     let _ = c.refresh_main_isolate().await;
-                    if let Ok(tree) = c.fetch_widget_summary_tree(&tree_group).await { let _ = tx.try_send(BackendEvent::WidgetTreeLoaded(tree)); }
+                    if let Some(ref root) = project_root {
+                        c.set_pub_root_directories(root).await;
+                    }
+                    if let Ok(tree) = c.fetch_widget_summary_tree(&tree_group).await {
+                        let _ = tx.try_send(BackendEvent::WidgetTreeLoaded(tree));
+                    }
                     c.dispose_inspector_group(&prev_group).await;
                 });
             }

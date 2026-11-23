@@ -43,6 +43,17 @@ impl DevToolsPage {
         }
     }
 
+    pub fn icon_name(self) -> gpui_kit::assets::IconName {
+        use gpui_kit::assets::IconName;
+        match self {
+            Self::Inspector => IconName::LayoutGrid,
+            Self::Network => IconName::Network,
+            Self::Logging => IconName::SquareTerminal,
+            Self::Performance => IconName::Activity,
+            Self::Memory => IconName::MemoryStick,
+        }
+    }
+
     pub const fn all() -> [Self; 5] {
         [
             Self::Inspector,

@@ -4,8 +4,9 @@ use flutter_debugger_protocol::ServiceOverlay;
 use gpui_kit::{
     Context, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
     StatefulInteractiveElement as _, Styled as _, Window,
+    assets::IconName,
     component::{
-        Selectable as _, Sizable as _,
+        Icon, Selectable as _, Sizable as _,
         button::Button,
     },
     div,
@@ -138,20 +139,28 @@ impl RootView {
                                     .small()
                                     .compact()
                                     .selected(recording)
-                                    .label(if recording { "● Recording" } else { "⏸ Paused" })
+                                    .icon(Icon::new(if recording {
+                                        IconName::CircleDot
+                                    } else {
+                                        IconName::Pause
+                                    }))
+                                    .label(if recording { "Recording" } else { "Paused" })
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.performance.recording = !this.performance.recording;
                                         cx.notify();
                                     })),
                             )
                             .child(
-                                Button::new("perf-clear-btn").small().compact().label("Clear").on_click(
-                                    cx.listener(|this, _, _, cx| {
+                                Button::new("perf-clear-btn")
+                                    .small()
+                                    .compact()
+                                    .icon(Icon::new(IconName::Trash))
+                                    .label("Clear")
+                                    .on_click(cx.listener(|this, _, _, cx| {
                                         this.performance.frames.clear();
                                         this.performance.selected_frame_number = None;
                                         cx.notify();
-                                    }),
-                                ),
+                                    })),
                             )
                             .child(
                                 Button::new("perf-60fps-btn")
