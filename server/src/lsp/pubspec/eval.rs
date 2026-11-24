@@ -2,6 +2,7 @@ use std::cmp::Ordering;
 
 use semver::Version;
 
+use crate::lsp::pubspec::ignore::PackageIgnoreRules;
 use crate::lsp::pubspec::parser::ParsedDependency;
 use crate::lsp::pubspec::registry::PackageInfo;
 use crate::lsp::pubspec::version::{
@@ -10,7 +11,8 @@ use crate::lsp::pubspec::version::{
 };
 use crate::lsp::state::PubspecConfig;
 
-/// Complete evaluation of a single hosted dependency against pub.dev metadata and `pubspec.lock`.
+/// Complete evaluation of a single hosted dependency against pub.dev metadata, `pubspec.lock`,
+/// and any active `.zed/pubspec-ignore.json` / `settings.json` ignore rules.
 #[derive(Debug, Clone)]
 pub struct DependencyEvaluation {
     pub dep: ParsedDependency,
@@ -18,10 +20,16 @@ pub struct DependencyEvaluation {
     pub locked_version: Option<String>,
     /// Baseline version used for comparison (locked version if newer & matching constraint, else declared min).
     pub baseline_version: Option<Version>,
-    /// Latest non-retracted version satisfying the current constraint & project SDK.
+    /// Latest non-retracted, non-ignored version satisfying the current constraint & project SDK.
     pub latest_compatible: Option<Version>,
-    /// Latest non-retracted version overall (respecting prerelease policy).
+    /// Latest non-retracted, non-ignored version overall (respecting prerelease policy).
     pub latest_overall: Option<Version>,
+    /// Actual latest non-retracted version on pub.dev BEFORE applying ignore rules (for Hover transparency).
+    pub raw_latest_overall: Option<Version>,
+    /// Active ignore rules for this package.
+    pub ignore_rules: PackageIgnoreRules,
+    /// True if at least one version strictly newer than `baseline_version` was filtered out by ignore rules.
+    pub muted_newer_version: bool,
     /// Whether `latest_overall` requires a Dart SDK incompatible with the project's `environment.sdk`.
     pub latest_sdk_incompatible: bool,
     /// Required Dart SDK constraint of `latest_overall`, if any.
@@ -39,6 +47,7 @@ impl DependencyEvaluation {
         locked_version: Option<String>,
         project_sdk: Option<&VersionConstraint>,
         config: &PubspecConfig,
+        ignore_rules: PackageIgnoreRules,
     ) -> Self {
         let allow_pre = config.include_prerelease || dep.constraint.opts_into_prerelease();
 
@@ -63,17 +72,25 @@ impl DependencyEvaluation {
             (None, None) => None,
         };
 
-        let current_retracted = baseline_version.as_ref().is_some_and(|base| {
-            info.versions.iter().any(|v| {
-                v.retracted
-                    && parse_dart_version(&v.version)
-                        .is_some_and(|pv| compare_dart_versions(&pv, base) == Ordering::Equal)
-            })
-        });
+        let all_ignored = ignore_rules.is_all_ignored();
 
+        let current_retracted = if all_ignored {
+            false
+        } else {
+            baseline_version.as_ref().is_some_and(|base| {
+                info.versions.iter().any(|v| {
+                    v.retracted
+                        && parse_dart_version(&v.version)
+                            .is_some_and(|pv| compare_dart_versions(&pv, base) == Ordering::Equal)
+                })
+            })
+        };
+
+        let mut raw_latest_overall: Option<Version> = None;
         let mut latest_overall: Option<Version> = None;
         let mut latest_sdk_requirement: Option<String> = None;
         let mut latest_compatible: Option<Version> = None;
+        let mut muted_newer_version = false;
 
         // `info.versions` is sorted newest-first.
         for v in &info.versions {
@@ -84,6 +101,30 @@ impl DependencyEvaluation {
                 continue;
             };
             if !parsed.pre.is_empty() && !allow_pre {
+                continue;
+            }
+
+            if raw_latest_overall.is_none() {
+                raw_latest_overall = Some(parsed.clone());
+            }
+
+            if all_ignored {
+                if baseline_version
+                    .as_ref()
+                    .is_some_and(|base| compare_dart_versions(&parsed, base) == Ordering::Greater)
+                {
+                    muted_newer_version = true;
+                }
+                break;
+            }
+
+            if ignore_rules.matches_version(&parsed) {
+                if baseline_version
+                    .as_ref()
+                    .is_some_and(|base| compare_dart_versions(&parsed, base) == Ordering::Greater)
+                {
+                    muted_newer_version = true;
+                }
                 continue;
             }
 
@@ -107,9 +148,13 @@ impl DependencyEvaluation {
         let latest_sdk_incompatible =
             !is_sdk_compatible(project_sdk, latest_sdk_requirement.as_deref());
 
-        let upgrade_kind = match (&baseline_version, &latest_overall) {
-            (Some(base), Some(latest)) => classify_upgrade(base, latest),
-            _ => UpgradeKind::UpToDate,
+        let upgrade_kind = if all_ignored {
+            UpgradeKind::UpToDate
+        } else {
+            match (&baseline_version, &latest_overall) {
+                (Some(base), Some(latest)) => classify_upgrade(base, latest),
+                _ => UpgradeKind::UpToDate,
+            }
         };
 
         Self {
@@ -119,6 +164,9 @@ impl DependencyEvaluation {
             baseline_version,
             latest_compatible,
             latest_overall,
+            raw_latest_overall,
+            ignore_rules,
+            muted_newer_version,
             latest_sdk_incompatible,
             latest_sdk_requirement,
             current_retracted,
@@ -128,11 +176,14 @@ impl DependencyEvaluation {
 
     #[must_use]
     pub fn has_update(&self) -> bool {
-        self.upgrade_kind != UpgradeKind::UpToDate
+        !self.ignore_rules.is_all_ignored() && self.upgrade_kind != UpgradeKind::UpToDate
     }
 
     #[must_use]
     pub fn preferred_upgrade_edit(&self) -> Option<(Version, String)> {
+        if self.ignore_rules.is_all_ignored() {
+            return None;
+        }
         let target = self.latest_overall.as_ref()?;
         if !self.has_update() && !self.current_retracted {
             return None;

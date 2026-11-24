@@ -48,12 +48,14 @@ use crate::lsp::dart_file::{
 use crate::lsp::dart_parser::build_closing_label_inlay_hints;
 use crate::lsp::progress::ProgressHandle;
 use crate::lsp::pubspec::{
-    ChangelogEntry, DependencyEvaluation, DependencySection, DependencySource, PackageInfo,
-    PubPackageCache, PubRegistryClient, VersionConstraint, build_asset_hover_markdown,
-    build_hosted_hover_markdown, build_local_path_hover_markdown, build_pubspec_code_actions,
-    build_pubspec_code_lenses, build_pubspec_diagnostics, build_pubspec_document_links,
-    build_pubspec_inlay_hints, build_sdk_or_git_hover_markdown, build_version_completion_items,
-    completion_context_at, load_sibling_lockfile, parse_pubspec,
+    ChangelogEntry, DependencyEvaluation, DependencySection, DependencySource, IgnoreRule,
+    PackageInfo, PubPackageCache, PubRegistryClient, VersionConstraint, add_ignore_rule,
+    build_asset_hover_markdown, build_hosted_hover_markdown, build_ignored_fallback_hover_markdown,
+    build_local_path_hover_markdown, build_pubspec_code_actions, build_pubspec_code_lenses,
+    build_pubspec_diagnostics, build_pubspec_document_links, build_pubspec_inlay_hints,
+    build_sdk_or_git_hover_markdown, build_version_completion_items, completion_context_at,
+    ensure_ignore_file_exists, load_effective_ignore_config, load_sibling_lockfile, parse_pubspec,
+    remove_package_ignore_rules, resolve_all_ignore_files, resolve_primary_ignore_file,
 };
 use crate::lsp::state::{
     DocumentKind, OpenDocument, ServerConfig, classify_document_path, file_path_to_uri,
@@ -74,6 +76,9 @@ impl Request for InlayHintRefreshRequest {
 
 const SUPPORTED_COMMANDS: &[&str] = &[
     "flutterDebugger.refreshPubVersions",
+    "flutterDebugger.ignorePubUpdate",
+    "flutterDebugger.unignorePubUpdate",
+    "flutterDebugger.openPubIgnoreFile",
     "flutterDebugger.pubGet",
     "flutterDebugger.pubUpgrade",
     "flutterDebugger.pubOutdated",
@@ -242,11 +247,17 @@ impl FlutterLspBackend {
         let project = find_project_for_path(&path);
         let doc_gen = self.pubspec_gen_counter.fetch_add(1, Ordering::SeqCst) + 1;
 
-        // Preserve existing evaluations/lockfile temporarily to avoid inlay hint flicker while refreshing.
-        let (prev_locked, prev_evals) = self
+        // Preserve existing evaluations/lockfile/ignore snapshot temporarily to avoid inlay hint flicker while refreshing.
+        let (prev_locked, prev_evals, prev_ignore) = self
             .docs
             .get(&uri)
-            .map(|d| (d.locked_versions.clone(), d.evaluations.clone()))
+            .map(|d| {
+                (
+                    d.locked_versions.clone(),
+                    d.evaluations.clone(),
+                    d.ignore_config.clone(),
+                )
+            })
             .unwrap_or_default();
 
         self.docs.insert(
@@ -258,12 +269,15 @@ impl FlutterLspBackend {
                 pubspec: Some(parsed.clone()),
                 locked_versions: prev_locked,
                 evaluations: prev_evals,
+                ignore_config: prev_ignore,
                 generation: doc_gen,
                 dart: None,
             },
         );
 
         let cfg = self.config.read().await.pubspec.clone();
+        let workspace_roots = self.workspace_roots.read().await.clone();
+        let ignore_config = load_effective_ignore_config(&path, &workspace_roots, &cfg.ignore_packages);
         let project_root = project.as_ref().map(|p| p.root.as_path());
 
         if !parsed.is_valid_dart_project {
@@ -272,6 +286,7 @@ impl FlutterLspBackend {
             {
                 doc.locked_versions.clear();
                 doc.evaluations.clear();
+                doc.ignore_config = ignore_config;
             }
             self.client.publish_diagnostics(uri, Vec::new(), None).await;
             let _ = self.client.send_request::<InlayHintRefreshRequest>(()).await;
@@ -288,6 +303,7 @@ impl FlutterLspBackend {
             if let Some(mut doc) = self.docs.get_mut(&uri) {
                 doc.locked_versions = locked_versions;
                 doc.evaluations.clear();
+                doc.ignore_config = ignore_config;
             }
             let diags = build_pubspec_diagnostics(&parsed, &[], project_root, &cfg);
             self.client.publish_diagnostics(uri, diags, None).await;
@@ -310,7 +326,7 @@ impl FlutterLspBackend {
                     DependencySection::DevDependencies => cfg.check_dev_dependencies,
                     DependencySection::DependencyOverrides => cfg.check_dependency_overrides,
                 };
-                if !section_enabled || cfg.is_ignored(&dep.name) {
+                if !section_enabled {
                     return None;
                 }
                 match &dep.source {
@@ -329,9 +345,13 @@ impl FlutterLspBackend {
 
         let mut unique_keys: Vec<(String, String)> = Vec::new();
         let mut seen_keys: HashSet<(String, String)> = HashSet::new();
+        let mut refresh_invalidate_keys: Vec<(String, String)> = Vec::new();
         for (dep, hosted) in &eligible_deps {
             let key = (hosted.clone(), dep.name.clone());
             if seen_keys.insert(key.clone()) {
+                if !ignore_config.is_all_ignored(&dep.name) {
+                    refresh_invalidate_keys.push(key.clone());
+                }
                 unique_keys.push(key);
             }
         }
@@ -339,21 +359,22 @@ impl FlutterLspBackend {
         if force_refresh {
             self.pub_refreshing.insert(uri.clone());
             let _ = self.client.send_request::<CodeLensRefresh>(()).await;
-            self.pub_cache.invalidate(&unique_keys).await;
+            self.pub_cache.invalidate(&refresh_invalidate_keys).await;
         }
 
         let mut info_map: HashMap<(String, String), PackageInfo> = HashMap::new();
         let mut to_fetch: Vec<(String, String)> = Vec::new();
 
         for (hosted, name) in unique_keys {
-            if !force_refresh
+            let is_all_ignored = ignore_config.is_all_ignored(&name);
+            if (!force_refresh || is_all_ignored)
                 && let Some(cached) = self
                     .pub_cache
                     .get_package(&hosted, &name, cfg.cache_ttl_secs)
                     .await
             {
                 info_map.insert((hosted, name), cached);
-            } else {
+            } else if !is_all_ignored {
                 to_fetch.push((hosted, name));
             }
         }
@@ -438,12 +459,14 @@ impl FlutterLspBackend {
             .filter_map(|(dep, hosted)| {
                 let info = info_map.get(&(hosted, dep.name.clone()))?.clone();
                 let locked = locked_versions.get(&dep.name).cloned();
+                let pkg_ignore = ignore_config.for_package(&dep.name);
                 Some(DependencyEvaluation::evaluate(
                     dep,
                     info,
                     locked,
                     effective_sdk.as_ref(),
                     &cfg,
+                    pkg_ignore,
                 ))
             })
             .collect();
@@ -454,6 +477,7 @@ impl FlutterLspBackend {
             }
             doc.locked_versions = locked_versions;
             doc.evaluations = evaluations.clone();
+            doc.ignore_config = ignore_config;
         } else {
             return;
         }
@@ -475,6 +499,40 @@ impl FlutterLspBackend {
                 }
                 let doc_path = uri_to_file_path(entry.key())?;
                 if doc_path.parent() == Some(dir) {
+                    Some((entry.key().clone(), doc.text.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for (uri, text) in targets {
+            let this = self.clone_handle();
+            tokio::spawn(async move {
+                this.analyze_pubspec_document(uri, text, false).await;
+            });
+        }
+    }
+
+    async fn reanalyze_open_pubspecs_under(&self, root: &Path) {
+        let canonical_root = std::fs::canonicalize(root).ok();
+        let targets: Vec<(Uri, String)> = self
+            .docs
+            .iter()
+            .filter_map(|entry| {
+                let doc = entry.value();
+                if !matches!(doc.kind, DocumentKind::Pubspec | DocumentKind::PubspecOverrides) {
+                    return None;
+                }
+                let doc_path = uri_to_file_path(entry.key())?;
+                let direct = doc_path.starts_with(root);
+                let canonical = !direct
+                    && canonical_root.as_ref().is_some_and(|cr| {
+                        std::fs::canonicalize(&doc_path)
+                            .ok()
+                            .is_some_and(|cd| cd.starts_with(cr))
+                    });
+                if direct || canonical {
                     Some((entry.key().clone(), doc.text.clone()))
                 } else {
                     None
@@ -1193,19 +1251,20 @@ impl LanguageServer for FlutterLspBackend {
         ))
         .await;
 
-        // Dynamically register a file watcher on `**/pubspec.lock` so external
-        // `flutter pub get` / `dart pub upgrade` runs immediately refresh open pubspec hints.
+        // Dynamically register file watchers on `**/pubspec.lock` and `**/.zed/pubspec-ignore.json`
+        // so external `pub get` runs or manual edits to ignore rules immediately refresh open pubspecs.
         let lock_watcher = Registration {
-            id: "flutter-debugger-pubspec-lock".to_string(),
+            id: "flutter-debugger-pubspec-files".to_string(),
             method: "workspace/didChangeWatchedFiles".to_string(),
             register_options: Some(json!({
                 "watchers": [
-                    { "globPattern": "**/pubspec.lock" }
+                    { "globPattern": "**/pubspec.lock" },
+                    { "globPattern": "**/.zed/pubspec-ignore.json" }
                 ]
             })),
         };
         if let Err(err) = self.client.register_capability(vec![lock_watcher]).await {
-            tracing::debug!("Dynamic pubspec.lock watcher registration skipped by client: {err}");
+            tracing::debug!("Dynamic pubspec file watcher registration skipped by client: {err}");
         }
 
         if let Some(flutter_proj) = discovered
@@ -1299,20 +1358,36 @@ impl LanguageServer for FlutterLspBackend {
     }
 
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
-        let mut dirs: Vec<PathBuf> = Vec::new();
+        let mut lock_dirs: Vec<PathBuf> = Vec::new();
+        let mut ignore_roots: Vec<PathBuf> = Vec::new();
         for change in params.changes {
-            if let Some(path) = uri_to_file_path(&change.uri)
-                && path.file_name().and_then(|n| n.to_str()) == Some("pubspec.lock")
+            let Some(path) = uri_to_file_path(&change.uri) else {
+                continue;
+            };
+            let file_name = path.file_name().and_then(|n| n.to_str());
+            if file_name == Some("pubspec.lock")
                 && let Some(parent) = path.parent()
             {
                 let dir = parent.to_path_buf();
-                if !dirs.contains(&dir) {
-                    dirs.push(dir);
+                if !lock_dirs.contains(&dir) {
+                    lock_dirs.push(dir);
+                }
+            } else if file_name == Some("pubspec-ignore.json")
+                && let Some(zed_dir) = path.parent()
+                && zed_dir.file_name().and_then(|n| n.to_str()) == Some(".zed")
+                && let Some(root) = zed_dir.parent()
+            {
+                let root_buf = root.to_path_buf();
+                if !ignore_roots.contains(&root_buf) {
+                    ignore_roots.push(root_buf);
                 }
             }
         }
-        for dir in dirs {
+        for dir in lock_dirs {
             self.reanalyze_open_pubspecs_in_dir(&dir).await;
+        }
+        for root in ignore_roots {
+            self.reanalyze_open_pubspecs_under(&root).await;
         }
     }
 
@@ -1385,6 +1460,7 @@ impl LanguageServer for FlutterLspBackend {
             if let Some(existing) = self.docs.get(&uri) {
                 doc.locked_versions = existing.locked_versions.clone();
                 doc.evaluations = existing.evaluations.clone();
+                doc.ignore_config = existing.ignore_config.clone();
             }
             doc.generation = doc_gen;
             let text_clone = doc.text.clone();
@@ -1529,9 +1605,12 @@ impl LanguageServer for FlutterLspBackend {
                 doc.project.as_ref().map(|p| p.root.clone()),
                 doc.pubspec.clone()?,
                 doc.evaluations.clone(),
+                doc.locked_versions.clone(),
+                doc.ignore_config.clone(),
             ))
         });
-        let Some((project_root, parsed, evaluations)) = snapshot else {
+        let Some((project_root, parsed, evaluations, locked_versions, ignore_config)) = snapshot
+        else {
             return Ok(None);
         };
 
@@ -1577,7 +1656,7 @@ impl LanguageServer for FlutterLspBackend {
             }));
         }
 
-        // 3. Local `path:`, `sdk:`, or `git:` dependency hover
+        // 3. Local `path:`, `sdk:`, `git:`, or `*`-ignored uncached hosted dependency hover
         if let Some(dep) = parsed.dependencies.iter().find(|d| {
             let path_hit = match &d.source {
                 DependencySource::Path { range, .. } => position_in_range(pos, *range),
@@ -1609,7 +1688,26 @@ impl LanguageServer for FlutterLspBackend {
                         }));
                     }
                 }
-                DependencySource::Hosted { .. } => {}
+                DependencySource::Hosted { url } => {
+                    let pkg_ignore = ignore_config.for_package(&dep.name);
+                    if cfg.enabled && !pkg_ignore.is_empty() {
+                        let default_hosted = cfg.resolved_hosted_url();
+                        let hosted = url.as_deref().unwrap_or(&default_hosted);
+                        let md = build_ignored_fallback_hover_markdown(
+                            dep,
+                            &pkg_ignore,
+                            locked_versions.get(&dep.name).map(String::as_str),
+                            hosted,
+                        );
+                        return Ok(Some(Hover {
+                            contents: HoverContents::Markup(MarkupContent {
+                                kind: MarkupKind::Markdown,
+                                value: md,
+                            }),
+                            range: Some(union_range(dep.name_range, dep.version_range)),
+                        }));
+                    }
+                }
             }
         }
 
@@ -1629,9 +1727,10 @@ impl LanguageServer for FlutterLspBackend {
                 doc.text.clone(),
                 doc.pubspec.clone()?,
                 doc.locked_versions.clone(),
+                doc.ignore_config.clone(),
             ))
         });
-        let Some((text, parsed, locked_versions)) = snapshot else {
+        let Some((text, parsed, locked_versions, ignore_config)) = snapshot else {
             return Ok(None);
         };
 
@@ -1679,12 +1778,14 @@ impl LanguageServer for FlutterLspBackend {
             .resolve_effective_sdk_for_pubspec(doc_path.as_deref(), &parsed)
             .await;
 
+        let pkg_ignore = ignore_config.for_package(&ctx.package_name);
         let items = build_version_completion_items(
             &ctx,
             &info,
             locked_versions.get(&ctx.package_name).map(String::as_str),
             effective_sdk.as_ref(),
             &cfg,
+            &pkg_ignore,
         );
 
         if items.is_empty() {
@@ -1845,7 +1946,9 @@ impl LanguageServer for FlutterLspBackend {
         };
         let kind = doc.kind;
         let project = doc.project.clone();
+        let pubspec = doc.pubspec.clone();
         let evaluations = doc.evaluations.clone();
+        let ignore_config = doc.ignore_config.clone();
         let dart = doc.dart.clone();
         drop(doc);
 
@@ -1855,8 +1958,16 @@ impl LanguageServer for FlutterLspBackend {
 
         match kind {
             DocumentKind::Pubspec | DocumentKind::PubspecOverrides => {
-                if cfg.pubspec.enabled {
-                    actions = build_pubspec_code_actions(&uri, &evaluations, params.range);
+                if cfg.pubspec.enabled
+                    && let Some(parsed) = pubspec
+                {
+                    actions = build_pubspec_code_actions(
+                        &uri,
+                        &parsed,
+                        &evaluations,
+                        &ignore_config,
+                        params.range,
+                    );
                 }
             }
             DocumentKind::Dart => {
@@ -1953,6 +2064,93 @@ impl LanguageServer for FlutterLspBackend {
             "flutterDebugger.refreshPubVersions" => {
                 if let Some(text) = self.docs.get(&uri).map(|d| d.text.clone()) {
                     self.analyze_pubspec_document(uri.clone(), text, true).await;
+                }
+            }
+            "flutterDebugger.ignorePubUpdate" => {
+                let package = params.arguments.get(1).and_then(Value::as_str);
+                let rule_raw = params.arguments.get(2).and_then(Value::as_str);
+                if let (Some(pkg), Some(rule_str), Some(doc_path)) =
+                    (package, rule_raw, uri_to_file_path(&uri))
+                    && let Some(rule) = IgnoreRule::parse(rule_str)
+                {
+                    let workspace_roots = self.workspace_roots.read().await.clone();
+                    if let Some(ignore_file) =
+                        resolve_primary_ignore_file(&doc_path, &workspace_roots)
+                    {
+                        let canonical = rule.to_canonical_string();
+                        match add_ignore_rule(&ignore_file, pkg, rule) {
+                            Ok(()) => {
+                                if let Some(root) = ignore_file.parent().and_then(Path::parent) {
+                                    self.reanalyze_open_pubspecs_under(root).await;
+                                } else if let Some(parent) = doc_path.parent() {
+                                    self.reanalyze_open_pubspecs_in_dir(parent).await;
+                                }
+                                self.client
+                                    .show_message(
+                                        MessageType::INFO,
+                                        format!(
+                                            "Ignored `{pkg}` ({canonical}) in .zed/pubspec-ignore.json"
+                                        ),
+                                    )
+                                    .await;
+                            }
+                            Err(err) => {
+                                self.client.show_message(MessageType::WARNING, err).await;
+                            }
+                        }
+                    }
+                }
+            }
+            "flutterDebugger.unignorePubUpdate" => {
+                let package = params.arguments.get(1).and_then(Value::as_str);
+                if let (Some(pkg), Some(doc_path)) = (package, uri_to_file_path(&uri)) {
+                    let workspace_roots = self.workspace_roots.read().await.clone();
+                    let all_files = resolve_all_ignore_files(&doc_path, &workspace_roots);
+                    match remove_package_ignore_rules(&all_files, pkg) {
+                        Ok(true) => {
+                            if let Some(primary) = all_files.first()
+                                && let Some(root) = primary.parent().and_then(Path::parent)
+                            {
+                                self.reanalyze_open_pubspecs_under(root).await;
+                            } else if let Some(parent) = doc_path.parent() {
+                                self.reanalyze_open_pubspecs_in_dir(parent).await;
+                            }
+                            self.client
+                                .show_message(
+                                    MessageType::INFO,
+                                    format!("Cleared ignore rules for `{pkg}`."),
+                                )
+                                .await;
+                        }
+                        Ok(false) => {
+                            self.client
+                                .show_message(
+                                    MessageType::INFO,
+                                    format!(
+                                        "`{pkg}` has no entry in .zed/pubspec-ignore.json (check `pubspec.ignorePackages` in Zed settings.json if still ignored)."
+                                    ),
+                                )
+                                .await;
+                        }
+                        Err(err) => {
+                            self.client.show_message(MessageType::WARNING, err).await;
+                        }
+                    }
+                }
+            }
+            "flutterDebugger.openPubIgnoreFile" => {
+                if let Some(doc_path) = uri_to_file_path(&uri) {
+                    let workspace_roots = self.workspace_roots.read().await.clone();
+                    if let Some(ignore_file) =
+                        resolve_primary_ignore_file(&doc_path, &workspace_roots)
+                    {
+                        match ensure_ignore_file_exists(&ignore_file) {
+                            Ok(()) => self.open_local_file_in_editor(&ignore_file).await,
+                            Err(err) => {
+                                self.client.show_message(MessageType::WARNING, err).await;
+                            }
+                        }
+                    }
                 }
             }
             "flutterDebugger.pubGet" => {

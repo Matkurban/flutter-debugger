@@ -1,6 +1,7 @@
 pub mod cache;
 pub mod eval;
 pub mod features;
+pub mod ignore;
 pub mod lockfile;
 pub mod parser;
 pub mod registry;
@@ -9,10 +10,15 @@ pub mod version;
 pub use cache::PubPackageCache;
 pub use eval::DependencyEvaluation;
 pub use features::{
-    build_asset_hover_markdown, build_hosted_hover_markdown, build_local_path_hover_markdown,
-    build_pubspec_code_actions, build_pubspec_code_lenses, build_pubspec_diagnostics,
-    build_pubspec_document_links, build_pubspec_inlay_hints, build_sdk_or_git_hover_markdown,
-    build_version_completion_items,
+    build_asset_hover_markdown, build_hosted_hover_markdown, build_ignored_fallback_hover_markdown,
+    build_local_path_hover_markdown, build_pubspec_code_actions, build_pubspec_code_lenses,
+    build_pubspec_diagnostics, build_pubspec_document_links, build_pubspec_inlay_hints,
+    build_sdk_or_git_hover_markdown, build_version_completion_items,
+};
+pub use ignore::{
+    IgnoreRule, PubspecIgnoreConfig, add_ignore_rule, ensure_ignore_file_exists,
+    load_effective_ignore_config, remove_package_ignore_rules, resolve_all_ignore_files,
+    resolve_primary_ignore_file,
 };
 pub use lockfile::load_sibling_lockfile;
 pub use parser::{

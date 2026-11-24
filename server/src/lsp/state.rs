@@ -6,7 +6,9 @@ use tower_lsp_server::ls_types::{DiagnosticSeverity, Uri};
 
 use crate::cache::DEFAULT_DEVICE_CACHE_TTL_SECS;
 use crate::lsp::dart_file::{DartFileRole, ParsedDartFile, classify_dart_file_role, parse_dart_file};
-use crate::lsp::pubspec::{DependencyEvaluation, ParsedPubspec, parse_pubspec};
+use crate::lsp::pubspec::{
+    DependencyEvaluation, ParsedPubspec, PubspecIgnoreConfig, parse_pubspec,
+};
 use crate::project::{ProjectInfo, find_project_for_path};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,11 +106,6 @@ impl PubspecConfig {
             .unwrap_or_else(|| "https://pub.dev".to_string());
 
         raw.trim_end_matches('/').to_string()
-    }
-
-    #[must_use]
-    pub fn is_ignored(&self, package: &str) -> bool {
-        self.ignore_packages.iter().any(|p| p == package)
     }
 
     fn apply_patch(&mut self, patch: PubspecConfigPatch) -> bool {
@@ -359,6 +356,7 @@ pub struct OpenDocument {
     pub pubspec: Option<ParsedPubspec>,
     pub locked_versions: std::collections::HashMap<String, String>,
     pub evaluations: Vec<DependencyEvaluation>,
+    pub ignore_config: PubspecIgnoreConfig,
     pub generation: u64,
     pub dart: Option<ParsedDartFile>,
 }
@@ -376,6 +374,7 @@ impl OpenDocument {
                 pubspec: None,
                 locked_versions: std::collections::HashMap::new(),
                 evaluations: Vec::new(),
+                ignore_config: PubspecIgnoreConfig::default(),
                 generation: 0,
                 dart: None,
             }),
@@ -386,6 +385,7 @@ impl OpenDocument {
                 pubspec: Some(parse_pubspec(text)),
                 locked_versions: std::collections::HashMap::new(),
                 evaluations: Vec::new(),
+                ignore_config: PubspecIgnoreConfig::default(),
                 generation: 0,
                 dart: None,
             }),
@@ -403,6 +403,7 @@ impl OpenDocument {
                     pubspec: None,
                     locked_versions: std::collections::HashMap::new(),
                     evaluations: Vec::new(),
+                    ignore_config: PubspecIgnoreConfig::default(),
                     generation: 0,
                     dart: Some(parse_dart_file(text, role)),
                 })

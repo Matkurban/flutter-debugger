@@ -12,6 +12,7 @@ use tower_lsp_server::ls_types::{
 };
 
 use crate::lsp::pubspec::eval::DependencyEvaluation;
+use crate::lsp::pubspec::ignore::{PackageIgnoreRules, PubspecIgnoreConfig};
 use crate::lsp::pubspec::parser::{
     DependencySource, FlutterAssetEntry, ParsedDependency, ParsedPubspec, VersionCompletionContext,
     parse_pubspec,
@@ -28,6 +29,9 @@ pub const CMD_PUB_REFRESH: &str = "flutterDebugger.refreshPubVersions";
 pub const CMD_PUB_GET: &str = "flutterDebugger.pubGet";
 pub const CMD_PUB_UPGRADE: &str = "flutterDebugger.pubUpgrade";
 pub const CMD_PUB_OUTDATED: &str = "flutterDebugger.pubOutdated";
+pub const CMD_PUB_IGNORE: &str = "flutterDebugger.ignorePubUpdate";
+pub const CMD_PUB_UNIGNORE: &str = "flutterDebugger.unignorePubUpdate";
+pub const CMD_PUB_OPEN_IGNORE_FILE: &str = "flutterDebugger.openPubIgnoreFile";
 
 /// Builds the unified list of diagnostics for `pubspec.yaml` / `pubspec_overrides.yaml`,
 /// combining missing `flutter.assets`/`fonts` warnings with dependency version/health diagnostics
@@ -76,6 +80,10 @@ fn build_dependency_diagnostic(
     eval: &DependencyEvaluation,
     config: &PubspecConfig,
 ) -> Option<Diagnostic> {
+    if eval.ignore_rules.is_all_ignored() {
+        return None;
+    }
+
     if eval.info.is_discontinued {
         let replacement = eval
             .info
@@ -259,6 +267,10 @@ fn build_single_inlay_hint(
     eval: &DependencyEvaluation,
     config: &PubspecConfig,
 ) -> Option<InlayHint> {
+    if eval.ignore_rules.is_all_ignored() {
+        return None;
+    }
+
     let (label, text_edits, tooltip) = if eval.info.is_discontinued {
         let lbl = match &eval.info.replaced_by {
             Some(rep) => format!("⚠ discontinued (use {rep})"),
@@ -289,7 +301,7 @@ fn build_single_inlay_hint(
     } else if let Some(latest) = &eval.latest_overall {
         match eval.upgrade_kind {
             UpgradeKind::UpToDate => {
-                if !config.show_up_to_date_hints {
+                if eval.muted_newer_version || !config.show_up_to_date_hints {
                     return None;
                 }
                 ("✓ latest".to_string(), None, None)
@@ -404,7 +416,30 @@ pub fn build_hosted_hover_markdown(
         } else {
             String::new()
         };
-        md.push_str(&format!("- **Latest**: `{latest}`{sdk_warn}\n"));
+        let label = if eval.raw_latest_overall.as_ref() != Some(latest) {
+            "Latest (unignored)"
+        } else {
+            "Latest"
+        };
+        md.push_str(&format!("- **{label}**: `{latest}`{sdk_warn}\n"));
+    }
+    if let Some(raw_latest) = &eval.raw_latest_overall
+        && eval.latest_overall.as_ref() != Some(raw_latest)
+    {
+        let matched = eval
+            .ignore_rules
+            .matching_rule_display(raw_latest)
+            .map_or_else(String::new, |r| format!(" *(ignored by `{r}`)*"));
+        md.push_str(&format!(
+            "- **Latest on pub.dev**: `{raw_latest}`{matched}\n"
+        ));
+    }
+    if !eval.ignore_rules.is_empty() {
+        md.push_str(&format!(
+            "- **Ignored Rules**: `{}` *(from `{}`)*\n",
+            eval.ignore_rules.summary(),
+            eval.ignore_rules.source_label()
+        ));
     }
     if let Some(rep) = &eval.info.replaced_by {
         md.push_str(&format!(
@@ -417,15 +452,23 @@ pub fn build_hosted_hover_markdown(
         md.push_str(&format!(
             "\n> **Quick Upgrade → `{new_text}`**: Click the inline `⬆ {target}` hint or press `Cmd+.` (`Ctrl+.`)\n"
         ));
+    } else if eval.ignore_rules.from_file {
+        md.push_str(
+            "\n> Updates muted by `.zed/pubspec-ignore.json` — press `Cmd+.` (`Ctrl+.`) to unignore or edit rules.\n",
+        );
     }
 
     md.push_str("\n#### Changelog\n\n");
+    let changelog_target = eval
+        .latest_overall
+        .as_ref()
+        .or(eval.raw_latest_overall.as_ref());
     match changelog_entries {
         Some(entries) if !entries.is_empty() => {
             let selected = select_relevant_entries(
                 entries,
                 eval.baseline_version.as_ref(),
-                eval.latest_overall.as_ref(),
+                changelog_target,
                 config.max_changelog_versions,
             );
             for entry in selected {
@@ -459,6 +502,39 @@ pub fn build_hosted_hover_markdown(
         links.push(format!("[Repository]({repo})"));
     }
     md.push_str(&links.join(" · "));
+    md
+}
+
+/// Renders concise Markdown hover for a `*`-ignored hosted dependency when no cached
+/// `pub.dev` metadata is available (avoiding unnecessary network traffic).
+#[must_use]
+pub fn build_ignored_fallback_hover_markdown(
+    dep: &ParsedDependency,
+    ignore_rules: &PackageIgnoreRules,
+    locked_version: Option<&str>,
+    hosted_url: &str,
+) -> String {
+    let mut md = format!("### `{}`  *(Ignored)*\n\n", dep.name);
+    let declared = dep.raw_constraint.as_deref().unwrap_or("any");
+    md.push_str(&format!("- **Declared**: `{declared}`\n"));
+    if let Some(locked) = locked_version {
+        md.push_str(&format!("- **Locked (`pubspec.lock`)**: `{locked}`\n"));
+    }
+    md.push_str(&format!(
+        "- **Ignored Rules**: `{}` *(from `{}`)*\n",
+        ignore_rules.summary(),
+        ignore_rules.source_label()
+    ));
+    if ignore_rules.from_file {
+        md.push_str(
+            "\n> Updates muted by `.zed/pubspec-ignore.json` — press `Cmd+.` (`Ctrl+.`) to unignore or edit rules.\n",
+        );
+    }
+    let base = hosted_url.trim_end_matches('/');
+    md.push_str(&format!(
+        "\n[pub.dev]({base}/packages/{}) · [Full Changelog]({base}/packages/{}/changelog)",
+        dep.name, dep.name
+    ));
     md
 }
 
@@ -581,10 +657,12 @@ pub fn build_version_completion_items(
     locked_version: Option<&str>,
     project_sdk: Option<&VersionConstraint>,
     config: &PubspecConfig,
+    ignore_rules: &PackageIgnoreRules,
 ) -> Vec<CompletionItem> {
     let mut items = Vec::new();
     let max_items = 30usize;
     let mut latest_stable_seen = false;
+    let mut preselected_any = false;
 
     for v in &info.versions {
         if v.retracted {
@@ -602,6 +680,7 @@ pub fn build_version_completion_items(
         }
 
         let sdk_ok = is_sdk_compatible(project_sdk, v.sdk_constraint.as_deref());
+        let is_ignored = ignore_rules.matches_version(&parsed);
         let is_latest = !latest_stable_seen && parsed.pre.is_empty();
         if is_latest {
             latest_stable_seen = true;
@@ -620,6 +699,9 @@ pub fn build_version_completion_items(
         let mut tags = Vec::new();
         if is_latest {
             tags.push("latest".to_string());
+        }
+        if is_ignored {
+            tags.push("ignored".to_string());
         }
         if locked_version == Some(v.version.as_str()) {
             tags.push("locked".to_string());
@@ -642,6 +724,11 @@ pub fn build_version_completion_items(
             Some(tags.join(" · "))
         };
 
+        let should_preselect = !preselected_any && parsed.pre.is_empty() && sdk_ok && !is_ignored;
+        if should_preselect {
+            preselected_any = true;
+        }
+
         let idx = items.len();
         items.push(CompletionItem {
             label: raw_ver,
@@ -655,7 +742,7 @@ pub fn build_version_completion_items(
             }),
             sort_text: Some(format!("{idx:05}")),
             filter_text: Some(v.version.clone()),
-            preselect: Some(is_latest && sdk_ok),
+            preselect: Some(should_preselect),
             text_edit: Some(CompletionTextEdit::Edit(TextEdit {
                 range: ctx.replace_range,
                 new_text: insert_text,
@@ -725,10 +812,17 @@ pub fn build_pubspec_code_lenses(
             "Checking pub.dev…".to_string()
         } else {
             let updates = evals.iter().filter(|e| e.has_update()).count();
-            let discontinued = evals.iter().filter(|e| e.info.is_discontinued).count();
+            let discontinued = evals
+                .iter()
+                .filter(|e| !e.ignore_rules.is_all_ignored() && e.info.is_discontinued)
+                .count();
+            let checked = evals
+                .iter()
+                .filter(|e| !e.ignore_rules.is_all_ignored())
+                .count();
             let update_word = if updates == 1 { "update" } else { "updates" };
             if updates == 0 && discontinued == 0 {
-                format!("Refresh ({} checked · up to date)", evals.len())
+                format!("Refresh ({checked} checked · up to date)")
             } else if discontinued > 0 {
                 format!("Refresh ({updates} {update_word}, {discontinued} discontinued)")
             } else {
@@ -761,18 +855,23 @@ pub fn build_pubspec_code_lenses(
 
 /// Builds Quick Fix and Source Code Actions for `pubspec.yaml` / `pubspec_overrides.yaml`:
 /// 1. Single-dependency compatible and major upgrades on cursor line;
-/// 2. Batch compatible upgrade (when 2+ packages have compatible updates);
-/// 3. Batch latest upgrade including major versions (non-preferred, when 2+ updates include a major);
-/// 4. Manual refresh source action.
+/// 2. Fine-grained ignore actions (`=version`, `>=version`, `*`) & unignore action on cursor line;
+/// 3. Batch compatible upgrade (when 2+ packages have compatible updates);
+/// 4. Batch latest upgrade including major versions (non-preferred, when 2+ updates include a major);
+/// 5. Open `.zed/pubspec-ignore.json` & manual refresh source actions.
 #[must_use]
 pub fn build_pubspec_code_actions(
     uri: &Uri,
+    parsed: &ParsedPubspec,
     evals: &[DependencyEvaluation],
+    ignore_config: &PubspecIgnoreConfig,
     requested_range: Range,
 ) -> Vec<CodeActionOrCommand> {
     let mut actions = Vec::new();
+    let uri_str = uri.as_str().to_string();
+    let mut cursor_handled_pkgs: Vec<String> = Vec::new();
 
-    // 1. Per-dependency upgrade quick fixes for the line under cursor.
+    // 1. Per-dependency upgrade & ignore/unignore actions for the line under cursor.
     for eval in evals {
         if !ranges_overlap_line(eval.dep.name_range, eval.dep.version_range, requested_range) {
             continue;
@@ -780,46 +879,120 @@ pub fn build_pubspec_code_actions(
         if !matches!(eval.dep.source, DependencySource::Hosted { .. }) {
             continue;
         }
+        cursor_handled_pkgs.push(eval.dep.name.clone());
 
         let mut offered_versions: Vec<String> = Vec::new();
 
-        if let Some(compat) = &eval.latest_compatible
-            && eval
-                .baseline_version
-                .as_ref()
-                .is_none_or(|b| compare_dart_versions(compat, b) == Ordering::Greater)
-        {
-            let new_text = format_upgraded_constraint(eval.dep.raw_constraint.as_deref(), compat);
-            let title = format!("Upgrade `{}` to {new_text} (compatible)", eval.dep.name);
-            actions.push(make_edit_action(
-                uri,
-                title,
-                eval.dep.version_range,
-                new_text,
-                true,
-            ));
-            offered_versions.push(compat.to_string());
+        if !eval.ignore_rules.is_all_ignored() {
+            if let Some(compat) = &eval.latest_compatible
+                && eval
+                    .baseline_version
+                    .as_ref()
+                    .is_none_or(|b| compare_dart_versions(compat, b) == Ordering::Greater)
+            {
+                let new_text =
+                    format_upgraded_constraint(eval.dep.raw_constraint.as_deref(), compat);
+                let title = format!("Upgrade `{}` to {new_text} (compatible)", eval.dep.name);
+                actions.push(make_edit_action(
+                    uri,
+                    title,
+                    eval.dep.version_range,
+                    new_text,
+                    true,
+                ));
+                offered_versions.push(compat.to_string());
+            }
+
+            if let Some(latest) = &eval.latest_overall
+                && (eval.has_update() || eval.current_retracted)
+                && !offered_versions.contains(&latest.to_string())
+            {
+                let new_text =
+                    format_upgraded_constraint(eval.dep.raw_constraint.as_deref(), latest);
+                let kind_tag = match eval.upgrade_kind {
+                    UpgradeKind::Major => " (major)",
+                    UpgradeKind::Prerelease => " (prerelease)",
+                    _ => "",
+                };
+                let title = format!("Upgrade `{}` to {new_text}{kind_tag}", eval.dep.name);
+                let is_preferred =
+                    eval.upgrade_kind != UpgradeKind::Major && offered_versions.is_empty();
+                actions.push(make_edit_action(
+                    uri,
+                    title,
+                    eval.dep.version_range,
+                    new_text,
+                    is_preferred,
+                ));
+            }
+
+            if eval.has_update()
+                && let Some(latest) = &eval.latest_overall
+            {
+                let exact_rule = format!("={latest}");
+                let from_rule = format!(">={latest}");
+                actions.push(make_command_action(
+                    format!("Ignore `{}` {latest}", eval.dep.name),
+                    CodeActionKind::QUICKFIX,
+                    CMD_PUB_IGNORE,
+                    vec![json!(uri_str), json!(eval.dep.name), json!(exact_rule)],
+                ));
+                actions.push(make_command_action(
+                    format!(
+                        "Ignore `{}` >={latest} (this & newer versions)",
+                        eval.dep.name
+                    ),
+                    CodeActionKind::QUICKFIX,
+                    CMD_PUB_IGNORE,
+                    vec![json!(uri_str), json!(eval.dep.name), json!(from_rule)],
+                ));
+                actions.push(make_command_action(
+                    format!("Ignore all updates for `{}`", eval.dep.name),
+                    CodeActionKind::QUICKFIX,
+                    CMD_PUB_IGNORE,
+                    vec![json!(uri_str), json!(eval.dep.name), json!("*")],
+                ));
+            } else {
+                actions.push(make_command_action(
+                    format!("Ignore all updates for `{}`", eval.dep.name),
+                    CodeActionKind::SOURCE,
+                    CMD_PUB_IGNORE,
+                    vec![json!(uri_str), json!(eval.dep.name), json!("*")],
+                ));
+            }
         }
 
-        if let Some(latest) = &eval.latest_overall
-            && (eval.has_update() || eval.current_retracted)
-            && !offered_versions.contains(&latest.to_string())
+        if ignore_config.has_file_rule(&eval.dep.name) {
+            actions.push(make_command_action(
+                format!("Unignore `{}` (clear ignore rules)", eval.dep.name),
+                CodeActionKind::QUICKFIX,
+                CMD_PUB_UNIGNORE,
+                vec![json!(uri_str), json!(eval.dep.name)],
+            ));
+        }
+    }
+
+    // Fallback for hosted dependencies on cursor line that have no evaluation (e.g. `*`-ignored without cache).
+    for dep in &parsed.dependencies {
+        if !matches!(dep.source, DependencySource::Hosted { .. })
+            || cursor_handled_pkgs.contains(&dep.name)
+            || !ranges_overlap_line(dep.name_range, dep.version_range, requested_range)
         {
-            let new_text = format_upgraded_constraint(eval.dep.raw_constraint.as_deref(), latest);
-            let kind_tag = match eval.upgrade_kind {
-                UpgradeKind::Major => " (major)",
-                UpgradeKind::Prerelease => " (prerelease)",
-                _ => "",
-            };
-            let title = format!("Upgrade `{}` to {new_text}{kind_tag}", eval.dep.name);
-            let is_preferred =
-                eval.upgrade_kind != UpgradeKind::Major && offered_versions.is_empty();
-            actions.push(make_edit_action(
-                uri,
-                title,
-                eval.dep.version_range,
-                new_text,
-                is_preferred,
+            continue;
+        }
+        if ignore_config.has_file_rule(&dep.name) {
+            actions.push(make_command_action(
+                format!("Unignore `{}` (clear ignore rules)", dep.name),
+                CodeActionKind::QUICKFIX,
+                CMD_PUB_UNIGNORE,
+                vec![json!(uri_str), json!(dep.name)],
+            ));
+        } else if !ignore_config.is_all_ignored(&dep.name) {
+            actions.push(make_command_action(
+                format!("Ignore all updates for `{}`", dep.name),
+                CodeActionKind::SOURCE,
+                CMD_PUB_IGNORE,
+                vec![json!(uri_str), json!(dep.name), json!("*")],
             ));
         }
     }
@@ -828,6 +1001,9 @@ pub fn build_pubspec_code_actions(
     let batch_compat_edits: Vec<TextEdit> = evals
         .iter()
         .filter_map(|eval| {
+            if eval.ignore_rules.is_all_ignored() {
+                return None;
+            }
             let compat = eval.latest_compatible.as_ref()?;
             let base = eval.baseline_version.as_ref()?;
             if compare_dart_versions(compat, base) != Ordering::Greater {
@@ -889,19 +1065,48 @@ pub fn build_pubspec_code_actions(
         }));
     }
 
-    // 4. Manual refresh source action.
+    // 4. Open `.zed/pubspec-ignore.json` when any ignore file or rule is active.
+    if ignore_config.has_ignore_file || ignore_config.has_any_rules() {
+        actions.push(make_command_action(
+            "Flutter Debugger: Open .zed/pubspec-ignore.json".to_string(),
+            CodeActionKind::SOURCE,
+            CMD_PUB_OPEN_IGNORE_FILE,
+            vec![json!(uri_str)],
+        ));
+    }
+
+    // 5. Manual refresh source action.
     actions.push(CodeActionOrCommand::CodeAction(CodeAction {
         title: "Flutter Debugger: Refresh dependency versions from pub.dev".to_string(),
         kind: Some(CodeActionKind::SOURCE),
         command: Some(Command {
             title: "Refresh dependency versions".to_string(),
             command: CMD_PUB_REFRESH.to_string(),
-            arguments: Some(vec![json!(uri.as_str())]),
+            arguments: Some(vec![json!(uri_str)]),
         }),
         ..Default::default()
     }));
 
     actions
+}
+
+fn make_command_action(
+    title: String,
+    kind: CodeActionKind,
+    command: &str,
+    arguments: Vec<serde_json::Value>,
+) -> CodeActionOrCommand {
+    CodeActionOrCommand::CodeAction(CodeAction {
+        title: title.clone(),
+        kind: Some(kind),
+        is_preferred: Some(false),
+        command: Some(Command {
+            title,
+            command: command.to_string(),
+            arguments: Some(arguments),
+        }),
+        ..Default::default()
+    })
 }
 
 fn make_edit_action(
@@ -1045,6 +1250,7 @@ mod tests {
             Some("5.1.0".to_string()),
             parsed.environment_sdk.as_ref(),
             &config,
+            PackageIgnoreRules::default(),
         );
         let http_eval = DependencyEvaluation::evaluate(
             http_dep,
@@ -1052,6 +1258,7 @@ mod tests {
             Some("1.2.0".to_string()),
             parsed.environment_sdk.as_ref(),
             &config,
+            PackageIgnoreRules::default(),
         );
         let evals = vec![dio_eval.clone(), http_eval];
 
@@ -1080,11 +1287,14 @@ mod tests {
         assert_eq!(hints.len(), 2);
         assert!(hints[0].text_edits.is_some());
 
-        // 3. CodeActions include single compatible, single major, batch compatible, batch major (non-preferred), and refresh
+        // 3. CodeActions include single compatible, single major, ignore rules, batch compatible, batch major (non-preferred), and refresh
         let uri: Uri = "file:///tmp/demo/pubspec.yaml".parse().expect("uri");
+        let empty_ignore = PubspecIgnoreConfig::default();
         let actions = build_pubspec_code_actions(
             &uri,
+            &parsed,
             &evals,
+            &empty_ignore,
             Range::new(Position::new(6, 2), Position::new(6, 5)),
         );
         let titles: Vec<&str> = actions
@@ -1096,6 +1306,9 @@ mod tests {
             .collect();
         assert!(titles.iter().any(|t| t.contains("Upgrade `dio` to ^5.8.0 (compatible)")));
         assert!(titles.iter().any(|t| t.contains("Upgrade `dio` to ^6.0.0 (major)")));
+        assert!(titles.iter().any(|t| t.contains("Ignore `dio` 6.0.0")));
+        assert!(titles.iter().any(|t| t.contains("Ignore `dio` >=6.0.0")));
+        assert!(titles.iter().any(|t| t.contains("Ignore all updates for `dio`")));
         assert!(titles.iter().any(|t| t.contains("latest compatible")));
         assert!(titles.iter().any(|t| t.contains("latest (including major)")));
         assert!(titles.iter().any(|t| t.contains("Refresh dependency versions")));
@@ -1130,12 +1343,14 @@ mod tests {
 
         // 5. Version completions exclude retracted 5.7.0 and preserve newest-first ordering
         let ctx = completion_context_at(yaml, &parsed, Position::new(6, 13)).expect("ctx");
+        let no_rules = PackageIgnoreRules::default();
         let completions = build_version_completion_items(
             &ctx,
             &dio_info,
             Some("5.1.0"),
             parsed.environment_sdk.as_ref(),
             &config,
+            &no_rules,
         );
         // `dio: ^5.1.0` -> filter_prefix = "5.1.0", none start with 5.1.0; test fresh prefix `^`
         assert!(completions.is_empty());
@@ -1150,6 +1365,7 @@ mod tests {
             Some("5.8.0"),
             parsed.environment_sdk.as_ref(),
             &config,
+            &no_rules,
         );
         assert_eq!(items.len(), 2); // 5.7.0 is retracted and excluded
         assert_eq!(items[0].label, "^6.0.0");
@@ -1176,5 +1392,211 @@ mod tests {
             lenses[1].command.as_ref().expect("c").title,
             "flutter pub get…"
         );
+    }
+
+    #[test]
+    fn enforces_exact_from_version_and_all_ignore_semantics() {
+        use crate::lsp::pubspec::ignore::IgnoreRule;
+
+        let yaml = concat!(
+            "name: demo\n",
+            "environment:\n",
+            "  sdk: ^3.5.0\n",
+            "dependencies:\n",
+            "  dio: ^5.4.0\n",
+            "  legacy: ^1.0.0\n",
+        );
+        let parsed = parse_pubspec(yaml);
+        let config = PubspecConfig::default();
+        let dio_dep = parsed.dependencies[0].clone();
+        let legacy_dep = parsed.dependencies[1].clone();
+
+        let dio_info = sample_pkg(
+            "dio",
+            &[
+                ("6.1.0", false, Some("^3.0.0")),
+                ("6.0.0", false, Some("^3.0.0")),
+                ("5.9.0", false, Some("^3.0.0")),
+                ("5.4.0", false, Some("^3.0.0")),
+            ],
+        );
+
+        // Case 1: `>=6.0.0` skips 6.1.0 & 6.0.0, STILL surfaces minor update 5.9.0
+        let mut from_6 = PackageIgnoreRules {
+            rules: Vec::new(),
+            from_file: true,
+            from_settings: false,
+        };
+        from_6.insert_normalized(IgnoreRule::parse(">=6.0.0").unwrap());
+
+        let dio_eval_54 = DependencyEvaluation::evaluate(
+            dio_dep.clone(),
+            dio_info.clone(),
+            Some("5.4.0".to_string()),
+            parsed.environment_sdk.as_ref(),
+            &config,
+            from_6.clone(),
+        );
+        assert_eq!(
+            dio_eval_54.latest_overall.as_ref().map(ToString::to_string),
+            Some("5.9.0".to_string())
+        );
+        assert_eq!(
+            dio_eval_54
+                .raw_latest_overall
+                .as_ref()
+                .map(ToString::to_string),
+            Some("6.1.0".to_string())
+        );
+        assert_eq!(dio_eval_54.upgrade_kind, UpgradeKind::Minor);
+        assert!(dio_eval_54.muted_newer_version);
+
+        // Hover reveals both unignored latest (5.9.0) and real pub.dev latest (6.1.0 ignored by >=6.0.0)
+        let hover_54 = build_hosted_hover_markdown(&dio_eval_54, None, &config);
+        assert!(hover_54.contains("Latest (unignored)**: `5.9.0`"));
+        assert!(hover_54.contains("Latest on pub.dev**: `6.1.0` *(ignored by `>=6.0.0`)*"));
+        assert!(hover_54.contains("Ignored Rules**: `>=6.0.0`"));
+
+        // Case 2: Once locked/declared at 5.9.0 with `>=6.0.0`, diagnostics are empty AND InlayHint is completely silent (None)!
+        let dio_eval_59 = DependencyEvaluation::evaluate(
+            dio_dep.clone(),
+            dio_info.clone(),
+            Some("5.9.0".to_string()),
+            parsed.environment_sdk.as_ref(),
+            &config,
+            from_6.clone(),
+        );
+        assert!(!dio_eval_59.has_update());
+        assert!(dio_eval_59.muted_newer_version);
+        assert!(
+            build_pubspec_diagnostics(&parsed, std::slice::from_ref(&dio_eval_59), None, &config)
+                .is_empty()
+        );
+        assert!(
+            build_pubspec_inlay_hints(
+                std::slice::from_ref(&dio_eval_59),
+                Range::new(Position::new(0, 0), Position::new(10, 0)),
+                &config,
+            )
+            .is_empty()
+        );
+
+        // Case 3: Exact `=6.1.0` ignores 6.1.0 only; if 6.2.0 is released, it prompts immediately
+        let mut exact_61 = PackageIgnoreRules {
+            rules: Vec::new(),
+            from_file: true,
+            from_settings: false,
+        };
+        exact_61.insert_normalized(IgnoreRule::parse("=6.1.0").unwrap());
+        let dio_info_62 = sample_pkg(
+            "dio",
+            &[
+                ("6.2.0", false, Some("^3.0.0")),
+                ("6.1.0", false, Some("^3.0.0")),
+                ("5.9.0", false, Some("^3.0.0")),
+            ],
+        );
+        let dio_eval_62 = DependencyEvaluation::evaluate(
+            dio_dep,
+            dio_info_62,
+            Some("5.9.0".to_string()),
+            parsed.environment_sdk.as_ref(),
+            &config,
+            exact_61,
+        );
+        assert_eq!(
+            dio_eval_62.latest_overall.as_ref().map(ToString::to_string),
+            Some("6.2.0".to_string())
+        );
+        assert_eq!(dio_eval_62.upgrade_kind, UpgradeKind::Major);
+
+        // Case 4: `>=2.0.0` still preserves `discontinued` warning, whereas `*` silences everything (incl. `discontinued`)
+        let mut legacy_info = sample_pkg("legacy", &[("2.0.0", false, Some("^3.0.0")), ("1.0.0", false, Some("^3.0.0"))]);
+        legacy_info.is_discontinued = true;
+        let mut from_2 = PackageIgnoreRules {
+            rules: Vec::new(),
+            from_file: true,
+            from_settings: false,
+        };
+        from_2.insert_normalized(IgnoreRule::parse(">=2.0.0").unwrap());
+        let legacy_partial = DependencyEvaluation::evaluate(
+            legacy_dep.clone(),
+            legacy_info.clone(),
+            Some("1.0.0".to_string()),
+            parsed.environment_sdk.as_ref(),
+            &config,
+            from_2,
+        );
+        let partial_diags = build_pubspec_diagnostics(&parsed, &[legacy_partial], None, &config);
+        assert!(partial_diags.iter().any(|d| d.code == Some(NumberOrString::String("discontinued".to_string()))));
+
+        let mut ignore_all = PackageIgnoreRules {
+            rules: Vec::new(),
+            from_file: true,
+            from_settings: false,
+        };
+        ignore_all.insert_normalized(IgnoreRule::All);
+        let legacy_all = DependencyEvaluation::evaluate(
+            legacy_dep,
+            legacy_info,
+            Some("1.0.0".to_string()),
+            parsed.environment_sdk.as_ref(),
+            &config,
+            ignore_all.clone(),
+        );
+        assert!(
+            build_pubspec_diagnostics(&parsed, std::slice::from_ref(&legacy_all), None, &config)
+                .is_empty()
+        );
+        assert!(
+            build_pubspec_inlay_hints(
+                std::slice::from_ref(&legacy_all),
+                Range::new(Position::new(0, 0), Position::new(10, 0)),
+                &config,
+            )
+            .is_empty()
+        );
+
+        // Case 5: CodeActions offer Unignore + Open .zed/pubspec-ignore.json on ignored lines
+        let uri: Uri = "file:///tmp/demo/pubspec.yaml".parse().expect("uri");
+        let mut ignore_cfg = PubspecIgnoreConfig {
+            has_ignore_file: true,
+            ..Default::default()
+        };
+        ignore_cfg.packages.insert("legacy".to_string(), ignore_all);
+        let actions = build_pubspec_code_actions(
+            &uri,
+            &parsed,
+            std::slice::from_ref(&legacy_all),
+            &ignore_cfg,
+            Range::new(Position::new(5, 2), Position::new(5, 8)),
+        );
+        let titles: Vec<&str> = actions
+            .iter()
+            .filter_map(|a| match a {
+                CodeActionOrCommand::CodeAction(ca) => Some(ca.title.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(titles.iter().any(|t| t.contains("Unignore `legacy`")));
+        assert!(titles.iter().any(|t| t.contains("Open .zed/pubspec-ignore.json")));
+
+        // Case 6: Version completion marks ignored versions and preselects the first unignored stable version
+        let yaml_typing = "name: demo\ndependencies:\n  dio: ^\n";
+        let parsed_typing = parse_pubspec(yaml_typing);
+        let ctx = completion_context_at(yaml_typing, &parsed_typing, Position::new(2, 8)).unwrap();
+        let items = build_version_completion_items(
+            &ctx,
+            &dio_info,
+            Some("5.4.0"),
+            parsed.environment_sdk.as_ref(),
+            &config,
+            &from_6,
+        );
+        assert_eq!(items[0].label, "^6.1.0");
+        assert!(items[0].detail.as_deref().unwrap_or("").contains("ignored"));
+        assert_eq!(items[0].preselect, Some(false));
+        assert_eq!(items[2].label, "^5.9.0");
+        assert_eq!(items[2].preselect, Some(true));
     }
 }

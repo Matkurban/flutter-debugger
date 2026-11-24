@@ -12,7 +12,7 @@
   - **可点击内联版本提示（`inlayHint`）**：行尾显示 `✓ latest`、`⬆ 5.9.0`、`⬆ 6.0.0 (major)`、`⬆ 6.0.0 (major, SDK)`、`⚠ retracted → ...` 与 `⚠ discontinued`，点击过期提示即可直接就地升级版本号。
   - **富文本悬停卡片（`textDocument/hover`）**：展示包描述、Pub Points / 点赞数 / 30 天下载量、声明版本 vs `pubspec.lock` 锁定版本 vs 最新兼容/总体版本、Dart SDK 兼容性提示以及懒加载缓存的 `pub.dev` 更新日志（Changelog）；同时支持离线悬停查看本地 `path:` / `sdk:` / `git:` 依赖与 `flutter.assets` / `flutter.fonts` 磁盘状态。
   - **依赖版本自动补全（`textDocument/completion`）**：在 `pubspec.yaml` / `pubspec_overrides.yaml` 中输入 `:` 或 `^` 即触发版本补全，自动保留原有引号与 `^` 前缀，并标注 `latest`、`locked`、发布日期与 SDK 兼容性。
-  - **统一诊断与一键升级（`Cmd+.`）**：将大版本/小版本/补丁/预发布/撤回/已停维护（含 `DEPRECATED` 删除线）以及缺失资源/字体诊断原子合并发布；支持单包兼容升级、单包大版本升级、一键批量升级所有兼容依赖，以及一键批量升级全部依赖至最新版（含大版本）。
+  - **统一诊断、一键升级与细粒度忽略（`Cmd+.`）**：将大版本/小版本/补丁/预发布/撤回/已停维护（含 `DEPRECATED` 删除线）以及缺失资源/字体诊断原子合并发布；支持单包与批量升级，以及一键忽略规则写入 `<workspace>/.zed/pubspec-ignore.json`（不污染 `pubspec.yaml`）：支持忽略单版本（`=X.Y.Z`）、忽略某版本及之后所有版本（`>=X.Y.Z`）或彻底忽略该包（`*`）。
   - **保存自动 `pub get` 与 `pubspec.lock` 实时同步**：保存 `pubspec.yaml` 时通过依赖与 SDK 约束指纹比对，**仅在依赖真正变化时**调用项目 FVM / 自定义 SDK 自动执行 `<flutter|dart> pub get`；同时通过动态文件监听 `**/pubspec.lock` 实时同步外部命令行执行结果。
   - **顶部 CodeLens 与可点击链接**：提供 `Refresh (N updates)`、`<flutter|dart> pub get`、`pub upgrade`、`pub outdated` 一键入口，以及直达 `pub.dev`（支持 `PUB_HOSTED_URL` / `pubHostedUrl` 镜像与私服）、本地 `path:` 包与本地资源/字体的 `Cmd+点击` 链接。
 - **Dart LSP 编辑器增强**：Widget 闭合标签（Closing Labels）、Flutter 颜色预览与取色器、`main()` 与测试文件 CodeLens、流式 `--machine` 测试运行器（支持嵌套 `group` 路径与 UTF-16 精准失败诊断）与保存防抖自动热重载。
@@ -153,6 +153,7 @@
 - **完整的 Pub V2 仓库与镜像支持**：遵循 Hosted Pub Repository Specification V2（`Accept: application/vnd.pub.v2+json`）与 `/score` 接口，按 `pubspec.pubHostedUrl` → `PUB_HOSTED_URL` → `https://pub.dev` 优先级解析，兼容单包自定义 `hosted:` 源、HTTP/2 + gzip + 系统代理，以及原子双层缓存（`<cache>/pub_packages` 与 `pub_changelogs`）。
 - **精准的 Dart SemVer 与 Lockfile 解析**：完整支持 `^`、区间（`>=1.0.0 <2.0.0`）、精确版本、`any` 与空约束；自动读取同级 `pubspec.lock` 并通过 `workspace/didChangeWatchedFiles` 实时同步；编辑升级至最新版时立即消除过期下划线；支持撤回（retracted）、停维护（discontinued）与 Dart `environment.sdk` 兼容性校验。
 - **交互式升级与版本补全**：点击任意 `⬆` 内联提示、使用 `Cmd+.` Code Actions（单包兼容/大版本升级、批量升级兼容依赖、批量升级全部至最新版），或在 `:` / `^` 后触发版本自动补全。
+- **细粒度版本忽略（`.zed/pubspec-ignore.json`）**：支持忽略单个版本（`=5.9.0`，后续发布新版自动重新提示）、忽略某版本及之后所有版本（`>=6.0.0`，若存在更低兼容更新如 `5.9.0` 仍照常提示，并保留 `discontinued`/`retracted` 警告），或彻底忽略该包全部更新（`*`，连同 `discontinued`/`retracted` 一并静音且不发起网络请求）。规则保存在工作区根目录 `.zed/pubspec-ignore.json`（不修改 `pubspec.yaml`，Monorepo 所有子包共享并自动合并子包规则及 `settings.json` `pubspec.ignorePackages`），支持文件变更实时生效；被静音的依赖行尾完全隐藏 Inlay Hint，可通过 Hover 查看规则与真实最新版，或按 `Cmd+.` 一键取消忽略 / 打开配置文件。
 - **保存自动 `pub get`**：对每个打开的 `pubspec.yaml` 维护依赖与 SDK 约束指纹，修改注释/描述/资源路径不会误触发，仅在依赖或 SDK 约束真正变更并保存时通过项目 FVM / SDK 自动运行 `<flutter|dart> pub get`。
 - **资源、字体与本地依赖**：检测缺失的 `flutter.assets` / `flutter.fonts`，提供 `Cmd+点击` 跳转链接，并支持离线悬停查看文件大小、目录文件数量或本地 `path:` 包元信息。
 
