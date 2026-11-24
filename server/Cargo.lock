@@ -313,7 +313,7 @@ dependencies = [
 
 [[package]]
 name = "flutter-debugger-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dirs",
  "serde",
@@ -323,7 +323,7 @@ dependencies = [
 
 [[package]]
 name = "flutter-debugger-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dashmap",
  "dirs",
