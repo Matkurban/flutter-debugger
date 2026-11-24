@@ -271,8 +271,11 @@ impl zed::Extension for FlutterDebuggerExtension {
                     }
                 }
                 value if value.starts_with("--dart-define-from-file=") => {
-                    dart_define_from_file =
-                        Some(value.trim_start_matches("--dart-define-from-file=").to_string());
+                    dart_define_from_file = Some(
+                        value
+                            .trim_start_matches("--dart-define-from-file=")
+                            .to_string(),
+                    );
                 }
                 value if !value.starts_with('-') && value.ends_with(".dart") => {
                     program = value.to_string();
