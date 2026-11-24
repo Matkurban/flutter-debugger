@@ -1134,18 +1134,25 @@ mod tests {
         let proj_root = dir.path().join("my_app");
         let dart_tool = proj_root.join(".dart_tool");
         std::fs::create_dir_all(&dart_tool).expect("mkdir .dart_tool");
-        let nicepay_file = proj_root.join("lib/pages/home/nicepay_view.dart");
+        let nicepay_file = proj_root
+            .join("lib")
+            .join("pages")
+            .join("home")
+            .join("nicepay_view.dart");
         std::fs::create_dir_all(nicepay_file.parent().expect("parent")).expect("mkdir pages/home");
         std::fs::write(&nicepay_file, "void main() {}\n").expect("write nicepay_view.dart");
 
         let pub_cache_pkg = dir.path().join("pub_cache").join("provider-6.1.0");
-        std::fs::create_dir_all(pub_cache_pkg.join("lib/src")).expect("mkdir provider");
+        std::fs::create_dir_all(pub_cache_pkg.join("lib").join("src")).expect("mkdir provider");
+        let pub_cache_uri = url::Url::from_directory_path(&pub_cache_pkg)
+            .expect("pub_cache file URI")
+            .to_string();
 
         let pkg_cfg = json!({
             "configVersion": 2,
             "packages": [
                 { "name": "my_app", "rootUri": "../", "packageUri": "lib/" },
-                { "name": "provider", "rootUri": format!("file://{}", pub_cache_pkg.display()), "packageUri": "lib/" }
+                { "name": "provider", "rootUri": pub_cache_uri, "packageUri": "lib/" }
             ]
         });
         std::fs::write(
@@ -1209,7 +1216,7 @@ mod tests {
         assert_eq!(msg1["body"]["column"], 40);
 
         // 2. Dart stack trace with ANSI dim escape codes (`\x1b[2m`) and `package:my_app/...` -> `\x1b[90m` + `zed://file/...`
-        let home_file = proj_root.join("lib/pages/home.dart");
+        let home_file = proj_root.join("lib").join("pages").join("home.dart");
         let expected_home_uri =
             flutter_debugger_protocol::format_zed_file_uri(&home_file, Some(42), Some(5));
         let mut msg2 = json!({
@@ -1235,7 +1242,10 @@ mod tests {
         assert_eq!(msg2["body"]["column"], 5);
 
         // 3. Third-party pub package `package:provider/...` + existing `file://` source.path normalization
-        let provider_file = pub_cache_pkg.join("lib/src/provider.dart");
+        let provider_file = pub_cache_pkg.join("lib").join("src").join("provider.dart");
+        let provider_file_uri = url::Url::from_file_path(&provider_file)
+            .expect("provider file URI")
+            .to_string();
         let expected_provider_uri =
             flutter_debugger_protocol::format_zed_file_uri(&provider_file, Some(19), Some(7));
         let mut msg3 = json!({
@@ -1247,7 +1257,7 @@ mod tests {
                 "output": "#1      Provider.of (package:provider/src/provider.dart:19:7) see https://pub.dev/packages/provider\n",
                 "source": {
                     "name": "package:provider/src/provider.dart",
-                    "path": format!("file://{}", provider_file.display())
+                    "path": provider_file_uri
                 }
             }
         });

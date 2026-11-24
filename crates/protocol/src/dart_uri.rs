@@ -549,6 +549,9 @@ mod tests {
 
         let external_pkg = dir.path().join("pub_cache").join("provider-6.1.0");
         fs::create_dir_all(external_pkg.join("lib").join("src")).expect("mkdir provider");
+        let external_uri = url::Url::from_directory_path(&external_pkg)
+            .expect("external pkg file URI")
+            .to_string();
 
         let pkg_config = json!({
             "configVersion": 2,
@@ -560,7 +563,7 @@ mod tests {
                 },
                 {
                     "name": "provider",
-                    "rootUri": format!("file://{}", external_pkg.display()),
+                    "rootUri": external_uri,
                     "packageUri": "lib/"
                 }
             ]
@@ -743,7 +746,13 @@ mod tests {
         assert_eq!(resolved_back, clean_relative_segments(&dart_file));
 
         // Real disk `file://` URI containing raw spaces, parentheses, and Chinese characters
-        let raw_space_file_uri = format!("at file://{}:10:2\n", dart_file.display());
+        let dart_file_slashes = normalize_slashes(&dart_file);
+        let raw_space_prefix = if dart_file_slashes.starts_with('/') {
+            "file://"
+        } else {
+            "file:///"
+        };
+        let raw_space_file_uri = format!("at {raw_space_prefix}{dart_file_slashes}:10:2\n");
         let (rewritten_raw_space, first_raw_space) =
             rewrite_dart_output_paths(&raw_space_file_uri, &special_root);
         assert_eq!(rewritten_raw_space, format!("at {uri}\n"));

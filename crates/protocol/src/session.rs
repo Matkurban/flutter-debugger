@@ -118,7 +118,7 @@ pub fn normalize_project_key(path: &Path) -> String {
         .into_owned()
 }
 
-/// Fast OS-level PID liveness check (`kill(pid, 0)` on Unix).
+/// Fast OS-level PID liveness check (`kill(pid, 0)` on Unix, `OpenProcess` + `GetExitCodeProcess` on Windows).
 pub fn is_pid_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
@@ -139,7 +139,41 @@ pub fn is_pid_alive(pid: u32) -> bool {
         matches!(std::io::Error::last_os_error().raw_os_error(), Some(1))
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+        const STILL_ACTIVE: u32 = 259;
+        const ERROR_ACCESS_DENIED: i32 = 5;
+
+        unsafe extern "system" {
+            fn OpenProcess(
+                dw_desired_access: u32,
+                b_inherit_handle: i32,
+                dw_process_id: u32,
+            ) -> *mut std::ffi::c_void;
+            fn GetExitCodeProcess(
+                h_process: *mut std::ffi::c_void,
+                lp_exit_code: *mut u32,
+            ) -> i32;
+            fn CloseHandle(h_object: *mut std::ffi::c_void) -> i32;
+        }
+
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() {
+            return matches!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(ERROR_ACCESS_DENIED)
+            );
+        }
+        let mut exit_code: u32 = 0;
+        let ok = unsafe { GetExitCodeProcess(handle, &mut exit_code) };
+        unsafe {
+            CloseHandle(handle);
+        }
+        ok != 0 && exit_code == STILL_ACTIVE
+    }
+
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = pid;
         true
