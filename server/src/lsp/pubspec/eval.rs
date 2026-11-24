@@ -7,7 +7,7 @@ use crate::lsp::pubspec::parser::ParsedDependency;
 use crate::lsp::pubspec::registry::PackageInfo;
 use crate::lsp::pubspec::version::{
     UpgradeKind, VersionConstraint, classify_upgrade, compare_dart_versions,
-    format_upgraded_constraint, is_sdk_compatible, parse_dart_version,
+    format_tightened_constraint, format_upgraded_constraint, is_sdk_compatible, parse_dart_version,
 };
 use crate::lsp::state::PubspecConfig;
 
@@ -18,6 +18,11 @@ pub struct DependencyEvaluation {
     pub dep: ParsedDependency,
     pub info: PackageInfo,
     pub locked_version: Option<String>,
+    /// Lower-bound version declared in `pubspec.yaml` (if any).
+    pub declared_version: Option<Version>,
+    /// Set when `pubspec.lock` resolves to a compatible version strictly newer than
+    /// `declared_version` (e.g. after `flutter pub upgrade` leaves `pubspec.yaml` behind).
+    pub lock_ahead_version: Option<Version>,
     /// Baseline version used for comparison (locked version if newer & matching constraint, else declared min).
     pub baseline_version: Option<Version>,
     /// Latest non-retracted, non-ignored version satisfying the current constraint & project SDK.
@@ -51,28 +56,41 @@ impl DependencyEvaluation {
     ) -> Self {
         let allow_pre = config.include_prerelease || dep.constraint.opts_into_prerelease();
 
-        let declared_min = dep.constraint.baseline_version().cloned();
+        let declared_version = dep.constraint.baseline_version().cloned();
         let locked_parsed = locked_version.as_deref().and_then(parse_dart_version);
+        let all_ignored = ignore_rules.is_all_ignored();
+
+        let lock_ahead_version = if all_ignored || dep.raw_constraint.is_none() {
+            None
+        } else {
+            match (&declared_version, &locked_parsed) {
+                (Some(decl), Some(locked))
+                    if dep.constraint.matches(locked)
+                        && compare_dart_versions(locked, decl) == Ordering::Greater =>
+                {
+                    Some(locked.clone())
+                }
+                _ => None,
+            }
+        };
 
         // Prefer declared lower bound whenever `pubspec.lock` is stale (e.g. right after editing
         // `pubspec.yaml` to the latest version before `pub get` finishes), so outdated underlines
         // clear immediately. If lockfile satisfies constraint and is newer, use locked version.
-        let baseline_version = match (declared_min, locked_parsed) {
+        let baseline_version = match (&declared_version, &locked_parsed) {
             (Some(decl), Some(locked)) => {
-                if dep.constraint.matches(&locked)
-                    && compare_dart_versions(&locked, &decl) == Ordering::Greater
+                if dep.constraint.matches(locked)
+                    && compare_dart_versions(locked, decl) == Ordering::Greater
                 {
-                    Some(locked)
+                    Some(locked.clone())
                 } else {
-                    Some(decl)
+                    Some(decl.clone())
                 }
             }
-            (Some(decl), None) => Some(decl),
-            (None, Some(locked)) => Some(locked),
+            (Some(decl), None) => Some(decl.clone()),
+            (None, Some(locked)) => Some(locked.clone()),
             (None, None) => None,
         };
-
-        let all_ignored = ignore_rules.is_all_ignored();
 
         let current_retracted = if all_ignored {
             false
@@ -161,6 +179,8 @@ impl DependencyEvaluation {
             dep,
             info,
             locked_version,
+            declared_version,
+            lock_ahead_version,
             baseline_version,
             latest_compatible,
             latest_overall,
@@ -190,5 +210,17 @@ impl DependencyEvaluation {
         }
         let new_text = format_upgraded_constraint(self.dep.raw_constraint.as_deref(), target);
         Some((target.clone(), new_text))
+    }
+
+    /// Returns `(locked_version, tightened_constraint)` when `pubspec.lock` is strictly ahead of
+    /// the declared lower bound in `pubspec.yaml`.
+    #[must_use]
+    pub fn sync_to_lock_edit(&self) -> Option<(Version, String)> {
+        if self.ignore_rules.is_all_ignored() {
+            return None;
+        }
+        let locked = self.lock_ahead_version.as_ref()?;
+        let new_text = format_tightened_constraint(self.dep.raw_constraint.as_deref(), locked);
+        Some((locked.clone(), new_text))
     }
 }

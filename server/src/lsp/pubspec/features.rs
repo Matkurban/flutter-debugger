@@ -122,9 +122,25 @@ fn build_dependency_diagnostic(
         });
     }
 
-    let latest = eval.latest_overall.as_ref()?;
+    let latest = eval.latest_overall.as_ref();
     let (severity, code, label) = match eval.upgrade_kind {
-        UpgradeKind::UpToDate => return None,
+        UpgradeKind::UpToDate => {
+            if let Some((locked, synced)) = eval.sync_to_lock_edit() {
+                let severity = config.lock_drift_severity.to_lsp()?;
+                let declared = eval.dep.raw_constraint.as_deref().unwrap_or("any");
+                return Some(Diagnostic {
+                    range: eval.dep.version_range,
+                    severity: Some(severity),
+                    code: Some(NumberOrString::String("lock-drift".to_string())),
+                    source: Some("flutter-debugger".to_string()),
+                    message: format!(
+                        "Locked at {locked} in pubspec.lock (pubspec.yaml declares {declared}) — sync constraint to {synced}"
+                    ),
+                    ..Default::default()
+                });
+            }
+            return None;
+        }
         UpgradeKind::Major => (
             config.major_severity.to_lsp()?,
             "outdated-major",
@@ -146,6 +162,7 @@ fn build_dependency_diagnostic(
             "New prerelease",
         ),
     };
+    let latest = latest?;
 
     let current_display = eval
         .baseline_version
@@ -160,12 +177,20 @@ fn build_dependency_diagnostic(
         String::new()
     };
 
+    let drift_note = if eval.lock_ahead_version.is_some()
+        && let Some(declared) = eval.dep.raw_constraint.as_deref()
+    {
+        format!(" (pubspec.yaml declares {declared})")
+    } else {
+        String::new()
+    };
+
     Some(Diagnostic {
         range: eval.dep.version_range,
         severity: Some(severity),
         code: Some(NumberOrString::String(code.to_string())),
         source: Some("flutter-debugger".to_string()),
-        message: format!("{label}: {current_display} → {latest}{sdk_note}"),
+        message: format!("{label}: {current_display} → {latest}{sdk_note}{drift_note}"),
         ..Default::default()
     })
 }
@@ -301,47 +326,93 @@ fn build_single_inlay_hint(
     } else if let Some(latest) = &eval.latest_overall {
         match eval.upgrade_kind {
             UpgradeKind::UpToDate => {
-                if eval.muted_newer_version || !config.show_up_to_date_hints {
-                    return None;
+                if let Some((locked, synced)) = eval.sync_to_lock_edit() {
+                    (
+                        format!("⇄ {locked} (locked)"),
+                        Some(vec![TextEdit {
+                            range: eval.dep.version_range,
+                            new_text: synced.clone(),
+                        }]),
+                        Some(InlayHintTooltip::String(format!(
+                            "Locked at {locked} in pubspec.lock — click to sync `{}` to {synced}",
+                            eval.dep.name
+                        ))),
+                    )
+                } else {
+                    if eval.muted_newer_version || !config.show_up_to_date_hints {
+                        return None;
+                    }
+                    ("✓ latest".to_string(), None, None)
                 }
-                ("✓ latest".to_string(), None, None)
             }
             UpgradeKind::Major => {
                 let new_text =
                     format_upgraded_constraint(eval.dep.raw_constraint.as_deref(), latest);
-                let lbl = if eval.latest_sdk_incompatible {
-                    format!("⬆ {latest} (major, SDK)")
+                let suffix = if eval.latest_sdk_incompatible {
+                    " (major, SDK)"
                 } else {
-                    format!("⬆ {latest} (major)")
+                    " (major)"
+                };
+                let (lbl, tip) = match &eval.lock_ahead_version {
+                    Some(locked) => (
+                        format!("locked {locked} · ⬆ {latest}{suffix}"),
+                        format!(
+                            "Locked at {locked} in pubspec.lock — click to upgrade `{}` to {new_text} (major)",
+                            eval.dep.name
+                        ),
+                    ),
+                    None => (
+                        format!("⬆ {latest}{suffix}"),
+                        format!("Click to upgrade `{}` to {new_text} (major)", eval.dep.name),
+                    ),
                 };
                 (
                     lbl,
                     Some(vec![TextEdit {
                         range: eval.dep.version_range,
-                        new_text: new_text.clone(),
+                        new_text,
                     }]),
-                    Some(InlayHintTooltip::String(format!(
-                        "Click to upgrade `{}` to {new_text} (major)",
-                        eval.dep.name
-                    ))),
+                    Some(InlayHintTooltip::String(tip)),
                 )
             }
             UpgradeKind::Minor | UpgradeKind::Patch | UpgradeKind::Prerelease => {
                 let new_text =
                     format_upgraded_constraint(eval.dep.raw_constraint.as_deref(), latest);
+                let (lbl, tip) = match &eval.lock_ahead_version {
+                    Some(locked) => (
+                        format!("locked {locked} · ⬆ {latest}"),
+                        format!(
+                            "Locked at {locked} in pubspec.lock — click to upgrade `{}` to {new_text}",
+                            eval.dep.name
+                        ),
+                    ),
+                    None => (
+                        format!("⬆ {latest}"),
+                        format!("Click to upgrade `{}` to {new_text}", eval.dep.name),
+                    ),
+                };
                 (
-                    format!("⬆ {latest}"),
+                    lbl,
                     Some(vec![TextEdit {
                         range: eval.dep.version_range,
-                        new_text: new_text.clone(),
+                        new_text,
                     }]),
-                    Some(InlayHintTooltip::String(format!(
-                        "Click to upgrade `{}` to {new_text}",
-                        eval.dep.name
-                    ))),
+                    Some(InlayHintTooltip::String(tip)),
                 )
             }
         }
+    } else if let Some((locked, synced)) = eval.sync_to_lock_edit() {
+        (
+            format!("⇄ {locked} (locked)"),
+            Some(vec![TextEdit {
+                range: eval.dep.version_range,
+                new_text: synced.clone(),
+            }]),
+            Some(InlayHintTooltip::String(format!(
+                "Locked at {locked} in pubspec.lock — click to sync `{}` to {synced}",
+                eval.dep.name
+            ))),
+        )
     } else {
         return None;
     };
@@ -452,6 +523,15 @@ pub fn build_hosted_hover_markdown(
         md.push_str(&format!(
             "\n> **Quick Upgrade → `{new_text}`**: Click the inline `⬆ {target}` hint or press `Cmd+.` (`Ctrl+.`)\n"
         ));
+        if let Some((locked, synced)) = eval.sync_to_lock_edit() {
+            md.push_str(&format!(
+                "> **Lock ahead of `pubspec.yaml`**: `pubspec.lock` is at `{locked}` while `pubspec.yaml` declares `{declared}` (use `Cmd+.` to sync to `{synced}`).\n"
+            ));
+        }
+    } else if let Some((locked, synced)) = eval.sync_to_lock_edit() {
+        md.push_str(&format!(
+            "\n> **Out of sync with `pubspec.lock`**: `pubspec.yaml` declares `{declared}`, while `pubspec.lock` is already at `{locked}`. Click `⇄ {locked} (locked)` or press `Cmd+.` (`Ctrl+.`) to sync to `{synced}`.\n"
+        ));
     } else if eval.ignore_rules.from_file {
         md.push_str(
             "\n> Updates muted by `.zed/pubspec-ignore.json` — press `Cmd+.` (`Ctrl+.`) to unignore or edit rules.\n",
@@ -459,15 +539,23 @@ pub fn build_hosted_hover_markdown(
     }
 
     md.push_str("\n#### Changelog\n\n");
+    let changelog_from = if eval.lock_ahead_version.is_some() {
+        eval.declared_version
+            .as_ref()
+            .or(eval.baseline_version.as_ref())
+    } else {
+        eval.baseline_version.as_ref()
+    };
     let changelog_target = eval
         .latest_overall
         .as_ref()
+        .or(eval.lock_ahead_version.as_ref())
         .or(eval.raw_latest_overall.as_ref());
     match changelog_entries {
         Some(entries) if !entries.is_empty() => {
             let selected = select_relevant_entries(
                 entries,
-                eval.baseline_version.as_ref(),
+                changelog_from,
                 changelog_target,
                 config.max_changelog_versions,
             );
@@ -812,6 +900,10 @@ pub fn build_pubspec_code_lenses(
             "Checking pub.dev…".to_string()
         } else {
             let updates = evals.iter().filter(|e| e.has_update()).count();
+            let to_sync = evals
+                .iter()
+                .filter(|e| !e.has_update() && e.lock_ahead_version.is_some())
+                .count();
             let discontinued = evals
                 .iter()
                 .filter(|e| !e.ignore_rules.is_all_ignored() && e.info.is_discontinued)
@@ -821,12 +913,24 @@ pub fn build_pubspec_code_lenses(
                 .filter(|e| !e.ignore_rules.is_all_ignored())
                 .count();
             let update_word = if updates == 1 { "update" } else { "updates" };
-            if updates == 0 && discontinued == 0 {
+            if updates == 0 && to_sync == 0 && discontinued == 0 {
                 format!("Refresh ({checked} checked · up to date)")
-            } else if discontinued > 0 {
-                format!("Refresh ({updates} {update_word}, {discontinued} discontinued)")
             } else {
-                format!("Refresh ({updates} {update_word})")
+                let mut parts = Vec::new();
+                if updates > 0 {
+                    parts.push(format!("{updates} {update_word}"));
+                }
+                if to_sync > 0 {
+                    if updates == 0 && discontinued == 0 {
+                        parts.push(format!("{to_sync} to sync with lock"));
+                    } else {
+                        parts.push(format!("{to_sync} to sync"));
+                    }
+                }
+                if discontinued > 0 {
+                    parts.push(format!("{discontinued} discontinued"));
+                }
+                format!("Refresh ({})", parts.join(", "))
             }
         };
         lenses.push(CodeLens {
@@ -844,7 +948,12 @@ pub fn build_pubspec_code_lenses(
         lenses.push(make_pub_lens("get", CMD_PUB_GET));
     }
     if config.code_lens_pub_upgrade {
-        lenses.push(make_pub_lens("upgrade", CMD_PUB_UPGRADE));
+        let upgrade_sub = if config.pub_upgrade_tighten {
+            "upgrade --tighten"
+        } else {
+            "upgrade"
+        };
+        lenses.push(make_pub_lens(upgrade_sub, CMD_PUB_UPGRADE));
     }
     if config.code_lens_pub_outdated {
         lenses.push(make_pub_lens("outdated", CMD_PUB_OUTDATED));
@@ -882,6 +991,7 @@ pub fn build_pubspec_code_actions(
         cursor_handled_pkgs.push(eval.dep.name.clone());
 
         let mut offered_versions: Vec<String> = Vec::new();
+        let mut offered_texts: Vec<String> = Vec::new();
 
         if !eval.ignore_rules.is_all_ignored() {
             if let Some(compat) = &eval.latest_compatible
@@ -897,10 +1007,11 @@ pub fn build_pubspec_code_actions(
                     uri,
                     title,
                     eval.dep.version_range,
-                    new_text,
+                    new_text.clone(),
                     true,
                 ));
                 offered_versions.push(compat.to_string());
+                offered_texts.push(new_text);
             }
 
             if let Some(latest) = &eval.latest_overall
@@ -921,7 +1032,22 @@ pub fn build_pubspec_code_actions(
                     uri,
                     title,
                     eval.dep.version_range,
-                    new_text,
+                    new_text.clone(),
+                    is_preferred,
+                ));
+                offered_texts.push(new_text);
+            }
+
+            if let Some((_, synced_text)) = eval.sync_to_lock_edit()
+                && !offered_texts.contains(&synced_text)
+            {
+                let title = format!("Sync `{}` to {synced_text} (from pubspec.lock)", eval.dep.name);
+                let is_preferred = !eval.has_update() && offered_versions.is_empty();
+                actions.push(make_edit_action(
+                    uri,
+                    title,
+                    eval.dep.version_range,
+                    synced_text,
                     is_preferred,
                 ));
             }
@@ -997,7 +1123,37 @@ pub fn build_pubspec_code_actions(
         }
     }
 
-    // 2. Batch compatible upgrade action if 2+ packages have compatible updates.
+    // 2. Batch sync all drifted constraints to `pubspec.lock` when 2+ packages have lock ahead of YAML.
+    let batch_sync_edits: Vec<TextEdit> = evals
+        .iter()
+        .filter_map(|eval| {
+            let (_, synced_text) = eval.sync_to_lock_edit()?;
+            Some(TextEdit {
+                range: eval.dep.version_range,
+                new_text: synced_text,
+            })
+        })
+        .collect();
+
+    if batch_sync_edits.len() >= 2 {
+        let count = batch_sync_edits.len();
+        let mut changes = HashMap::new();
+        changes.insert(uri.clone(), batch_sync_edits);
+        actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+            title: format!(
+                "Flutter Debugger: Sync all dependencies to pubspec.lock ({count} packages)"
+            ),
+            kind: Some(CodeActionKind::QUICKFIX),
+            is_preferred: Some(false),
+            edit: Some(WorkspaceEdit {
+                changes: Some(changes),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+    }
+
+    // 3. Batch compatible upgrade action if 2+ packages have compatible updates.
     let batch_compat_edits: Vec<TextEdit> = evals
         .iter()
         .filter_map(|eval| {
@@ -1457,20 +1613,29 @@ mod tests {
         assert!(hover_54.contains("Latest on pub.dev**: `6.1.0` *(ignored by `>=6.0.0`)*"));
         assert!(hover_54.contains("Ignored Rules**: `>=6.0.0`"));
 
-        // Case 2: Once locked/declared at 5.9.0 with `>=6.0.0`, diagnostics are empty AND InlayHint is completely silent (None)!
+        // Case 2: Once declared & locked at 5.9.0 with `>=6.0.0`, diagnostics are empty AND InlayHint is completely silent (None)!
+        let parsed_59 = parse_pubspec(
+            "name: demo\nenvironment:\n  sdk: ^3.5.0\ndependencies:\n  dio: ^5.9.0\n",
+        );
+        let dio_dep_59 = parsed_59.dependencies[0].clone();
         let dio_eval_59 = DependencyEvaluation::evaluate(
-            dio_dep.clone(),
+            dio_dep_59,
             dio_info.clone(),
             Some("5.9.0".to_string()),
-            parsed.environment_sdk.as_ref(),
+            parsed_59.environment_sdk.as_ref(),
             &config,
             from_6.clone(),
         );
         assert!(!dio_eval_59.has_update());
         assert!(dio_eval_59.muted_newer_version);
         assert!(
-            build_pubspec_diagnostics(&parsed, std::slice::from_ref(&dio_eval_59), None, &config)
-                .is_empty()
+            build_pubspec_diagnostics(
+                &parsed_59,
+                std::slice::from_ref(&dio_eval_59),
+                None,
+                &config
+            )
+            .is_empty()
         );
         assert!(
             build_pubspec_inlay_hints(
@@ -1598,5 +1763,290 @@ mod tests {
         assert_eq!(items[0].preselect, Some(false));
         assert_eq!(items[2].label, "^5.9.0");
         assert_eq!(items[2].preselect, Some(true));
+    }
+
+    #[test]
+    fn handles_lockfile_ahead_drift_without_emojis_and_fixes_changelog_range() {
+        use crate::lsp::pubspec::ignore::IgnoreRule;
+
+        let yaml = concat!(
+            "name: demo\n",
+            "environment:\n",
+            "  sdk: ^3.5.0\n",
+            "dependencies:\n",
+            "  dio: ^5.4.0\n",
+            "  http: ^1.2.0\n",
+            "  intl: '>=0.18.0 <0.21.0'\n",
+        );
+        let parsed = parse_pubspec(yaml);
+        let config = PubspecConfig::default();
+
+        let dio_dep = parsed.dependencies[0].clone();
+        let http_dep = parsed.dependencies[1].clone();
+        let intl_dep = parsed.dependencies[2].clone();
+
+        let dio_info = sample_pkg(
+            "dio",
+            &[
+                ("5.9.0", false, Some("^3.0.0")),
+                ("5.7.0", false, Some("^3.0.0")),
+                ("5.4.0", false, Some("^3.0.0")),
+            ],
+        );
+        let http_info = sample_pkg(
+            "http",
+            &[
+                ("2.0.0", false, Some("^3.0.0")),
+                ("1.5.0", false, Some("^3.0.0")),
+                ("1.2.0", false, Some("^3.0.0")),
+            ],
+        );
+        let intl_info = sample_pkg(
+            "intl",
+            &[
+                ("0.20.0", false, Some("^3.0.0")),
+                ("0.18.0", false, Some("^3.0.0")),
+            ],
+        );
+
+        // dio: YAML ^5.4.0, lock 5.9.0 (already latest on pub.dev) -> pure lock drift
+        let dio_eval = DependencyEvaluation::evaluate(
+            dio_dep,
+            dio_info,
+            Some("5.9.0".to_string()),
+            parsed.environment_sdk.as_ref(),
+            &config,
+            PackageIgnoreRules::default(),
+        );
+        // http: YAML ^1.2.0, lock 1.5.0, pub.dev 2.0.0 -> lock drift + major update
+        let http_eval = DependencyEvaluation::evaluate(
+            http_dep,
+            http_info,
+            Some("1.5.0".to_string()),
+            parsed.environment_sdk.as_ref(),
+            &config,
+            PackageIgnoreRules::default(),
+        );
+        // intl: YAML '>=0.18.0 <0.21.0', lock 0.20.0 (latest) -> compound range tightening
+        let intl_eval = DependencyEvaluation::evaluate(
+            intl_dep,
+            intl_info,
+            Some("0.20.0".to_string()),
+            parsed.environment_sdk.as_ref(),
+            &config,
+            PackageIgnoreRules::default(),
+        );
+
+        let evals = vec![dio_eval.clone(), http_eval.clone(), intl_eval.clone()];
+
+        // 1. Diagnostics: dio & intl emit INFO `lock-drift`, http emits WARNING `outdated-major` mentioning YAML constraint
+        let diags = build_pubspec_diagnostics(&parsed, &evals, None, &config);
+        assert_eq!(diags.len(), 3);
+        let dio_diag = diags
+            .iter()
+            .find(|d| d.range.start.line == 4)
+            .expect("dio diag");
+        assert_eq!(
+            dio_diag.code,
+            Some(NumberOrString::String("lock-drift".to_string()))
+        );
+        assert_eq!(dio_diag.severity, Some(DiagnosticSeverity::INFORMATION));
+        assert!(dio_diag.message.contains("Locked at 5.9.0"));
+        assert!(dio_diag.message.contains("^5.9.0"));
+
+        let http_diag = diags
+            .iter()
+            .find(|d| d.range.start.line == 5)
+            .expect("http diag");
+        assert_eq!(
+            http_diag.code,
+            Some(NumberOrString::String("outdated-major".to_string()))
+        );
+        assert!(http_diag.message.contains("pubspec.yaml declares ^1.2.0"));
+
+        // 2. Inlay hints: crisp monochrome labels, ZERO emoji characters, clickable sync edit
+        let hints = build_pubspec_inlay_hints(
+            &evals,
+            Range::new(Position::new(0, 0), Position::new(10, 0)),
+            &config,
+        );
+        assert_eq!(hints.len(), 3);
+        let hint_labels: Vec<String> = hints
+            .iter()
+            .map(|h| match &h.label {
+                InlayHintLabel::String(s) => s.clone(),
+                InlayHintLabel::LabelParts(_) => String::new(),
+            })
+            .collect();
+        assert_eq!(hint_labels[0], "⇄ 5.9.0 (locked)");
+        assert_eq!(hint_labels[1], "locked 1.5.0 · ⬆ 2.0.0 (major)");
+        assert_eq!(hint_labels[2], "⇄ 0.20.0 (locked)");
+        // Ensure no color emojis (e.g. U+1F300..U+1FAFF) ever sneak into hint labels
+        assert!(
+            hint_labels
+                .iter()
+                .all(|s| !s.chars().any(|c| ('\u{1F300}'..='\u{1FAFF}').contains(&c)))
+        );
+        assert_eq!(
+            hints[0].text_edits.as_ref().expect("dio edit")[0].new_text,
+            "^5.9.0"
+        );
+        assert_eq!(
+            hints[2].text_edits.as_ref().expect("intl edit")[0].new_text,
+            "'>=0.20.0 <0.21.0'"
+        );
+
+        // 3. CodeActions on dio line: preferred single sync + batch sync for all 3 drifted packages
+        let uri: Uri = "file:///tmp/demo/pubspec.yaml".parse().expect("uri");
+        let empty_ignore = PubspecIgnoreConfig::default();
+        let dio_actions = build_pubspec_code_actions(
+            &uri,
+            &parsed,
+            &evals,
+            &empty_ignore,
+            Range::new(Position::new(4, 2), Position::new(4, 6)),
+        );
+        let sync_dio = dio_actions.iter().find_map(|a| match a {
+            CodeActionOrCommand::CodeAction(ca)
+                if ca.title == "Sync `dio` to ^5.9.0 (from pubspec.lock)" =>
+            {
+                Some(ca)
+            }
+            _ => None,
+        });
+        assert_eq!(sync_dio.expect("sync dio").is_preferred, Some(true));
+        assert!(dio_actions.iter().any(|a| match a {
+            CodeActionOrCommand::CodeAction(ca) => {
+                ca.title == "Flutter Debugger: Sync all dependencies to pubspec.lock (3 packages)"
+            }
+            _ => false,
+        }));
+
+        // On http line: offers BOTH major upgrade to ^2.0.0 AND sync to ^1.5.0
+        let http_actions = build_pubspec_code_actions(
+            &uri,
+            &parsed,
+            &evals,
+            &empty_ignore,
+            Range::new(Position::new(5, 2), Position::new(5, 6)),
+        );
+        assert!(http_actions.iter().any(|a| match a {
+            CodeActionOrCommand::CodeAction(ca) => ca.title.contains("Upgrade `http` to ^2.0.0"),
+            _ => false,
+        }));
+        assert!(http_actions.iter().any(|a| match a {
+            CodeActionOrCommand::CodeAction(ca) => {
+                ca.title == "Sync `http` to ^1.5.0 (from pubspec.lock)"
+            }
+            _ => false,
+        }));
+
+        // 4. Hover Changelog uses `declared_version` (5.4.0) -> `5.9.0`, showing ALL intermediate releases
+        let changelog = vec![
+            ChangelogEntry {
+                version: "5.9.0".to_string(),
+                heading: "5.9.0".to_string(),
+                body_markdown: "- Added HTTP/3 support".to_string(),
+            },
+            ChangelogEntry {
+                version: "5.7.0".to_string(),
+                heading: "5.7.0".to_string(),
+                body_markdown: "- Improved cancellation tokens".to_string(),
+            },
+            ChangelogEntry {
+                version: "5.4.0".to_string(),
+                heading: "5.4.0".to_string(),
+                body_markdown: "- Baseline release".to_string(),
+            },
+        ];
+        let hover_md = build_hosted_hover_markdown(&dio_eval, Some(&changelog), &config);
+        assert!(hover_md.contains("Out of sync with `pubspec.lock`"));
+        assert!(hover_md.contains("Added HTTP/3 support"));
+        assert!(hover_md.contains("Improved cancellation tokens"));
+        assert!(!hover_md.contains("Baseline release"));
+
+        // 5. CodeLens reports updates + to sync count, and reflects `pub_upgrade_tighten`
+        let lenses = build_pubspec_code_lenses(
+            &uri,
+            &parsed,
+            ProjectKind::Flutter,
+            &evals,
+            false,
+            None,
+            &config,
+        );
+        assert_eq!(
+            lenses[0].command.as_ref().expect("c").title,
+            "Refresh (1 update, 2 to sync)"
+        );
+        assert_eq!(
+            lenses[2].command.as_ref().expect("c").title,
+            "flutter pub upgrade"
+        );
+
+        let mut tighten_cfg = config.clone();
+        tighten_cfg.pub_upgrade_tighten = true;
+        let lenses_tighten = build_pubspec_code_lenses(
+            &uri,
+            &parsed,
+            ProjectKind::Flutter,
+            std::slice::from_ref(&dio_eval),
+            false,
+            None,
+            &tighten_cfg,
+        );
+        assert_eq!(
+            lenses_tighten[0].command.as_ref().expect("c").title,
+            "Refresh (1 to sync with lock)"
+        );
+        assert_eq!(
+            lenses_tighten[2].command.as_ref().expect("c").title,
+            "flutter pub upgrade --tighten"
+        );
+
+        // 6. When `>=2.0.0` ignores http's major update while lock 1.5.0 > YAML ^1.2.0,
+        // lock-drift sync still surfaces until synced; once synced to ^1.5.0, line goes completely silent.
+        let mut ignore_2 = PackageIgnoreRules {
+            rules: Vec::new(),
+            from_file: true,
+            from_settings: false,
+        };
+        ignore_2.insert_normalized(IgnoreRule::parse(">=2.0.0").unwrap());
+        let http_drifted_muted = DependencyEvaluation::evaluate(
+            parsed.dependencies[1].clone(),
+            sample_pkg("http", &[("2.0.0", false, Some("^3.0.0")), ("1.5.0", false, Some("^3.0.0"))]),
+            Some("1.5.0".to_string()),
+            parsed.environment_sdk.as_ref(),
+            &config,
+            ignore_2.clone(),
+        );
+        assert_eq!(
+            build_pubspec_inlay_hints(
+                std::slice::from_ref(&http_drifted_muted),
+                Range::new(Position::new(0, 0), Position::new(10, 0)),
+                &config,
+            )
+            .len(),
+            1
+        );
+
+        let synced_yaml = "name: demo\ndependencies:\n  http: ^1.5.0\n";
+        let synced_parsed = parse_pubspec(synced_yaml);
+        let http_synced_muted = DependencyEvaluation::evaluate(
+            synced_parsed.dependencies[0].clone(),
+            sample_pkg("http", &[("2.0.0", false, Some("^3.0.0")), ("1.5.0", false, Some("^3.0.0"))]),
+            Some("1.5.0".to_string()),
+            None,
+            &config,
+            ignore_2,
+        );
+        assert!(
+            build_pubspec_inlay_hints(
+                std::slice::from_ref(&http_synced_muted),
+                Range::new(Position::new(0, 0), Position::new(10, 0)),
+                &config,
+            )
+            .is_empty()
+        );
     }
 }

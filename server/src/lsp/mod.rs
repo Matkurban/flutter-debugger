@@ -702,7 +702,9 @@ impl FlutterLspBackend {
 
         let is_pub_cmd = matches!(
             cmd,
-            AllowedCommand::PubGet | AllowedCommand::PubUpgrade | AllowedCommand::PubOutdated
+            AllowedCommand::PubGet
+                | AllowedCommand::PubUpgrade { .. }
+                | AllowedCommand::PubOutdated
         );
         let title = format!("{} {}", project.kind.cli_name(), cmd.display_name());
 
@@ -756,7 +758,10 @@ impl FlutterLspBackend {
 
                 if output.success() {
                     progress.end(Some("Completed".to_string())).await;
-                    if matches!(cmd, AllowedCommand::PubGet | AllowedCommand::PubUpgrade) {
+                    if matches!(
+                        cmd,
+                        AllowedCommand::PubGet | AllowedCommand::PubUpgrade { .. }
+                    ) {
                         self.reanalyze_open_pubspecs_in_dir(&project.root).await;
                     }
                     if cmd.always_open_log()
@@ -2158,7 +2163,8 @@ impl LanguageServer for FlutterLspBackend {
                     .await;
             }
             "flutterDebugger.pubUpgrade" => {
-                self.execute_project_cli(&uri, AllowedCommand::PubUpgrade, false)
+                let tighten = self.config.read().await.pubspec.pub_upgrade_tighten;
+                self.execute_project_cli(&uri, AllowedCommand::PubUpgrade { tighten }, false)
                     .await;
             }
             "flutterDebugger.pubOutdated" => {

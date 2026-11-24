@@ -55,9 +55,11 @@ pub struct PubspecConfig {
     pub check_dev_dependencies: bool,
     pub check_dependency_overrides: bool,
     pub auto_pub_get_on_save: bool,
+    pub pub_upgrade_tighten: bool,
     pub max_changelog_versions: usize,
     pub major_severity: SeverityLevel,
     pub minor_patch_severity: SeverityLevel,
+    pub lock_drift_severity: SeverityLevel,
     pub ignore_packages: Vec<String>,
 }
 
@@ -81,9 +83,11 @@ impl Default for PubspecConfig {
             check_dev_dependencies: true,
             check_dependency_overrides: true,
             auto_pub_get_on_save: true,
+            pub_upgrade_tighten: false,
             max_changelog_versions: 3,
             major_severity: SeverityLevel::Warning,
             minor_patch_severity: SeverityLevel::Info,
+            lock_drift_severity: SeverityLevel::Info,
             ignore_packages: Vec::new(),
         }
     }
@@ -183,6 +187,10 @@ impl PubspecConfig {
             self.auto_pub_get_on_save = v;
             changed = true;
         }
+        if let Some(v) = patch.pub_upgrade_tighten {
+            self.pub_upgrade_tighten = v;
+            changed = true;
+        }
         if let Some(v) = patch.max_changelog_versions {
             self.max_changelog_versions = v;
             changed = true;
@@ -193,6 +201,10 @@ impl PubspecConfig {
         }
         if let Some(v) = patch.minor_patch_severity {
             self.minor_patch_severity = v;
+            changed = true;
+        }
+        if let Some(v) = patch.lock_drift_severity {
+            self.lock_drift_severity = v;
             changed = true;
         }
         if let Some(v) = patch.ignore_packages {
@@ -223,9 +235,11 @@ pub struct PubspecConfigPatch {
     pub check_dev_dependencies: Option<bool>,
     pub check_dependency_overrides: Option<bool>,
     pub auto_pub_get_on_save: Option<bool>,
+    pub pub_upgrade_tighten: Option<bool>,
     pub max_changelog_versions: Option<usize>,
     pub major_severity: Option<SeverityLevel>,
     pub minor_patch_severity: Option<SeverityLevel>,
+    pub lock_drift_severity: Option<SeverityLevel>,
     pub ignore_packages: Option<Vec<String>>,
 }
 
@@ -445,20 +459,26 @@ mod tests {
         assert!(cfg.pubspec.show_up_to_date_hints);
         assert_eq!(cfg.pubspec.major_severity, SeverityLevel::Warning);
         assert_eq!(cfg.pubspec.minor_patch_severity, SeverityLevel::Info);
+        assert_eq!(cfg.pubspec.lock_drift_severity, SeverityLevel::Info);
+        assert!(!cfg.pubspec.pub_upgrade_tighten);
 
         assert!(cfg.apply_json_patch(&json!({
             "closingLabels": false,
             "closingLabelsMinLines": 4,
             "pubspec": {
                 "autoPubGetOnSave": false,
+                "pubUpgradeTighten": true,
                 "majorSeverity": "error",
+                "lockDriftSeverity": "hint",
                 "ignorePackages": ["legacy_pkg"]
             }
         })));
         assert!(!cfg.closing_labels);
         assert_eq!(cfg.closing_labels_min_lines, 4);
         assert!(!cfg.pubspec.auto_pub_get_on_save);
+        assert!(cfg.pubspec.pub_upgrade_tighten);
         assert_eq!(cfg.pubspec.major_severity, SeverityLevel::Error);
+        assert_eq!(cfg.pubspec.lock_drift_severity, SeverityLevel::Hint);
         assert_eq!(cfg.pubspec.ignore_packages, vec!["legacy_pkg".to_string()]);
         // Unmentioned sibling fields inside `pubspec` must remain untouched
         assert!(cfg.pubspec.enabled);

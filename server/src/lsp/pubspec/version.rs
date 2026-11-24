@@ -301,6 +301,54 @@ pub fn format_upgraded_constraint(original_raw: Option<&str>, new_version: &Vers
     }
 }
 
+/// Tightens a dependency constraint's lower bound to match `locked_version` (analogous to
+/// `dart pub upgrade --tighten`). For compound range constraints such as `>=5.4.0 <7.0.0`,
+/// only the lower bound is raised while preserving the upper bound and quotes; for caret/exact
+/// constraints, delegates to [`format_upgraded_constraint`].
+#[must_use]
+pub fn format_tightened_constraint(original_raw: Option<&str>, locked_version: &Version) -> String {
+    let Some(raw) = original_raw else {
+        return format!("^{locked_version}");
+    };
+    let trimmed = raw.trim();
+    let quote = if trimmed.starts_with('\'') && trimmed.ends_with('\'') && trimmed.len() >= 2 {
+        Some('\'')
+    } else if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2 {
+        Some('"')
+    } else {
+        None
+    };
+
+    let inner = strip_quotes(trimmed).trim();
+    let tokens = tokenize_constraint(inner);
+    let has_lower = tokens
+        .iter()
+        .any(|t| t.starts_with(">=") || t.starts_with('>'));
+    let has_upper = tokens
+        .iter()
+        .any(|t| t.starts_with("<=") || t.starts_with('<'));
+
+    if has_lower && has_upper {
+        let updated: Vec<String> = tokens
+            .into_iter()
+            .map(|t| {
+                if t.starts_with(">=") || t.starts_with('>') {
+                    format!(">={locked_version}")
+                } else {
+                    t
+                }
+            })
+            .collect();
+        let joined = updated.join(" ");
+        return match quote {
+            Some(q) => format!("{q}{joined}{q}"),
+            None => joined,
+        };
+    }
+
+    format_upgraded_constraint(original_raw, locked_version)
+}
+
 /// Checks whether a candidate package version's `environment.sdk` constraint is compatible
 /// with the current project's `environment.sdk` constraint.
 #[must_use]
@@ -438,5 +486,20 @@ mod tests {
         assert!(is_sdk_compatible(Some(&project_sdk), Some("^3.2.0")));
         assert!(!is_sdk_compatible(Some(&project_sdk), Some("^3.8.0")));
         assert!(!is_sdk_compatible(Some(&project_sdk), Some(">=2.12.0 <3.0.0")));
+
+        let v59 = parse_dart_version("5.9.0").expect("v");
+        assert_eq!(format_tightened_constraint(Some("^5.4.0"), &v59), "^5.9.0");
+        assert_eq!(
+            format_tightened_constraint(Some("'^5.4.0'"), &v59),
+            "'^5.9.0'"
+        );
+        assert_eq!(
+            format_tightened_constraint(Some(">=5.4.0 <7.0.0"), &v59),
+            ">=5.9.0 <7.0.0"
+        );
+        assert_eq!(
+            format_tightened_constraint(Some("\">= 5.4.0 < 6.0.0\""), &v59),
+            "\">=5.9.0 <6.0.0\""
+        );
     }
 }

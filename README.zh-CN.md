@@ -9,7 +9,7 @@
 ## 核心特性
 
 - **内置 `pubspec.yaml` 依赖与资源智能管理（默认开启）**：
-  - **可点击内联版本提示（`inlayHint`）**：行尾显示 `✓ latest`、`⬆ 5.9.0`、`⬆ 6.0.0 (major)`、`⬆ 6.0.0 (major, SDK)`、`⚠ retracted → ...` 与 `⚠ discontinued`，点击过期提示即可直接就地升级版本号。
+  - **可点击内联版本提示（`inlayHint`）**：行尾显示 `✓ latest`、`⇄ 5.9.0 (locked)`（点击同步 `pubspec.yaml` 约束至 `pubspec.lock`）、`locked 5.9.0 · ⬆ 6.0.0 (major)`、`⬆ 5.9.0`、`⬆ 6.0.0 (major)`、`⬆ 6.0.0 (major, SDK)`、`⚠ retracted → ...` 与 `⚠ discontinued`，点击过期或锁漂移提示即可直接就地更新版本号。
   - **富文本悬停卡片（`textDocument/hover`）**：展示包描述、Pub Points / 点赞数 / 30 天下载量、声明版本 vs `pubspec.lock` 锁定版本 vs 最新兼容/总体版本、Dart SDK 兼容性提示以及懒加载缓存的 `pub.dev` 更新日志（Changelog）；同时支持离线悬停查看本地 `path:` / `sdk:` / `git:` 依赖与 `flutter.assets` / `flutter.fonts` 磁盘状态。
   - **依赖版本自动补全（`textDocument/completion`）**：在 `pubspec.yaml` / `pubspec_overrides.yaml` 中输入 `:` 或 `^` 即触发版本补全，自动保留原有引号与 `^` 前缀，并标注 `latest`、`locked`、发布日期与 SDK 兼容性。
   - **统一诊断、一键升级与细粒度忽略（`Cmd+.`）**：将大版本/小版本/补丁/预发布/撤回/已停维护（含 `DEPRECATED` 删除线）以及缺失资源/字体诊断原子合并发布；支持单包与批量升级，以及一键忽略规则写入 `<workspace>/.zed/pubspec-ignore.json`（不污染 `pubspec.yaml`）：支持忽略单版本（`=X.Y.Z`）、忽略某版本及之后所有版本（`>=X.Y.Z`）或彻底忽略该包（`*`）。
@@ -151,7 +151,7 @@
 
 ### `pubspec.yaml` 与 `pubspec_overrides.yaml` 智能管理
 - **完整的 Pub V2 仓库与镜像支持**：遵循 Hosted Pub Repository Specification V2（`Accept: application/vnd.pub.v2+json`）与 `/score` 接口，按 `pubspec.pubHostedUrl` → `PUB_HOSTED_URL` → `https://pub.dev` 优先级解析，兼容单包自定义 `hosted:` 源、HTTP/2 + gzip + 系统代理，以及原子双层缓存（`<cache>/pub_packages` 与 `pub_changelogs`）。
-- **精准的 Dart SemVer 与 Lockfile 解析**：完整支持 `^`、区间（`>=1.0.0 <2.0.0`）、精确版本、`any` 与空约束；自动读取同级 `pubspec.lock` 并通过 `workspace/didChangeWatchedFiles` 实时同步；编辑升级至最新版时立即消除过期下划线；支持撤回（retracted）、停维护（discontinued）与 Dart `environment.sdk` 兼容性校验。
+- **精准的 Dart SemVer 与 Lockfile 同步检测**：完整支持 `^`、区间（`>=1.0.0 <2.0.0`）、精确版本、`any` 与空约束；自动读取同级 `pubspec.lock` 并通过 `workspace/didChangeWatchedFiles` 实时同步；当 `flutter pub upgrade` 更新了 `pubspec.lock` 但 `pubspec.yaml` 约束滞后时，自动发射 `lock-drift`（默认 `info`）诊断、行尾显示可点击 `⇄ x.y.z (locked)`、`Cmd+.` 提供单包/批量同步至 `pubspec.lock`，且 Hover 自动按「声明版本 → 锁定/最新版本」展示完整更新日志；同时支持撤回（retracted）、停维护（discontinued）与 Dart `environment.sdk` 兼容性校验。
 - **交互式升级与版本补全**：点击任意 `⬆` 内联提示、使用 `Cmd+.` Code Actions（单包兼容/大版本升级、批量升级兼容依赖、批量升级全部至最新版），或在 `:` / `^` 后触发版本自动补全。
 - **细粒度版本忽略（`.zed/pubspec-ignore.json`）**：支持忽略单个版本（`=5.9.0`，后续发布新版自动重新提示）、忽略某版本及之后所有版本（`>=6.0.0`，若存在更低兼容更新如 `5.9.0` 仍照常提示，并保留 `discontinued`/`retracted` 警告），或彻底忽略该包全部更新（`*`，连同 `discontinued`/`retracted` 一并静音且不发起网络请求）。规则保存在工作区根目录 `.zed/pubspec-ignore.json`（不修改 `pubspec.yaml`，Monorepo 所有子包共享并自动合并子包规则及 `settings.json` `pubspec.ignorePackages`），支持文件变更实时生效；被静音的依赖行尾完全隐藏 Inlay Hint，可通过 Hover 查看规则与真实最新版，或按 `Cmd+.` 一键取消忽略 / 打开配置文件。
 - **保存自动 `pub get`**：对每个打开的 `pubspec.yaml` 维护依赖与 SDK 约束指纹，修改注释/描述/资源路径不会误触发，仅在依赖或 SDK 约束真正变更并保存时通过项目 FVM / SDK 自动运行 `<flutter|dart> pub get`。
@@ -217,9 +217,11 @@
 | `checkDevDependencies` | `bool` | `true` | 检查 `dev_dependencies` |
 | `checkDependencyOverrides` | `bool` | `true` | 检查 `dependency_overrides` |
 | `autoPubGetOnSave` | `bool` | `true` | 保存时若依赖或 SDK 约束发生变更，自动运行 `<flutter\|dart> pub get` |
+| `pubUpgradeTighten` | `bool` | `false` | 点击顶部 `pub upgrade` CodeLens 时是否附加 `--tighten` 自动收紧 `pubspec.yaml` 下界 |
 | `maxChangelogVersions` | `number` | `3` | Hover 卡片中最多展示的 Changelog 版本条目数 |
 | `majorSeverity` | `"error" \| "warning" \| "info" \| "hint" \| "off"` | `"warning"` | 大版本更新诊断级别 |
 | `minorPatchSeverity` | `"error" \| "warning" \| "info" \| "hint" \| "off"` | `"info"` | 小版本 / 补丁 / 预发布更新诊断级别 |
+| `lockDriftSeverity` | `"error" \| "warning" \| "info" \| "hint" \| "off"` | `"info"` | `pubspec.lock` 领先于 `pubspec.yaml` 声明下界时的诊断级别 |
 | `ignorePackages` | `string[]` | `[]` | 跳过版本检查与诊断的包名列表 |
 
 ### DAP `.zed/debug.json` 配置项（`adapter: "Flutter"`）
@@ -266,7 +268,7 @@ flutter-debugger-server ctl launch-emulator [emulator_id]
 # 运行与工程工作流
 flutter-debugger-server ctl run [--mode debug|profile|release] [--target lib/main.dart] [--device <id>] [--flavor <f>] [--dart-define-from-file <file>]
 flutter-debugger-server ctl build-runner <build|watch>
-flutter-debugger-server ctl pub-get | pub-upgrade | pub-outdated | clean | doctor | create
+flutter-debugger-server ctl pub-get | pub-upgrade [--tighten] | pub-outdated | clean | doctor | create
 flutter-debugger-server init-zed
 flutter-debugger-server ctl print-zed-config
 ```

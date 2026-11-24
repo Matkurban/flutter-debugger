@@ -63,7 +63,13 @@ pub async fn run_ctl(args: Vec<String>) -> Result<(), String> {
         "run" => cmd_run(rest).await,
         "build-runner" | "br" => cmd_build_runner(rest).await,
         "pub-get" => cmd_passthrough_flutter(rest, &["pub", "get"]).await,
-        "pub-upgrade" => cmd_passthrough_flutter(rest, &["pub", "upgrade"]).await,
+        "pub-upgrade" => {
+            if rest.iter().any(|a| a == "--tighten") {
+                cmd_passthrough_flutter(rest, &["pub", "upgrade", "--tighten"]).await
+            } else {
+                cmd_passthrough_flutter(rest, &["pub", "upgrade"]).await
+            }
+        }
         "pub-outdated" => cmd_passthrough_flutter(rest, &["pub", "outdated"]).await,
         "clean" => cmd_passthrough_flutter(rest, &["clean"]).await,
         "doctor" => cmd_passthrough_flutter(rest, &["doctor", "-v"]).await,
@@ -107,7 +113,7 @@ Devices & Emulators:
 Run & Workflow:
   run [--mode debug|profile|release] [--target lib/main.dart] [--device <id>] [--flavor <f>] [--dart-define-from-file <file>]
   build-runner <build|watch>             Run dart build_runner with --delete-conflicting-outputs
-  pub-get | pub-upgrade | pub-outdated | clean | doctor
+  pub-get | pub-upgrade [--tighten] | pub-outdated | clean | doctor
                                          Run standard Flutter/Dart CLI commands
   create                                 Interactive `flutter create` prompt
   print-zed-config                       Print recommended Zed settings.json & keymap.json"
@@ -1623,7 +1629,8 @@ pub fn print_recommended_zed_config() {
           "showUpToDateHints": true,
           "codeLens": true,
           "majorSeverity": "warning",
-          "minorPatchSeverity": "info"
+          "minorPatchSeverity": "info",
+          "lockDriftSeverity": "info"
         }}
       }}
     }}

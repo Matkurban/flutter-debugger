@@ -9,7 +9,7 @@ A full-featured Flutter & Dart development, `pubspec.yaml` dependency intelligen
 ## Highlights
 
 - **Built-In `pubspec.yaml` Dependency & Asset Intelligence (Enabled by Default)**:
-  - **Clickable Inline Version Hints (`inlayHint`)**: `✓ latest`, `⬆ 5.9.0`, `⬆ 6.0.0 (major)`, `⬆ 6.0.0 (major, SDK)`, `⚠ retracted → ...`, and `⚠ discontinued` — click an outdated hint to upgrade directly in place.
+  - **Clickable Inline Version Hints (`inlayHint`)**: `✓ latest`, `⇄ 5.9.0 (locked)` (click to sync `pubspec.yaml` with `pubspec.lock`), `locked 5.9.0 · ⬆ 6.0.0 (major)`, `⬆ 5.9.0`, `⬆ 6.0.0 (major)`, `⬆ 6.0.0 (major, SDK)`, `⚠ retracted → ...`, and `⚠ discontinued` — click an outdated or lock-drifted hint to update directly in place.
   - **Rich Hover (`textDocument/hover`)**: Package description, Pub Points / Likes / 30-day downloads, declared vs `pubspec.lock` vs latest compatible/overall versions, SDK compatibility notes, and lazily cached `pub.dev` changelogs; plus offline Hover cards for local `path:`, `sdk:`, `git:` dependencies, and `flutter.assets` / `flutter.fonts`.
   - **Version Autocompletion (`textDocument/completion`)**: Triggered on `^` or `:` inside `pubspec.yaml` / `pubspec_overrides.yaml`, honoring existing quotes, caret prefix, locked status, and Dart SDK compatibility.
   - **Unified Diagnostics, Quick Fixes & Fine-Grained Ignore (`Cmd+.`)**: Major/minor/patch/prerelease/retracted/discontinued (`DEPRECATED` strikethrough) & missing asset/font diagnostics published atomically; single-package compatible/major upgrades, batch upgrades, plus one-click ignore rules persisted in `<workspace>/.zed/pubspec-ignore.json` without touching `pubspec.yaml` (`=X.Y.Z` single version, `>=X.Y.Z` this & all newer versions, or `*` entire package).
@@ -151,7 +151,7 @@ Run `flutter-debugger-server ctl print-zed-config` anytime to print these snippe
 
 ### `pubspec.yaml` & `pubspec_overrides.yaml` Intelligence
 - **Full Pub V2 Registry & Mirror Support**: Uses Hosted Pub Repository Specification V2 (`Accept: application/vnd.pub.v2+json`) plus `/score`, respects `pubspec.pubHostedUrl` → `PUB_HOSTED_URL` → `https://pub.dev`, supports per-dependency `hosted:` URLs, HTTP/2 + gzip + system proxy, and atomic two-tier caching (`<cache>/pub_packages` & `pub_changelogs`).
-- **Accurate Dart SemVer & Lockfile Evaluation**: Understands caret (`^`), range (`>=1.0.0 <2.0.0`), exact, `any`, and empty constraints; reads sibling `pubspec.lock` (with live `workspace/didChangeWatchedFiles` sync), clears stale underlines immediately when editing to latest, checks retracted/discontinued packages, and verifies Dart `environment.sdk` compatibility.
+- **Accurate Dart SemVer & Lockfile Sync**: Understands caret (`^`), range (`>=1.0.0 <2.0.0`), exact, `any`, and empty constraints; reads sibling `pubspec.lock` (with live `workspace/didChangeWatchedFiles` sync), detects when `pubspec.lock` is ahead of `pubspec.yaml` (e.g. after `flutter pub upgrade`) with `lock-drift` info diagnostics, clickable `⇄ x.y.z (locked)` inlay hints, single & batch `Cmd+.` sync actions, and `declared → locked` Hover changelogs; checks retracted/discontinued packages and Dart `environment.sdk` compatibility.
 - **Interactive Upgrades & Version Completion**: Click any `⬆` inlay hint, trigger `Cmd+.` Quick Fixes (single compatible/major upgrade, batch compatible upgrade, or batch upgrade-all including major), or invoke autocomplete after `:` / `^` to pick from published versions.
 - **Fine-Grained Version Ignore (`.zed/pubspec-ignore.json`)**: Mute a single version (`=5.9.0`, re-prompts on newer releases), mute a version and all newer versions (`>=6.0.0`, still surfaces lower compatible updates like `5.9.0` while keeping `discontinued`/`retracted` alerts), or mute all updates for a package (`*`, silences everything including `discontinued`/`retracted` with zero network requests). Rules are stored cleanly in `<workspace>/.zed/pubspec-ignore.json` (shared across Monorepo packages, automatically merged with any subpackage `.zed/pubspec-ignore.json` and `settings.json` `pubspec.ignorePackages`), watched live for edits, hide inline hints when muted, and remain inspectable/recoverable via Hover and `Cmd+.` (`Unignore` / `Open .zed/pubspec-ignore.json`).
 - **Auto `pub get` on Save**: Tracks a dependency & SDK constraint fingerprint per open `pubspec.yaml` — saving comment, description, or asset edits never triggers unnecessary `pub get`, while adding/changing a dependency runs `<flutter|dart> pub get` automatically using your project's FVM / SDK.
@@ -217,9 +217,11 @@ Launch via `main()` CodeLens, `flutter-debugger-server ctl devtools-ui`, or dire
 | `checkDevDependencies` | `bool` | `true` | Check `dev_dependencies` |
 | `checkDependencyOverrides` | `bool` | `true` | Check `dependency_overrides` |
 | `autoPubGetOnSave` | `bool` | `true` | Automatically run `<flutter\|dart> pub get` on save when dependencies or SDK constraints changed |
+| `pubUpgradeTighten` | `bool` | `false` | Pass `--tighten` when running `<flutter\|dart> pub upgrade` from CodeLens |
 | `maxChangelogVersions` | `number` | `3` | Maximum changelog release entries rendered in Hover |
 | `majorSeverity` | `"error" \| "warning" \| "info" \| "hint" \| "off"` | `"warning"` | Diagnostic severity for major version updates |
 | `minorPatchSeverity` | `"error" \| "warning" \| "info" \| "hint" \| "off"` | `"info"` | Diagnostic severity for minor/patch/prerelease updates |
+| `lockDriftSeverity` | `"error" \| "warning" \| "info" \| "hint" \| "off"` | `"info"` | Diagnostic severity when `pubspec.lock` is ahead of `pubspec.yaml` lower bound |
 | `ignorePackages` | `string[]` | `[]` | Package names excluded from registry checks & diagnostics |
 
 ### DAP `.zed/debug.json` Options (`adapter: "Flutter"`)
@@ -266,7 +268,7 @@ flutter-debugger-server ctl launch-emulator [emulator_id]
 # Run & Project Workflow
 flutter-debugger-server ctl run [--mode debug|profile|release] [--target lib/main.dart] [--device <id>] [--flavor <f>] [--dart-define-from-file <file>]
 flutter-debugger-server ctl build-runner <build|watch>
-flutter-debugger-server ctl pub-get | pub-upgrade | pub-outdated | clean | doctor | create
+flutter-debugger-server ctl pub-get | pub-upgrade [--tighten] | pub-outdated | clean | doctor | create
 flutter-debugger-server init-zed
 flutter-debugger-server ctl print-zed-config
 ```

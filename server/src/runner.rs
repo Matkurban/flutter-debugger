@@ -13,7 +13,9 @@ use crate::project::{ProjectInfo, resolve_sdk_executable};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AllowedCommand {
     PubGet,
-    PubUpgrade,
+    PubUpgrade {
+        tighten: bool,
+    },
     PubOutdated,
     Clean,
     Doctor,
@@ -27,7 +29,8 @@ impl AllowedCommand {
     pub fn display_name(&self) -> &'static str {
         match self {
             Self::PubGet => "pub get",
-            Self::PubUpgrade => "pub upgrade",
+            Self::PubUpgrade { tighten: true } => "pub upgrade --tighten",
+            Self::PubUpgrade { tighten: false } => "pub upgrade",
             Self::PubOutdated => "pub outdated",
             Self::Clean => "flutter clean",
             Self::Doctor => "flutter doctor",
@@ -42,7 +45,10 @@ impl AllowedCommand {
     pub fn build_args(&self) -> Vec<String> {
         match self {
             Self::PubGet => vec!["pub".into(), "get".into()],
-            Self::PubUpgrade => vec!["pub".into(), "upgrade".into()],
+            Self::PubUpgrade { tighten: true } => {
+                vec!["pub".into(), "upgrade".into(), "--tighten".into()]
+            }
+            Self::PubUpgrade { tighten: false } => vec!["pub".into(), "upgrade".into()],
             Self::PubOutdated => vec!["pub".into(), "outdated".into()],
             Self::Clean => vec!["clean".into()],
             Self::Doctor => vec!["doctor".into(), "-v".into()],
