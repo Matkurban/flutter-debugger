@@ -13,8 +13,10 @@ path = "src/main.rs"
 dashmap = "6.2"
 dirs = "6.0"
 flutter-debugger-protocol = { path = "../crates/protocol" }
+futures-util = "0.3"
 regex = "1.11"
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2", "json", "gzip", "system-proxy"] }
+semver = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"

@@ -6,34 +6,34 @@ pub mod pubspec;
 pub mod state;
 pub mod test_runner;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use dashmap::DashMap;
-use serde::Deserialize;
+use dashmap::{DashMap, DashSet};
+use futures_util::stream::{self, StreamExt};
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, Semaphore};
 use tower_lsp_server::jsonrpc::Result as RpcResult;
 use tower_lsp_server::ls_types::{
-    CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams,
+    CodeAction, CodeActionKind, CodeActionOptions, CodeActionOrCommand, CodeActionParams,
     CodeActionProviderCapability, CodeActionResponse, CodeLens, CodeLensOptions, CodeLensParams,
     ColorInformation, ColorPresentation, ColorPresentationParams, ColorProviderCapability, Command,
-    DidChangeConfigurationParams, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
+    CompletionOptions, CompletionParams, CompletionResponse, DidChangeConfigurationParams,
+    DidChangeTextDocumentParams, DidChangeWatchedFilesParams, DidCloseTextDocumentParams,
     DidOpenTextDocumentParams, DidSaveTextDocumentParams, DocumentColorParams, DocumentLink,
-    DocumentLinkOptions, DocumentLinkParams, ExecuteCommandOptions, ExecuteCommandParams,
-    InitializeParams, InitializeResult, InitializedParams, InlayHint, InlayHintParams,
-    MessageType, OneOf, Position, Range, ServerCapabilities, ServerInfo, ShowDocumentParams,
-    TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Uri, WorkspaceEdit,
+    DocumentLinkOptions, DocumentLinkParams, ExecuteCommandOptions, ExecuteCommandParams, Hover,
+    HoverContents, HoverParams, HoverProviderCapability, InitializeParams, InitializeResult,
+    InitializedParams, InlayHint, InlayHintParams, MarkupContent, MarkupKind, MessageType, OneOf,
+    Position, Range, Registration, ServerCapabilities, ServerInfo, ShowDocumentParams,
+    TextDocumentSyncCapability, TextDocumentSyncKind, Uri,
     request::{CodeLensRefresh, Request, ShowDocument},
 };
 use tower_lsp_server::{Client, LanguageServer, LspService, Server};
 
-use crate::cache::{
-    CachedPackageVersion, DiskCache, FlutterDevice, PubVersionCache, is_fresh, now_unix,
-};
+use crate::cache::{DiskCache, FlutterDevice, is_fresh, now_unix};
 use crate::daemon::FlutterDaemonManager;
 use crate::debug_config::ensure_zed_debug_config;
 use crate::devtools::resolve_or_start_devtools_url;
@@ -48,11 +48,16 @@ use crate::lsp::dart_file::{
 use crate::lsp::dart_parser::build_closing_label_inlay_hints;
 use crate::lsp::progress::ProgressHandle;
 use crate::lsp::pubspec::{
-    build_document_links, build_inlay_hints, build_pubspec_asset_diagnostics,
-    build_pubspec_code_lenses,
+    ChangelogEntry, DependencyEvaluation, DependencySection, DependencySource, PackageInfo,
+    PubPackageCache, PubRegistryClient, VersionConstraint, build_asset_hover_markdown,
+    build_hosted_hover_markdown, build_local_path_hover_markdown, build_pubspec_code_actions,
+    build_pubspec_code_lenses, build_pubspec_diagnostics, build_pubspec_document_links,
+    build_pubspec_inlay_hints, build_sdk_or_git_hover_markdown, build_version_completion_items,
+    completion_context_at, load_sibling_lockfile, parse_pubspec,
 };
 use crate::lsp::state::{
-    DocumentKind, OpenDocument, ServerConfig, file_path_to_uri, uri_to_file_path,
+    DocumentKind, OpenDocument, ServerConfig, classify_document_path, file_path_to_uri,
+    uri_to_file_path,
 };
 use crate::lsp::test_runner::{TestFilter, TestRunStore, run_tests_streaming};
 use crate::project::{ProjectInfo, ProjectKind, find_project_for_path};
@@ -68,6 +73,7 @@ impl Request for InlayHintRefreshRequest {
 }
 
 const SUPPORTED_COMMANDS: &[&str] = &[
+    "flutterDebugger.refreshPubVersions",
     "flutterDebugger.pubGet",
     "flutterDebugger.pubUpgrade",
     "flutterDebugger.pubOutdated",
@@ -95,48 +101,53 @@ pub struct FlutterLspBackend {
     cache: DiskCache,
     devices: Arc<RwLock<Vec<FlutterDevice>>>,
     daemon: FlutterDaemonManager,
-    pub_versions: Arc<RwLock<PubVersionCache>>,
+    pub_registry: Arc<RwLock<PubRegistryClient>>,
+    pub_cache: Arc<PubPackageCache>,
+    pub_refreshing: Arc<DashSet<Uri>>,
+    running_pub_commands: Arc<DashMap<PathBuf, String>>,
+    in_flight_changelogs: Arc<DashMap<String, Arc<Mutex<()>>>>,
+    saved_pubspec_fingerprints: Arc<DashMap<Uri, Vec<String>>>,
+    pubspec_gen_counter: Arc<AtomicU64>,
     device_scan_lock: Arc<Mutex<()>>,
-    pub_scan_lock: Arc<Mutex<()>>,
     reload_debounce: Arc<DashMap<PathBuf, u64>>,
     reload_seq: Arc<AtomicU64>,
     watcher_abort: Arc<Mutex<Option<tokio::task::AbortHandle>>>,
     test_results: TestRunStore,
     runner: CommandRunner,
-    http: reqwest::Client,
 }
 
 impl FlutterLspBackend {
     pub fn new(client: Client) -> Self {
         let cache = DiskCache::default_location();
         let initial_devices = cache.load_devices().map(|c| c.devices).unwrap_or_default();
-        let initial_pub_versions = cache.load_pub_versions();
         let devices = Arc::new(RwLock::new(initial_devices));
         let daemon = FlutterDaemonManager::new(cache.clone(), Arc::clone(&devices));
-
-        let http = reqwest::Client::builder()
-            .user_agent(concat!("flutter-debugger-zed/", env!("CARGO_PKG_VERSION")))
-            .timeout(Duration::from_secs(10))
-            .build()
-            .unwrap_or_default();
+        let default_cfg = ServerConfig::default();
+        let pub_cache = Arc::new(PubPackageCache::new(cache.root_dir()));
+        let pub_registry = PubRegistryClient::new(default_cfg.pubspec.request_timeout_secs)
+            .expect("failed to initialize HTTP client for pub registry");
 
         Self {
             client,
             docs: Arc::new(DashMap::new()),
-            config: Arc::new(RwLock::new(ServerConfig::default())),
+            config: Arc::new(RwLock::new(default_cfg)),
             workspace_roots: Arc::new(RwLock::new(Vec::new())),
             cache,
             devices,
             daemon,
-            pub_versions: Arc::new(RwLock::new(initial_pub_versions)),
+            pub_registry: Arc::new(RwLock::new(pub_registry)),
+            pub_cache,
+            pub_refreshing: Arc::new(DashSet::new()),
+            running_pub_commands: Arc::new(DashMap::new()),
+            in_flight_changelogs: Arc::new(DashMap::new()),
+            saved_pubspec_fingerprints: Arc::new(DashMap::new()),
+            pubspec_gen_counter: Arc::new(AtomicU64::new(1)),
             device_scan_lock: Arc::new(Mutex::new(())),
-            pub_scan_lock: Arc::new(Mutex::new(())),
             reload_debounce: Arc::new(DashMap::new()),
             reload_seq: Arc::new(AtomicU64::new(1)),
             watcher_abort: Arc::new(Mutex::new(None)),
             test_results: TestRunStore::new(),
             runner: CommandRunner::new(),
-            http,
         }
     }
 
@@ -195,17 +206,342 @@ impl FlutterLspBackend {
         find_project_for_path(&path).map(|p| p.root)
     }
 
-    async fn publish_pubspec_diagnostics_if_needed(&self, uri: &Uri, doc: &OpenDocument) {
-        if !matches!(doc.kind, DocumentKind::Pubspec | DocumentKind::PubspecOverrides) {
-            return;
+    async fn resolve_effective_sdk_for_pubspec(
+        &self,
+        path: Option<&Path>,
+        parsed: &crate::lsp::pubspec::ParsedPubspec,
+    ) -> Option<VersionConstraint> {
+        if parsed.environment_sdk.is_some() {
+            return parsed.environment_sdk.clone();
         }
-        let (Some(parsed), Some(project)) = (&doc.pubspec, &doc.project) else {
+        let parent = path?.parent()?;
+        let sibling_path = parent.join("pubspec.yaml");
+        if path == Some(sibling_path.as_path()) {
+            return None;
+        }
+        if let Some(sibling_uri) = file_path_to_uri(&sibling_path)
+            && let Some(doc) = self.docs.get(&sibling_uri)
+            && let Some(sdk) = doc.pubspec.as_ref().and_then(|p| p.environment_sdk.clone())
+        {
+            return Some(sdk);
+        }
+        let raw = tokio::fs::read_to_string(&sibling_path).await.ok()?;
+        parse_pubspec(&raw).environment_sdk
+    }
+
+    async fn analyze_pubspec_document(&self, uri: Uri, text: String, force_refresh: bool) {
+        let Some(path) = uri_to_file_path(&uri) else {
             return;
         };
-        let diags = build_pubspec_asset_diagnostics(parsed, &project.root);
-        self.client
-            .publish_diagnostics(uri.clone(), diags, None)
+        let kind = classify_document_path(&path);
+        if !matches!(kind, DocumentKind::Pubspec | DocumentKind::PubspecOverrides) {
+            return;
+        }
+
+        let parsed = parse_pubspec(&text);
+        let project = find_project_for_path(&path);
+        let doc_gen = self.pubspec_gen_counter.fetch_add(1, Ordering::SeqCst) + 1;
+
+        // Preserve existing evaluations/lockfile temporarily to avoid inlay hint flicker while refreshing.
+        let (prev_locked, prev_evals) = self
+            .docs
+            .get(&uri)
+            .map(|d| (d.locked_versions.clone(), d.evaluations.clone()))
+            .unwrap_or_default();
+
+        self.docs.insert(
+            uri.clone(),
+            OpenDocument {
+                kind,
+                text,
+                project: project.clone(),
+                pubspec: Some(parsed.clone()),
+                locked_versions: prev_locked,
+                evaluations: prev_evals,
+                generation: doc_gen,
+                dart: None,
+            },
+        );
+
+        let cfg = self.config.read().await.pubspec.clone();
+        let project_root = project.as_ref().map(|p| p.root.as_path());
+
+        if !parsed.is_valid_dart_project {
+            if let Some(mut doc) = self.docs.get_mut(&uri)
+                && doc.generation == doc_gen
+            {
+                doc.locked_versions.clear();
+                doc.evaluations.clear();
+            }
+            self.client.publish_diagnostics(uri, Vec::new(), None).await;
+            let _ = self.client.send_request::<InlayHintRefreshRequest>(()).await;
+            let _ = self.client.send_request::<CodeLensRefresh>(()).await;
+            return;
+        }
+
+        let locked_versions = load_sibling_lockfile(&path).await;
+
+        if !cfg.enabled {
+            if self.docs.get(&uri).is_none_or(|d| d.generation != doc_gen) {
+                return;
+            }
+            if let Some(mut doc) = self.docs.get_mut(&uri) {
+                doc.locked_versions = locked_versions;
+                doc.evaluations.clear();
+            }
+            let diags = build_pubspec_diagnostics(&parsed, &[], project_root, &cfg);
+            self.client.publish_diagnostics(uri, diags, None).await;
+            let _ = self.client.send_request::<InlayHintRefreshRequest>(()).await;
+            let _ = self.client.send_request::<CodeLensRefresh>(()).await;
+            return;
+        }
+
+        let effective_sdk = self
+            .resolve_effective_sdk_for_pubspec(Some(&path), &parsed)
             .await;
+        let default_hosted = cfg.resolved_hosted_url();
+
+        let eligible_deps: Vec<(crate::lsp::pubspec::ParsedDependency, String)> = parsed
+            .dependencies
+            .iter()
+            .filter_map(|dep| {
+                let section_enabled = match dep.section {
+                    DependencySection::Dependencies => true,
+                    DependencySection::DevDependencies => cfg.check_dev_dependencies,
+                    DependencySection::DependencyOverrides => cfg.check_dependency_overrides,
+                };
+                if !section_enabled || cfg.is_ignored(&dep.name) {
+                    return None;
+                }
+                match &dep.source {
+                    DependencySource::Hosted { url } => {
+                        let hosted = url
+                            .as_deref()
+                            .unwrap_or(&default_hosted)
+                            .trim_end_matches('/')
+                            .to_string();
+                        Some((dep.clone(), hosted))
+                    }
+                    _ => None,
+                }
+            })
+            .collect();
+
+        let mut unique_keys: Vec<(String, String)> = Vec::new();
+        let mut seen_keys: HashSet<(String, String)> = HashSet::new();
+        for (dep, hosted) in &eligible_deps {
+            let key = (hosted.clone(), dep.name.clone());
+            if seen_keys.insert(key.clone()) {
+                unique_keys.push(key);
+            }
+        }
+
+        if force_refresh {
+            self.pub_refreshing.insert(uri.clone());
+            let _ = self.client.send_request::<CodeLensRefresh>(()).await;
+            self.pub_cache.invalidate(&unique_keys).await;
+        }
+
+        let mut info_map: HashMap<(String, String), PackageInfo> = HashMap::new();
+        let mut to_fetch: Vec<(String, String)> = Vec::new();
+
+        for (hosted, name) in unique_keys {
+            if !force_refresh
+                && let Some(cached) = self
+                    .pub_cache
+                    .get_package(&hosted, &name, cfg.cache_ttl_secs)
+                    .await
+            {
+                info_map.insert((hosted, name), cached);
+            } else {
+                to_fetch.push((hosted, name));
+            }
+        }
+
+        if !to_fetch.is_empty() {
+            let total = to_fetch.len();
+            let progress = ProgressHandle::begin(
+                self.client.clone(),
+                "Pub Dependencies",
+                Some(format!("Checking 0/{total} package(s)...")),
+            )
+            .await;
+
+            let registry = self.pub_registry.read().await.clone();
+            let pub_cache = Arc::clone(&self.pub_cache);
+            let concurrency = cfg.max_concurrency.clamp(1, 32);
+            let semaphore = Arc::new(Semaphore::new(concurrency));
+            let completed = Arc::new(AtomicUsize::new(0));
+            let progress_ref = &progress;
+
+            let fetched: Vec<((String, String), Option<PackageInfo>)> = stream::iter(to_fetch)
+                .map(|(hosted, name)| {
+                    let registry = registry.clone();
+                    let pub_cache = Arc::clone(&pub_cache);
+                    let semaphore = Arc::clone(&semaphore);
+                    let completed = Arc::clone(&completed);
+                    async move {
+                        let _permit = semaphore.acquire_owned().await.ok();
+                        let res = registry.fetch_package_info(&hosted, &name).await;
+                        let done = completed.fetch_add(1, Ordering::SeqCst) + 1;
+                        let pct = ((done * 100) / total.max(1)) as u32;
+                        progress_ref
+                            .report_with_percentage(format!("{done}/{total} — {name}"), pct)
+                            .await;
+                        match res {
+                            Ok(info) => {
+                                pub_cache.put_package(info.clone()).await;
+                                ((hosted, name), Some(info))
+                            }
+                            Err(err) => {
+                                tracing::debug!(
+                                    package = %name,
+                                    hosted_url = %hosted,
+                                    %err,
+                                    "failed to fetch package metadata from pub registry"
+                                );
+                                ((hosted, name), None)
+                            }
+                        }
+                    }
+                })
+                .buffer_unordered(concurrency)
+                .collect()
+                .await;
+
+            let mut succeeded = 0usize;
+            for (key, maybe_info) in fetched {
+                if let Some(info) = maybe_info {
+                    info_map.insert(key, info);
+                    succeeded += 1;
+                }
+            }
+            progress
+                .end(Some(format!("Checked {succeeded}/{total} package(s)")))
+                .await;
+        }
+
+        if force_refresh {
+            self.pub_refreshing.remove(&uri);
+        }
+
+        // Abort applying stale results if the document was edited or closed during network I/O.
+        if self.docs.get(&uri).is_none_or(|d| d.generation != doc_gen) {
+            if force_refresh {
+                let _ = self.client.send_request::<CodeLensRefresh>(()).await;
+            }
+            return;
+        }
+
+        let evaluations: Vec<DependencyEvaluation> = eligible_deps
+            .into_iter()
+            .filter_map(|(dep, hosted)| {
+                let info = info_map.get(&(hosted, dep.name.clone()))?.clone();
+                let locked = locked_versions.get(&dep.name).cloned();
+                Some(DependencyEvaluation::evaluate(
+                    dep,
+                    info,
+                    locked,
+                    effective_sdk.as_ref(),
+                    &cfg,
+                ))
+            })
+            .collect();
+
+        if let Some(mut doc) = self.docs.get_mut(&uri) {
+            if doc.generation != doc_gen {
+                return;
+            }
+            doc.locked_versions = locked_versions;
+            doc.evaluations = evaluations.clone();
+        } else {
+            return;
+        }
+
+        let diags = build_pubspec_diagnostics(&parsed, &evaluations, project_root, &cfg);
+        self.client.publish_diagnostics(uri, diags, None).await;
+        let _ = self.client.send_request::<InlayHintRefreshRequest>(()).await;
+        let _ = self.client.send_request::<CodeLensRefresh>(()).await;
+    }
+
+    async fn reanalyze_open_pubspecs_in_dir(&self, dir: &Path) {
+        let targets: Vec<(Uri, String)> = self
+            .docs
+            .iter()
+            .filter_map(|entry| {
+                let doc = entry.value();
+                if !matches!(doc.kind, DocumentKind::Pubspec | DocumentKind::PubspecOverrides) {
+                    return None;
+                }
+                let doc_path = uri_to_file_path(entry.key())?;
+                if doc_path.parent() == Some(dir) {
+                    Some((entry.key().clone(), doc.text.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for (uri, text) in targets {
+            let this = self.clone_handle();
+            tokio::spawn(async move {
+                this.analyze_pubspec_document(uri, text, false).await;
+            });
+        }
+    }
+
+    async fn get_or_fetch_changelog(
+        &self,
+        hosted_url: &str,
+        package: &str,
+        ttl_secs: u64,
+    ) -> Option<Vec<ChangelogEntry>> {
+        if let Some(cached) = self
+            .pub_cache
+            .get_changelog(hosted_url, package, ttl_secs)
+            .await
+        {
+            return Some(cached.entries);
+        }
+
+        let key = PubPackageCache::cache_key(hosted_url, package);
+        let lock = self
+            .in_flight_changelogs
+            .entry(key)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        let _guard = lock.lock().await;
+
+        // Re-check cache in case a concurrent hover populated it while we waited.
+        if let Some(cached) = self
+            .pub_cache
+            .get_changelog(hosted_url, package, ttl_secs)
+            .await
+        {
+            return Some(cached.entries);
+        }
+
+        let registry = self.pub_registry.read().await.clone();
+        match tokio::time::timeout(
+            Duration::from_secs(8),
+            registry.fetch_changelog(hosted_url, package),
+        )
+        .await
+        {
+            Ok(Ok(cl)) => {
+                let entries = cl.entries.clone();
+                self.pub_cache.put_changelog(hosted_url, package, cl).await;
+                Some(entries)
+            }
+            Ok(Err(err)) => {
+                tracing::debug!(package = %package, %err, "changelog fetch failed");
+                None
+            }
+            Err(_) => {
+                tracing::debug!(package = %package, "changelog fetch timed out");
+                None
+            }
+        }
     }
 
     async fn maybe_scan_devices_in_background(&self, cwd: PathBuf, force: bool) {
@@ -285,89 +621,52 @@ impl FlutterLspBackend {
         }
     }
 
-    async fn maybe_fetch_pub_versions(&self, packages: Vec<String>, force: bool) {
-        if packages.is_empty() || !self.config.read().await.enable_pub_version_hints {
-            return;
-        }
-
-        let ttl = self.config.read().await.pub_cache_ttl_secs;
-        let to_fetch: Vec<String> = {
-            let guard = self.pub_versions.read().await;
-            packages
-                .into_iter()
-                .filter(|name| {
-                    force
-                        || guard
-                            .packages
-                            .get(name)
-                            .is_none_or(|entry| !is_fresh(entry.fetched_at_unix, ttl))
-                })
-                .collect()
-        };
-
-        if to_fetch.is_empty() {
-            return;
-        }
-
-        let Ok(_guard) = self.pub_scan_lock.try_lock() else {
-            return;
-        };
-
-        let total = to_fetch.len();
-        let progress = ProgressHandle::begin(
-            self.client.clone(),
-            "Pub Versions",
-            Some(format!("Checking {total} package(s) on pub.dev...")),
-        )
-        .await;
-
-        let mut updated = 0usize;
-        for (idx, pkg) in to_fetch.iter().enumerate() {
-            progress
-                .report(format!("[{}/{}] {}", idx + 1, total, pkg))
-                .await;
-            if let Some(latest) = fetch_pub_dev_latest(&self.http, pkg).await {
-                let mut guard = self.pub_versions.write().await;
-                guard.packages.insert(
-                    pkg.clone(),
-                    CachedPackageVersion {
-                        latest_version: latest,
-                        fetched_at_unix: now_unix(),
-                    },
-                );
-                updated += 1;
-            }
-        }
-
-        {
-            let guard = self.pub_versions.read().await;
-            self.cache.save_pub_versions(&guard);
-        }
-
-        progress
-            .end(Some(format!("Updated {updated}/{total} package(s)")))
-            .await;
-
-        if updated > 0 {
-            let _ = self.client.send_request::<InlayHintRefreshRequest>(()).await;
-        }
-    }
-
-    async fn execute_project_cli(&self, uri: &Uri, cmd: AllowedCommand) {
+    async fn execute_project_cli(
+        &self,
+        uri: &Uri,
+        cmd: AllowedCommand,
+        silent_if_busy: bool,
+    ) {
         let Some(path) = uri_to_file_path(uri) else {
             return;
         };
         let Some(project) = find_project_for_path(&path) else {
-            self.client
-                .show_message(
-                    MessageType::WARNING,
-                    "No pubspec.yaml found for this file.".to_string(),
-                )
-                .await;
+            if !silent_if_busy {
+                self.client
+                    .show_message(
+                        MessageType::WARNING,
+                        "No pubspec.yaml found for this file.".to_string(),
+                    )
+                    .await;
+            }
             return;
         };
 
+        let is_pub_cmd = matches!(
+            cmd,
+            AllowedCommand::PubGet | AllowedCommand::PubUpgrade | AllowedCommand::PubOutdated
+        );
         let title = format!("{} {}", project.kind.cli_name(), cmd.display_name());
+
+        if is_pub_cmd {
+            if let Some(existing) = self.running_pub_commands.get(&project.root) {
+                let running = existing.clone();
+                drop(existing);
+                if !silent_if_busy {
+                    self.client
+                        .show_message(
+                            MessageType::INFO,
+                            format!("`{running}` is already running for this project."),
+                        )
+                        .await;
+                }
+                return;
+            }
+            self.running_pub_commands
+                .insert(project.root.clone(), title.clone());
+            let _ = self.client.send_request::<CodeLensRefresh>(()).await;
+        }
+
         let progress = ProgressHandle::begin(
             self.client.clone(),
             title.clone(),
@@ -376,19 +675,37 @@ impl FlutterLspBackend {
         .await;
 
         let custom_sdk = self.config.read().await.flutter_sdk_path.clone();
-        match self
+        let res = self
             .runner
             .run_project_command(&project, &cmd, custom_sdk.as_deref())
-            .await
-        {
+            .await;
+
+        if is_pub_cmd {
+            self.running_pub_commands.remove(&project.root);
+            let _ = self.client.send_request::<CodeLensRefresh>(()).await;
+        }
+
+        match res {
             Ok(output) => {
+                if !output.stdout.trim().is_empty() {
+                    self.log_info(format!("[{title}]\n{}", output.stdout.trim()))
+                        .await;
+                }
+                if !output.stderr.trim().is_empty() {
+                    self.log_warn(format!("[{title} stderr]\n{}", output.stderr.trim()))
+                        .await;
+                }
+
                 if output.success() {
                     progress.end(Some("Completed".to_string())).await;
+                    if matches!(cmd, AllowedCommand::PubGet | AllowedCommand::PubUpgrade) {
+                        self.reanalyze_open_pubspecs_in_dir(&project.root).await;
+                    }
                     if cmd.always_open_log()
                         && let Some(log_path) = output.log_path
                     {
                         self.open_local_file_in_editor(&log_path).await;
-                    } else {
+                    } else if !silent_if_busy {
                         self.client
                             .show_message(MessageType::INFO, format!("{title} succeeded."))
                             .await;
@@ -403,9 +720,11 @@ impl FlutterLspBackend {
             }
             Err(err) => {
                 progress.end(Some("Blocked".to_string())).await;
-                self.client
-                    .show_message(MessageType::WARNING, err.to_string())
-                    .await;
+                if !silent_if_busy {
+                    self.client
+                        .show_message(MessageType::WARNING, err.to_string())
+                        .await;
+                }
             }
         }
     }
@@ -760,6 +1079,7 @@ impl FlutterLspBackend {
                 device_id,
                 output_path: output_str,
             },
+            false,
         )
         .await;
     }
@@ -768,7 +1088,15 @@ impl FlutterLspBackend {
 impl LanguageServer for FlutterLspBackend {
     async fn initialize(&self, params: InitializeParams) -> RpcResult<InitializeResult> {
         if let Some(opts) = params.initialization_options {
-            self.config.write().await.apply_json_patch(&opts);
+            let timeout_before = self.config.read().await.pubspec.request_timeout_secs;
+            if self.config.write().await.apply_json_patch(&opts) {
+                let timeout_after = self.config.read().await.pubspec.request_timeout_secs;
+                if timeout_after != timeout_before
+                    && let Ok(new_client) = PubRegistryClient::new(timeout_after)
+                {
+                    *self.pub_registry.write().await = new_client;
+                }
+            }
         }
 
         let mut roots: Vec<PathBuf> = Vec::new();
@@ -804,6 +1132,12 @@ impl LanguageServer for FlutterLspBackend {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
                     TextDocumentSyncKind::FULL,
                 )),
+                hover_provider: Some(HoverProviderCapability::Simple(true)),
+                completion_provider: Some(CompletionOptions {
+                    trigger_characters: Some(vec!["^".to_string(), ":".to_string()]),
+                    resolve_provider: Some(false),
+                    ..Default::default()
+                }),
                 code_lens_provider: Some(CodeLensOptions {
                     resolve_provider: Some(false),
                 }),
@@ -813,7 +1147,15 @@ impl LanguageServer for FlutterLspBackend {
                 }),
                 inlay_hint_provider: Some(OneOf::Left(true)),
                 color_provider: Some(ColorProviderCapability::Simple(true)),
-                code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
+                code_action_provider: Some(CodeActionProviderCapability::Options(
+                    CodeActionOptions {
+                        code_action_kinds: Some(vec![
+                            CodeActionKind::QUICKFIX,
+                            CodeActionKind::SOURCE,
+                        ]),
+                        ..Default::default()
+                    },
+                )),
                 execute_command_provider: Some(ExecuteCommandOptions {
                     commands: SUPPORTED_COMMANDS.iter().map(|s| (*s).to_string()).collect(),
                     ..Default::default()
@@ -850,6 +1192,21 @@ impl LanguageServer for FlutterLspBackend {
             device_names.join(", ")
         ))
         .await;
+
+        // Dynamically register a file watcher on `**/pubspec.lock` so external
+        // `flutter pub get` / `dart pub upgrade` runs immediately refresh open pubspec hints.
+        let lock_watcher = Registration {
+            id: "flutter-debugger-pubspec-lock".to_string(),
+            method: "workspace/didChangeWatchedFiles".to_string(),
+            register_options: Some(json!({
+                "watchers": [
+                    { "globPattern": "**/pubspec.lock" }
+                ]
+            })),
+        };
+        if let Err(err) = self.client.register_capability(vec![lock_watcher]).await {
+            tracing::debug!("Dynamic pubspec.lock watcher registration skipped by client: {err}");
+        }
 
         if let Some(flutter_proj) = discovered
             .into_iter()
@@ -907,9 +1264,55 @@ impl LanguageServer for FlutterLspBackend {
     }
 
     async fn did_change_configuration(&self, params: DidChangeConfigurationParams) {
-        if self.config.write().await.apply_json_patch(&params.settings) {
+        let timeout_before = self.config.read().await.pubspec.request_timeout_secs;
+        let changed = self.config.write().await.apply_json_patch(&params.settings);
+        if changed {
+            let timeout_after = self.config.read().await.pubspec.request_timeout_secs;
+            if timeout_after != timeout_before
+                && let Ok(new_client) = PubRegistryClient::new(timeout_after)
+            {
+                *self.pub_registry.write().await = new_client;
+            }
+
+            let open_pubspecs: Vec<(Uri, String)> = self
+                .docs
+                .iter()
+                .filter_map(|entry| {
+                    let doc = entry.value();
+                    if matches!(doc.kind, DocumentKind::Pubspec | DocumentKind::PubspecOverrides) {
+                        Some((entry.key().clone(), doc.text.clone()))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            for (uri, text) in open_pubspecs {
+                let this = self.clone_handle();
+                tokio::spawn(async move {
+                    this.analyze_pubspec_document(uri, text, false).await;
+                });
+            }
+
             let _ = self.client.send_request::<InlayHintRefreshRequest>(()).await;
             let _ = self.client.send_request::<CodeLensRefresh>(()).await;
+        }
+    }
+
+    async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        for change in params.changes {
+            if let Some(path) = uri_to_file_path(&change.uri)
+                && path.file_name().and_then(|n| n.to_str()) == Some("pubspec.lock")
+                && let Some(parent) = path.parent()
+            {
+                let dir = parent.to_path_buf();
+                if !dirs.contains(&dir) {
+                    dirs.push(dir);
+                }
+            }
+        }
+        for dir in dirs {
+            self.reanalyze_open_pubspecs_in_dir(&dir).await;
         }
     }
 
@@ -921,23 +1324,23 @@ impl LanguageServer for FlutterLspBackend {
             return;
         };
 
-        self.publish_pubspec_diagnostics_if_needed(&uri, &doc).await;
-
+        let kind = doc.kind;
         let project = doc.project.clone();
         let main_line = doc.dart.as_ref().and_then(|d| d.main_line);
-        let hosted_packages: Vec<String> = doc
-            .pubspec
-            .as_ref()
-            .map(|p| {
-                p.dependencies
-                    .iter()
-                    .filter(|d| d.is_hosted_pub_dev)
-                    .map(|d| d.name.clone())
-                    .collect()
-            })
-            .unwrap_or_default();
+        let initial_fp = doc.pubspec.as_ref().map(|p| p.dependency_fingerprint());
 
         self.docs.insert(uri.clone(), doc);
+
+        if matches!(kind, DocumentKind::Pubspec | DocumentKind::PubspecOverrides) {
+            if let Some(fp) = initial_fp {
+                self.saved_pubspec_fingerprints.insert(uri.clone(), fp);
+            }
+            let this = self.clone_handle();
+            let uri_clone = uri.clone();
+            tokio::spawn(async move {
+                this.analyze_pubspec_document(uri_clone, text, false).await;
+            });
+        }
 
         let Some(project) = project else {
             return;
@@ -966,21 +1369,40 @@ impl LanguageServer for FlutterLspBackend {
                 });
             }
         }
-
-        if !hosted_packages.is_empty() && self.config.read().await.enable_pub_version_hints {
-            let this = self.clone_handle();
-            tokio::spawn(async move {
-                this.maybe_fetch_pub_versions(hosted_packages, false).await;
-            });
-        }
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let uri = params.text_document.uri;
-        if let Some(change) = params.content_changes.into_iter().last()
-            && let Some(doc) = OpenDocument::parse_sync(&uri, &change.text)
-        {
-            self.publish_pubspec_diagnostics_if_needed(&uri, &doc).await;
+        let Some(change) = params.content_changes.into_iter().last() else {
+            return;
+        };
+        let Some(mut doc) = OpenDocument::parse_sync(&uri, &change.text) else {
+            return;
+        };
+
+        if matches!(doc.kind, DocumentKind::Pubspec | DocumentKind::PubspecOverrides) {
+            let doc_gen = self.pubspec_gen_counter.fetch_add(1, Ordering::SeqCst) + 1;
+            if let Some(existing) = self.docs.get(&uri) {
+                doc.locked_versions = existing.locked_versions.clone();
+                doc.evaluations = existing.evaluations.clone();
+            }
+            doc.generation = doc_gen;
+            let text_clone = doc.text.clone();
+            self.docs.insert(uri.clone(), doc);
+
+            // Debounce pubspec re-evaluation (350ms) so rapid typing stays smooth.
+            let this = self.clone_handle();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(350)).await;
+                let still_current = this
+                    .docs
+                    .get(&uri)
+                    .is_some_and(|d| d.generation == doc_gen);
+                if still_current {
+                    this.analyze_pubspec_document(uri, text_clone, false).await;
+                }
+            });
+        } else {
             self.docs.insert(uri, doc);
         }
     }
@@ -988,13 +1410,35 @@ impl LanguageServer for FlutterLspBackend {
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
         let uri = params.text_document.uri;
 
-        if let Some(doc) = self.docs.get(&uri)
-            && matches!(doc.kind, DocumentKind::Pubspec | DocumentKind::PubspecOverrides)
-        {
-            let doc_clone = doc.clone();
-            drop(doc);
-            self.publish_pubspec_diagnostics_if_needed(&uri, &doc_clone)
-                .await;
+        let is_pubspec = self
+            .docs
+            .get(&uri)
+            .is_some_and(|d| matches!(d.kind, DocumentKind::Pubspec | DocumentKind::PubspecOverrides));
+        if is_pubspec {
+            let text = params
+                .text
+                .or_else(|| self.docs.get(&uri).map(|d| d.text.clone()));
+            if let Some(text) = text {
+                let new_fp = parse_pubspec(&text).dependency_fingerprint();
+                let prev_fp = self.saved_pubspec_fingerprints.insert(uri.clone(), new_fp.clone());
+                let deps_changed = prev_fp.is_some_and(|old| old != new_fp);
+
+                let this = self.clone_handle();
+                let uri_analyze = uri.clone();
+                tokio::spawn(async move {
+                    this.analyze_pubspec_document(uri_analyze, text, false).await;
+                });
+
+                let pubspec_cfg = self.config.read().await.pubspec.clone();
+                if deps_changed && pubspec_cfg.enabled && pubspec_cfg.auto_pub_get_on_save {
+                    let this = self.clone_handle();
+                    let uri_cli = uri.clone();
+                    tokio::spawn(async move {
+                        this.execute_project_cli(&uri_cli, AllowedCommand::PubGet, true)
+                            .await;
+                    });
+                }
+            }
             return;
         }
 
@@ -1067,22 +1511,210 @@ impl LanguageServer for FlutterLspBackend {
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = params.text_document.uri;
         self.docs.remove(&uri);
+        self.saved_pubspec_fingerprints.remove(&uri);
+        self.pub_refreshing.remove(&uri);
         self.client.publish_diagnostics(uri, Vec::new(), None).await;
+    }
+
+    async fn hover(&self, params: HoverParams) -> RpcResult<Option<Hover>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let pos = params.text_document_position_params.position;
+
+        // Never interfere with the official Dart LSP on `.dart` files.
+        let snapshot = self.docs.get(&uri).and_then(|doc| {
+            if !matches!(doc.kind, DocumentKind::Pubspec | DocumentKind::PubspecOverrides) {
+                return None;
+            }
+            Some((
+                doc.project.as_ref().map(|p| p.root.clone()),
+                doc.pubspec.clone()?,
+                doc.evaluations.clone(),
+            ))
+        });
+        let Some((project_root, parsed, evaluations)) = snapshot else {
+            return Ok(None);
+        };
+
+        // 1. Asset / font entry hover (local filesystem info)
+        if let Some(asset) = parsed
+            .assets
+            .iter()
+            .find(|a| position_in_range(pos, a.range))
+        {
+            let md = build_asset_hover_markdown(asset, project_root.as_deref());
+            return Ok(Some(Hover {
+                contents: HoverContents::Markup(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value: md,
+                }),
+                range: Some(asset.range),
+            }));
+        }
+
+        let cfg = self.config.read().await.pubspec.clone();
+
+        // 2. Hosted dependency hover (package metadata, pub points, versions & lazy changelog)
+        if cfg.enabled
+            && let Some(eval) = evaluations.iter().find(|e| {
+                position_in_range(pos, e.dep.name_range)
+                    || position_in_range(pos, e.dep.version_range)
+            })
+        {
+            let changelog = self
+                .get_or_fetch_changelog(
+                    &eval.info.hosted_url,
+                    &eval.dep.name,
+                    cfg.changelog_cache_ttl_secs,
+                )
+                .await;
+            let md = build_hosted_hover_markdown(eval, changelog.as_deref(), &cfg);
+            return Ok(Some(Hover {
+                contents: HoverContents::Markup(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value: md,
+                }),
+                range: Some(union_range(eval.dep.name_range, eval.dep.version_range)),
+            }));
+        }
+
+        // 3. Local `path:`, `sdk:`, or `git:` dependency hover
+        if let Some(dep) = parsed.dependencies.iter().find(|d| {
+            let path_hit = match &d.source {
+                DependencySource::Path { range, .. } => position_in_range(pos, *range),
+                _ => false,
+            };
+            position_in_range(pos, d.name_range)
+                || position_in_range(pos, d.version_range)
+                || path_hit
+        }) {
+            match &dep.source {
+                DependencySource::Path { path, range } => {
+                    let md = build_local_path_hover_markdown(dep, path, project_root.as_deref());
+                    return Ok(Some(Hover {
+                        contents: HoverContents::Markup(MarkupContent {
+                            kind: MarkupKind::Markdown,
+                            value: md,
+                        }),
+                        range: Some(union_range(dep.name_range, *range)),
+                    }));
+                }
+                DependencySource::Sdk(_) | DependencySource::Git { .. } => {
+                    if let Some(md) = build_sdk_or_git_hover_markdown(dep) {
+                        return Ok(Some(Hover {
+                            contents: HoverContents::Markup(MarkupContent {
+                                kind: MarkupKind::Markdown,
+                                value: md,
+                            }),
+                            range: Some(dep.name_range),
+                        }));
+                    }
+                }
+                DependencySource::Hosted { .. } => {}
+            }
+        }
+
+        Ok(None)
+    }
+
+    async fn completion(&self, params: CompletionParams) -> RpcResult<Option<CompletionResponse>> {
+        let uri = params.text_document_position.text_document.uri;
+        let pos = params.text_document_position.position;
+
+        // Never interfere with the official Dart LSP on `.dart` files.
+        let snapshot = self.docs.get(&uri).and_then(|doc| {
+            if !matches!(doc.kind, DocumentKind::Pubspec | DocumentKind::PubspecOverrides) {
+                return None;
+            }
+            Some((
+                doc.text.clone(),
+                doc.pubspec.clone()?,
+                doc.locked_versions.clone(),
+            ))
+        });
+        let Some((text, parsed, locked_versions)) = snapshot else {
+            return Ok(None);
+        };
+
+        let cfg = self.config.read().await.pubspec.clone();
+        if !cfg.enabled {
+            return Ok(None);
+        }
+
+        let Some(ctx) = completion_context_at(&text, &parsed, pos) else {
+            return Ok(None);
+        };
+
+        let default_hosted = cfg.resolved_hosted_url();
+        let hosted_url = ctx
+            .hosted_url
+            .as_deref()
+            .unwrap_or(&default_hosted)
+            .trim_end_matches('/')
+            .to_string();
+
+        let info = if let Some(cached) = self
+            .pub_cache
+            .get_package(&hosted_url, &ctx.package_name, cfg.cache_ttl_secs)
+            .await
+        {
+            cached
+        } else {
+            let registry = self.pub_registry.read().await.clone();
+            match tokio::time::timeout(
+                Duration::from_secs(3),
+                registry.fetch_package_info(&hosted_url, &ctx.package_name),
+            )
+            .await
+            {
+                Ok(Ok(fetched)) => {
+                    self.pub_cache.put_package(fetched.clone()).await;
+                    fetched
+                }
+                _ => return Ok(None),
+            }
+        };
+
+        let doc_path = uri_to_file_path(&uri);
+        let effective_sdk = self
+            .resolve_effective_sdk_for_pubspec(doc_path.as_deref(), &parsed)
+            .await;
+
+        let items = build_version_completion_items(
+            &ctx,
+            &info,
+            locked_versions.get(&ctx.package_name).map(String::as_str),
+            effective_sdk.as_ref(),
+            &cfg,
+        );
+
+        if items.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(CompletionResponse::Array(items)))
+        }
     }
 
     async fn document_link(&self, params: DocumentLinkParams) -> RpcResult<Option<Vec<DocumentLink>>> {
         let uri = params.text_document.uri;
-        let Some(doc) = self.docs.get(&uri) else {
+        let snapshot = self.docs.get(&uri).and_then(|doc| {
+            if !matches!(doc.kind, DocumentKind::Pubspec | DocumentKind::PubspecOverrides) {
+                return None;
+            }
+            Some((
+                doc.project.as_ref().map(|p| p.root.clone()),
+                doc.pubspec.clone()?,
+            ))
+        });
+        let Some((project_root, parsed)) = snapshot else {
             return Ok(None);
         };
-        let (Some(project), Some(parsed)) = (&doc.project, &doc.pubspec) else {
-            return Ok(None);
-        };
-        let include_pub_dev = self.config.read().await.enable_pub_version_hints;
-        Ok(Some(build_document_links(
-            parsed,
-            &project.root,
-            include_pub_dev,
+        let cfg = self.config.read().await.pubspec.clone();
+        let default_hosted = cfg.resolved_hosted_url();
+        Ok(Some(build_pubspec_document_links(
+            &parsed,
+            project_root.as_deref(),
+            &default_hosted,
+            cfg.enabled,
         )))
     }
 
@@ -1091,24 +1723,25 @@ impl LanguageServer for FlutterLspBackend {
         let Some(doc) = self.docs.get(&uri) else {
             return Ok(None);
         };
-        if doc.project.is_none() {
-            return Ok(None);
-        }
+        let kind = doc.kind;
+        let has_project = doc.project.is_some();
+        let dart = doc.dart.clone();
+        let evaluations = doc.evaluations.clone();
+        drop(doc);
 
         let cfg = self.config.read().await.clone();
-        match doc.kind {
+        match kind {
             DocumentKind::Dart => {
-                if !cfg.closing_labels {
+                if !has_project || !cfg.closing_labels {
                     return Ok(None);
                 }
-                let Some(parsed) = &doc.dart else {
+                let Some(parsed) = dart else {
                     return Ok(None);
                 };
                 let hints = build_closing_label_inlay_hints(
                     &parsed.closing_labels,
                     cfg.closing_labels_min_lines,
                 );
-                // Filter to requested visible range
                 let range = params.range;
                 let filtered: Vec<InlayHint> = hints
                     .into_iter()
@@ -1119,14 +1752,8 @@ impl LanguageServer for FlutterLspBackend {
                 Ok(Some(filtered))
             }
             DocumentKind::Pubspec | DocumentKind::PubspecOverrides => {
-                if !cfg.enable_pub_version_hints {
-                    return Ok(None);
-                }
-                let Some(parsed) = &doc.pubspec else {
-                    return Ok(None);
-                };
-                let pub_cache = self.pub_versions.read().await;
-                Ok(Some(build_inlay_hints(parsed, &pub_cache)))
+                let hints = build_pubspec_inlay_hints(&evaluations, params.range, &cfg.pubspec);
+                Ok(Some(hints))
             }
             DocumentKind::Ignored => Ok(None),
         }
@@ -1161,29 +1788,46 @@ impl LanguageServer for FlutterLspBackend {
         let Some(doc) = self.docs.get(&uri) else {
             return Ok(None);
         };
-        let Some(project) = &doc.project else {
-            return Ok(None);
-        };
+        let kind = doc.kind;
+        let project = doc.project.clone();
+        let pubspec = doc.pubspec.clone();
+        let evaluations = doc.evaluations.clone();
+        let dart = doc.dart.clone();
+        drop(doc);
 
-        match doc.kind {
+        match kind {
             DocumentKind::Pubspec | DocumentKind::PubspecOverrides => {
-                if self.config.read().await.enable_pub_version_hints {
-                    Ok(Some(build_pubspec_code_lenses(&uri)))
-                } else {
-                    Ok(None)
-                }
+                let Some(parsed) = pubspec else {
+                    return Ok(None);
+                };
+                let cfg = self.config.read().await.pubspec.clone();
+                let project_kind = project.as_ref().map_or(ProjectKind::Dart, |p| p.kind);
+                let is_refreshing = self.pub_refreshing.contains(&uri);
+                let running_cmd = project
+                    .as_ref()
+                    .and_then(|p| self.running_pub_commands.get(&p.root).map(|r| r.clone()));
+                let lenses = build_pubspec_code_lenses(
+                    &uri,
+                    &parsed,
+                    project_kind,
+                    &evaluations,
+                    is_refreshing,
+                    running_cmd.as_deref(),
+                    &cfg,
+                );
+                Ok(Some(lenses))
             }
             DocumentKind::Dart => {
-                let Some(parsed) = &doc.dart else {
+                let (Some(project), Some(parsed)) = (project, dart) else {
                     return Ok(None);
                 };
                 let devices = self.devices.read().await;
-                let selected_label = self.selected_device_label_sync(project, &devices);
+                let selected_label = self.selected_device_label_sync(&project, &devices);
                 let active_session = read_session_record(&self.cache, &project.root);
                 let test_results = self.test_results.get_file_results(&uri);
                 Ok(Some(build_dart_code_lenses(
                     &uri,
-                    parsed,
+                    &parsed,
                     project.kind,
                     selected_label.as_deref(),
                     active_session.as_ref(),
@@ -1199,54 +1843,28 @@ impl LanguageServer for FlutterLspBackend {
         let Some(doc) = self.docs.get(&uri) else {
             return Ok(None);
         };
-        let Some(project) = &doc.project else {
-            return Ok(None);
-        };
+        let kind = doc.kind;
+        let project = doc.project.clone();
+        let evaluations = doc.evaluations.clone();
+        let dart = doc.dart.clone();
+        drop(doc);
 
         let uri_str = uri.as_str().to_string();
         let cfg = self.config.read().await.clone();
         let mut actions: Vec<CodeActionOrCommand> = Vec::new();
 
-        match doc.kind {
+        match kind {
             DocumentKind::Pubspec | DocumentKind::PubspecOverrides => {
-                let cursor_line = params.range.start.line;
-                if cfg.enable_pub_version_hints
-                    && let Some(parsed) = &doc.pubspec
-                {
-                    let pub_cache = self.pub_versions.read().await;
-                    if let Some(dep) = parsed
-                        .dependencies
-                        .iter()
-                        .find(|d| d.line == cursor_line && d.is_hosted_pub_dev)
-                        && let Some(cached) = pub_cache.packages.get(&dep.name)
-                    {
-                        let new_line = format!("  {}: ^{}", dep.name, cached.latest_version);
-                        let mut changes = HashMap::new();
-                        changes.insert(
-                            uri.clone(),
-                            vec![TextEdit {
-                                range: Range {
-                                    start: Position::new(dep.line, 0),
-                                    end: Position::new(dep.line, dep.line_end_col),
-                                },
-                                new_text: new_line,
-                            }],
-                        );
-                        actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-                            title: format!("Upgrade {} to ^{}", dep.name, cached.latest_version),
-                            kind: Some(CodeActionKind::QUICKFIX),
-                            edit: Some(WorkspaceEdit {
-                                changes: Some(changes),
-                                ..Default::default()
-                            }),
-                            ..Default::default()
-                        }));
-                    }
+                if cfg.pubspec.enabled {
+                    actions = build_pubspec_code_actions(&uri, &evaluations, params.range);
                 }
             }
             DocumentKind::Dart => {
+                let Some(project) = project else {
+                    return Ok(None);
+                };
                 let cursor_line = params.range.start.line;
-                if let Some(parsed) = &doc.dart
+                if let Some(parsed) = dart
                     && parsed.role.is_runnable_test()
                     && let Some(entry) = parsed.tests.iter().find(|t| t.line == cursor_line)
                 {
@@ -1332,22 +1950,30 @@ impl LanguageServer for FlutterLspBackend {
         .await;
 
         match params.command.as_str() {
+            "flutterDebugger.refreshPubVersions" => {
+                if let Some(text) = self.docs.get(&uri).map(|d| d.text.clone()) {
+                    self.analyze_pubspec_document(uri.clone(), text, true).await;
+                }
+            }
             "flutterDebugger.pubGet" => {
-                self.execute_project_cli(&uri, AllowedCommand::PubGet).await;
+                self.execute_project_cli(&uri, AllowedCommand::PubGet, false)
+                    .await;
             }
             "flutterDebugger.pubUpgrade" => {
-                self.execute_project_cli(&uri, AllowedCommand::PubUpgrade)
+                self.execute_project_cli(&uri, AllowedCommand::PubUpgrade, false)
                     .await;
             }
             "flutterDebugger.pubOutdated" => {
-                self.execute_project_cli(&uri, AllowedCommand::PubOutdated)
+                self.execute_project_cli(&uri, AllowedCommand::PubOutdated, false)
                     .await;
             }
             "flutterDebugger.clean" => {
-                self.execute_project_cli(&uri, AllowedCommand::Clean).await;
+                self.execute_project_cli(&uri, AllowedCommand::Clean, false)
+                    .await;
             }
             "flutterDebugger.doctor" => {
-                self.execute_project_cli(&uri, AllowedCommand::Doctor).await;
+                self.execute_project_cli(&uri, AllowedCommand::Doctor, false)
+                    .await;
             }
             "flutterDebugger.runTest" => {
                 let filter_str = params
@@ -1498,17 +2124,47 @@ impl FlutterLspBackend {
             cache: self.cache.clone(),
             devices: Arc::clone(&self.devices),
             daemon: self.daemon.clone(),
-            pub_versions: Arc::clone(&self.pub_versions),
+            pub_registry: Arc::clone(&self.pub_registry),
+            pub_cache: Arc::clone(&self.pub_cache),
+            pub_refreshing: Arc::clone(&self.pub_refreshing),
+            running_pub_commands: Arc::clone(&self.running_pub_commands),
+            in_flight_changelogs: Arc::clone(&self.in_flight_changelogs),
+            saved_pubspec_fingerprints: Arc::clone(&self.saved_pubspec_fingerprints),
+            pubspec_gen_counter: Arc::clone(&self.pubspec_gen_counter),
             device_scan_lock: Arc::clone(&self.device_scan_lock),
-            pub_scan_lock: Arc::clone(&self.pub_scan_lock),
             reload_debounce: Arc::clone(&self.reload_debounce),
             reload_seq: Arc::clone(&self.reload_seq),
             watcher_abort: Arc::clone(&self.watcher_abort),
             test_results: self.test_results.clone(),
             runner: self.runner.clone(),
-            http: self.http.clone(),
         }
     }
+}
+
+fn position_in_range(pos: Position, range: Range) -> bool {
+    let after_start = pos.line > range.start.line
+        || (pos.line == range.start.line && pos.character >= range.start.character);
+    let before_end = pos.line < range.end.line
+        || (pos.line == range.end.line && pos.character <= range.end.character);
+    after_start && before_end
+}
+
+fn union_range(a: Range, b: Range) -> Range {
+    let start = if a.start.line < b.start.line
+        || (a.start.line == b.start.line && a.start.character <= b.start.character)
+    {
+        a.start
+    } else {
+        b.start
+    };
+    let end = if a.end.line > b.end.line
+        || (a.end.line == b.end.line && a.end.character >= b.end.character)
+    {
+        a.end
+    } else {
+        b.end
+    };
+    Range::new(start, end)
 }
 
 fn merge_unique_devices(primary: &[FlutterDevice], secondary: &[FlutterDevice]) -> Vec<FlutterDevice> {
@@ -1589,26 +2245,6 @@ fn compute_external_state_signature(cache: &DiskCache) -> String {
     format!("{selected_raw}|{}", sessions_summary.join(";"))
 }
 
-#[derive(Debug, Deserialize)]
-struct PubDevPackageResponse {
-    latest: PubDevLatest,
-}
-
-#[derive(Debug, Deserialize)]
-struct PubDevLatest {
-    version: String,
-}
-
-async fn fetch_pub_dev_latest(client: &reqwest::Client, package: &str) -> Option<String> {
-    let url = format!("https://pub.dev/api/packages/{package}");
-    let resp = client.get(&url).send().await.ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let body = resp.json::<PubDevPackageResponse>().await.ok()?;
-    Some(body.latest.version)
-}
-
 pub async fn run_lsp_server() {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
@@ -1665,5 +2301,19 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].root, sub_app);
         assert_eq!(found[0].kind, ProjectKind::Flutter);
+    }
+
+    #[test]
+    fn hover_range_helpers_handle_boundaries_and_unions() {
+        let name = Range::new(Position::new(5, 2), Position::new(5, 5));
+        let ver = Range::new(Position::new(5, 7), Position::new(5, 13));
+        assert!(position_in_range(Position::new(5, 2), name));
+        assert!(position_in_range(Position::new(5, 5), name));
+        assert!(!position_in_range(Position::new(5, 6), name));
+
+        let merged = union_range(ver, name);
+        assert_eq!(merged.start, Position::new(5, 2));
+        assert_eq!(merged.end, Position::new(5, 13));
+        assert!(position_in_range(Position::new(5, 6), merged));
     }
 }

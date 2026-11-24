@@ -61,6 +61,15 @@ impl ProgressHandle {
     }
 
     pub async fn report(&self, message: impl Into<String>) {
+        self.report_inner(message.into(), None).await;
+    }
+
+    pub async fn report_with_percentage(&self, message: impl Into<String>, percentage: u32) {
+        self.report_inner(message.into(), Some(percentage.min(100)))
+            .await;
+    }
+
+    async fn report_inner(&self, message: String, percentage: Option<u32>) {
         if self.ended {
             return;
         }
@@ -70,8 +79,8 @@ impl ProgressHandle {
                 value: ProgressParamsValue::WorkDone(WorkDoneProgress::Report(
                     WorkDoneProgressReport {
                         cancellable: Some(false),
-                        message: Some(message.into()),
-                        percentage: None,
+                        message: Some(message),
+                        percentage,
                     },
                 )),
             })

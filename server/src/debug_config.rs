@@ -305,6 +305,8 @@ pub fn build_tasks_presets(project: &ProjectInfo) -> Vec<Value> {
     if project.kind == ProjectKind::Dart {
         return vec![
             task_item("Dart: Pub Get", ctl, &["ctl", "pub-get"], "always", false),
+            task_item("Dart: Pub Upgrade", ctl, &["ctl", "pub-upgrade"], "always", false),
+            task_item("Dart: Pub Outdated", ctl, &["ctl", "pub-outdated"], "always", false),
             task_item(
                 "Dart: Build Runner Build",
                 ctl,
@@ -345,6 +347,8 @@ pub fn build_tasks_presets(project: &ProjectInfo) -> Vec<Value> {
         task_item("Flutter: Build Runner Watch", ctl, &["ctl", "build-runner", "watch"], "always", false),
         task_item("Flutter: Build Runner Build", ctl, &["ctl", "build-runner", "build"], "always", false),
         task_item("Flutter: Pub Get", ctl, &["ctl", "pub-get"], "always", false),
+        task_item("Flutter: Pub Upgrade", ctl, &["ctl", "pub-upgrade"], "always", false),
+        task_item("Flutter: Pub Outdated", ctl, &["ctl", "pub-outdated"], "always", false),
         task_item("Flutter: Clean", ctl, &["ctl", "clean"], "always", false),
         task_item("Flutter: Doctor", ctl, &["ctl", "doctor"], "always", false),
     ]
@@ -649,5 +653,19 @@ mod tests {
         assert!(parsed
             .iter()
             .any(|v| v["label"] == "Flutter: Current Test (Breakpoints)" && v["isTest"] == true));
+
+        let tasks = build_tasks_presets(&project);
+        assert!(tasks.iter().any(|t| t["label"] == "Flutter: Pub Get"));
+        assert!(tasks.iter().any(|t| t["label"] == "Flutter: Pub Upgrade"));
+        assert!(tasks.iter().any(|t| t["label"] == "Flutter: Pub Outdated"));
+
+        let dart_project = ProjectInfo {
+            root: dir.path().to_path_buf(),
+            pubspec_path: dir.path().join("pubspec.yaml"),
+            kind: ProjectKind::Dart,
+        };
+        let dart_tasks = build_tasks_presets(&dart_project);
+        assert!(dart_tasks.iter().any(|t| t["label"] == "Dart: Pub Upgrade"));
+        assert!(dart_tasks.iter().any(|t| t["label"] == "Dart: Pub Outdated"));
     }
 }

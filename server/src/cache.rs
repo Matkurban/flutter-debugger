@@ -6,7 +6,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_DEVICE_CACHE_TTL_SECS: u64 = 60 * 60; // 1 hour
-pub const DEFAULT_PUB_CACHE_TTL_SECS: u64 = 12 * 60 * 60; // 12 hours
 
 /// Subset of fields returned by `flutter devices --machine`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,17 +34,6 @@ impl FlutterDevice {
 pub struct DeviceCache {
     pub fetched_at_unix: u64,
     pub devices: Vec<FlutterDevice>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CachedPackageVersion {
-    pub latest_version: String,
-    pub fetched_at_unix: u64,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct PubVersionCache {
-    pub packages: HashMap<String, CachedPackageVersion>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -86,15 +74,6 @@ impl DiskCache {
             devices: devices.to_vec(),
         };
         let _ = self.write_json(&self.root_dir.join("devices.json"), &cache);
-    }
-
-    pub fn load_pub_versions(&self) -> PubVersionCache {
-        self.read_json(&self.root_dir.join("pub_versions.json"))
-            .unwrap_or_default()
-    }
-
-    pub fn save_pub_versions(&self, cache: &PubVersionCache) {
-        let _ = self.write_json(&self.root_dir.join("pub_versions.json"), cache);
     }
 
     pub fn get_selected_device(&self, project_root: &Path) -> Option<String> {

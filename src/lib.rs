@@ -32,17 +32,25 @@ impl zed::Extension for FlutterDebuggerExtension {
             .resolve_for_lsp(language_server_id, worktree)?;
 
         let mut args = vec!["lsp".to_string()];
+        let mut env = worktree.shell_env();
         if let Ok(settings) = LspSettings::for_worktree(SERVER_ID, worktree)
             && let Some(binary) = settings.binary
-            && let Some(extra_args) = binary.arguments
         {
-            args.extend(extra_args);
+            if let Some(extra_args) = binary.arguments {
+                args.extend(extra_args);
+            }
+            if let Some(extra_env) = binary.env {
+                for (key, value) in extra_env {
+                    env.retain(|(existing_key, _)| existing_key != &key);
+                    env.push((key, value));
+                }
+            }
         }
 
         Ok(zed::Command {
             command: binary_path,
             args,
-            env: worktree.shell_env(),
+            env,
         })
     }
 

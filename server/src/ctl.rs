@@ -63,6 +63,8 @@ pub async fn run_ctl(args: Vec<String>) -> Result<(), String> {
         "run" => cmd_run(rest).await,
         "build-runner" | "br" => cmd_build_runner(rest).await,
         "pub-get" => cmd_passthrough_flutter(rest, &["pub", "get"]).await,
+        "pub-upgrade" => cmd_passthrough_flutter(rest, &["pub", "upgrade"]).await,
+        "pub-outdated" => cmd_passthrough_flutter(rest, &["pub", "outdated"]).await,
         "clean" => cmd_passthrough_flutter(rest, &["clean"]).await,
         "doctor" => cmd_passthrough_flutter(rest, &["doctor", "-v"]).await,
         "create" => cmd_create_interactive(rest).await,
@@ -105,7 +107,8 @@ Devices & Emulators:
 Run & Workflow:
   run [--mode debug|profile|release] [--target lib/main.dart] [--device <id>] [--flavor <f>] [--dart-define-from-file <file>]
   build-runner <build|watch>             Run dart build_runner with --delete-conflicting-outputs
-  pub-get | clean | doctor               Run standard Flutter/Dart CLI commands
+  pub-get | pub-upgrade | pub-outdated | clean | doctor
+                                         Run standard Flutter/Dart CLI commands
   create                                 Interactive `flutter create` prompt
   print-zed-config                       Print recommended Zed settings.json & keymap.json"
     );
@@ -1600,6 +1603,7 @@ pub fn print_recommended_zed_config() {
         r#"=== Recommended ~/.config/zed/settings.json snippet ===
 {{
   "lsp_document_colors": "inlay",
+  "code_lens": "on",
   "inlay_hints": {{
     "enabled": true
   }},
@@ -1611,8 +1615,16 @@ pub fn print_recommended_zed_config() {
         "closingLabels": true,
         "closingLabelsMinLines": 2,
         "colorPreviews": true,
-        "enablePubVersionHints": false,
-        "exposeGlobalCodeActions": false
+        "exposeGlobalCodeActions": false,
+        "pubspec": {{
+          "enabled": true,
+          "autoPubGetOnSave": true,
+          "inlayHints": true,
+          "showUpToDateHints": true,
+          "codeLens": true,
+          "majorSeverity": "warning",
+          "minorPatchSeverity": "info"
+        }}
       }}
     }}
   }}

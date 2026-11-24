@@ -3,12 +3,13 @@ name = "Flutter Debugger"
 version = "0.1.0"
 schema_version = 1
 authors = ["Matkurban <https://github.com/Matkurban>"]
-description = "Personal VS Code-grade Flutter workflow suite for Zed: DAP debugging (with --test & Monorepo/FVM), Closing Labels, Color Previews, live flutter daemon, VM Service overlays, and ctl CLI"
+description = "VS Code-grade Flutter workflow suite for Zed: DAP debugging, Native GPUI DevTools, Closing Labels, Color Previews, pubspec dependency version checker & upgrades, live flutter daemon, and ctl CLI"
 repository = "https://github.com/Matkurban/flutter-debugger"
 
 [language_servers.flutter-debugger]
 name = "Flutter Debugger"
 languages = ["Dart", "YAML"]
+code_action_kinds = ["quickfix", "source"]
 
 [debug_adapters.Flutter]
 schema_path = "debug_adapter_schemas/Flutter.json"

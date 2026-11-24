@@ -1,6 +1,6 @@
 # Flutter Debugger for Zed
 
-A full-featured Flutter & Dart development, debugging, and native DevTools suite for [Zed](https://zed.dev), designed to bring a VS Code (`Dart-Code`) workflow to Zed while coexisting cleanly with Zed's official `dart` extension and `pubgrade`.
+A full-featured Flutter & Dart development, `pubspec.yaml` dependency intelligence, debugging, and native DevTools suite for [Zed](https://zed.dev), designed to bring a complete VS Code (`Dart-Code`) workflow to Zed while coexisting cleanly with Zed's official `dart` extension.
 
 > [中文文档](./README.zh-CN.md) · [Releases](https://github.com/Matkurban/flutter-debugger/releases)
 
@@ -8,10 +8,17 @@ A full-featured Flutter & Dart development, debugging, and native DevTools suite
 
 ## Highlights
 
-- **LSP Editor Enhancements (`Dart` & `YAML`)**: Widget Closing Labels (`inlayHint`), Flutter Color Previews & picker (`documentColor`), `main()` & test CodeLens, streaming `--machine` test runner with nested `group` paths and UTF-16 failure diagnostics, debounced Auto Hot Reload on save, and `pubspec.yaml` asset/font/local-path validation & links.
+- **Built-In `pubspec.yaml` Dependency & Asset Intelligence (Enabled by Default)**:
+  - **Clickable Inline Version Hints (`inlayHint`)**: `✓ latest`, `⬆ 5.9.0`, `⬆ 6.0.0 (major)`, `⬆ 6.0.0 (major, SDK)`, `⚠ retracted → ...`, and `⚠ discontinued` — click an outdated hint to upgrade directly in place.
+  - **Rich Hover (`textDocument/hover`)**: Package description, Pub Points / Likes / 30-day downloads, declared vs `pubspec.lock` vs latest compatible/overall versions, SDK compatibility notes, and lazily cached `pub.dev` changelogs; plus offline Hover cards for local `path:`, `sdk:`, `git:` dependencies, and `flutter.assets` / `flutter.fonts`.
+  - **Version Autocompletion (`textDocument/completion`)**: Triggered on `^` or `:` inside `pubspec.yaml` / `pubspec_overrides.yaml`, honoring existing quotes, caret prefix, locked status, and Dart SDK compatibility.
+  - **Unified Diagnostics & Quick Fixes (`Cmd+.`)**: Major/minor/patch/prerelease/retracted/discontinued (`DEPRECATED` strikethrough) & missing asset/font diagnostics published atomically; single-package compatible/major upgrades, batch compatible upgrades, and batch upgrade-all-to-latest actions.
+  - **Auto `pub get` on Save & Live `pubspec.lock` Sync**: Automatically runs `<flutter|dart> pub get` (via your project's FVM / custom SDK) **only** when dependency or SDK constraints actually changed on save, and watches `**/pubspec.lock` for external updates.
+  - **Actionable CodeLens & Clickable Links**: `Refresh (N updates)`, `<flutter|dart> pub get`, `pub upgrade`, and `pub outdated` CodeLenses at the top of `pubspec.yaml`, plus clickable links to `pub.dev` (or private registries via `PUB_HOSTED_URL` / `pubHostedUrl`), local `path:` packages, and local assets/fonts.
+- **Dart LSP Editor Enhancements**: Widget Closing Labels (`inlayHint`), Flutter Color Previews & picker (`documentColor`), `main()` & test CodeLens, streaming `--machine` test runner with nested `group` paths and UTF-16 failure diagnostics, and debounced Auto Hot Reload on save.
 - **DAP Proxy & Enhanced Debug Console**: Lazy Monorepo/FVM/`--test` resolution, real-time `flutter daemon` device hotplug & smart fallback selection, exception pause mode & Just-My-Code switches, clickable `zed://file/...:line:col` source links (`Cmd+Click` reuses your active Zed window), and VS Code-style multi-state ANSI console colors (auto-adapting to Zed light & dark themes).
 - **Native GPUI DevTools (`flutter-devtools-gpui`)**: Standalone native desktop companion featuring **Widget Inspector** (Layout Explorer, Properties, Details Tree, Select Widget Mode jump-to-source), **Network** (HTTP + Dart 3.14+ WebSocket, gzip/JSON highlighting, selectable text & one-click copy, tri-state column sorting), **Logging** (VM Service streams, pin-on-select, click-to-jump), **Performance** (UI/Raster frame timings & jank), and **Memory** (Isolate heap, RSS & GC).
-- **`ctl` CLI & Zero-Config Setup**: Interactive device/emulator selection, native terminal `ctl run`, full Flutter Service Extensions (`overlay`, `brightness`, `platform`, `screenshot`), page-targeted Web/GPUI DevTools launch, and lossless `init-zed` project scaffolding.
+- **`ctl` CLI & Zero-Config Setup**: Interactive device/emulator selection, native terminal `ctl run`, full Flutter Service Extensions (`overlay`, `brightness`, `platform`, `screenshot`), `pub-get` / `pub-upgrade` / `pub-outdated`, page-targeted Web/GPUI DevTools launch, and lossless `init-zed` project scaffolding.
 
 ---
 
@@ -19,12 +26,14 @@ A full-featured Flutter & Dart development, debugging, and native DevTools suite
 
 | Component | Path | Responsibility | Zero-Conflict Boundary |
 |---|---|---|---|
-| **Official `dart` Extension** | External | Syntax highlighting, completions, hover, go-to-definition, formatting, rename, Dart Analysis diagnostics | Never duplicated by `flutter-debugger` |
-| **`pubgrade` Extension** | External | `pubspec.yaml` dependency version hints, outdated checks & upgrades | `enablePubVersionHints` defaults to `false` to prevent duplicate hints |
-| **Zed WASM Extension** | `src/` | Registers `flutter-debugger` LSP (`Dart`, `YAML`), `Flutter` DAP adapter, and `flutter` Debug Locator; resolves binary via settings / `PATH` / GitHub Releases | Zero background processes outside projects containing `pubspec.yaml` |
+| **Official `dart` Extension** | External | Dart syntax highlighting, completions, hover, go-to-definition, formatting, rename, Dart Analysis diagnostics | `flutter-debugger` returns `None` immediately for `hover` & `completion` on `.dart` files |
+| **Zed WASM Extension** | `src/` | Registers `flutter-debugger` LSP (`Dart`, `YAML`), `Flutter` DAP adapter, and `flutter` Debug Locator; forwards `binary.env` overrides | Zero background processes outside projects containing `pubspec.yaml` |
 | **Shared Protocol Crate** | `crates/protocol/` | Session registry, IPC protocol, overlay states, Dart URI & `zed://file/...` rewriter, and ANSI console colorizer | Single source of truth shared by `server` and `devtools-gpui` |
-| **Backend Server (`flutter-debugger-server`)** | `server/` | LSP server, DAP proxy, `flutter daemon` watcher, VM Service client, and `ctl` CLI | Identical control plane across `F4` DAP, `attach`, and `ctl run` |
+| **Backend Server (`flutter-debugger-server`)** | `server/` | Unified LSP server (`Dart` + `pubspec.yaml` / `pubspec_overrides.yaml`), DAP proxy, `flutter daemon` watcher, VM Service client, and `ctl` CLI | Single process, shared FVM/SDK runner & persistent cache |
 | **Native GPUI DevTools (`flutter-devtools-gpui`)** | `devtools-gpui/` | Single-instance native GPUI desktop DevTools (Inspector, Network, Logging, Performance, Memory) | Connects directly to active session IPC & Dart VM Service |
+
+> [!TIP]
+> Because `pubspec.yaml` dependency management is now natively integrated into `flutter-debugger` (enabled by default), you can uninstall standalone `pubgrade` to avoid duplicate inlay hints or diagnostics.
 
 ---
 
@@ -70,6 +79,7 @@ Run `flutter-debugger-server ctl print-zed-config` anytime to print these snippe
 ```json
 {
   "lsp_document_colors": "inlay",
+  "code_lens": "on",
   "inlay_hints": {
     "enabled": true
   },
@@ -84,13 +94,36 @@ Run `flutter-debugger-server ctl print-zed-config` anytime to print these snippe
         "closingLabels": true,
         "closingLabelsMinLines": 2,
         "colorPreviews": true,
-        "enablePubVersionHints": false,
-        "exposeGlobalCodeActions": false
+        "exposeGlobalCodeActions": false,
+        "pubspec": {
+          "enabled": true,
+          "autoPubGetOnSave": true,
+          "inlayHints": true,
+          "showUpToDateHints": true,
+          "codeLens": true,
+          "majorSeverity": "warning",
+          "minorPatchSeverity": "info"
+        }
       }
     }
   }
 }
 ```
+
+> **Optional tip for `pubspec.yaml` Hover clarity**: If `yaml-language-server` also displays a generic JSON Schema hover alongside `flutter-debugger`'s rich package card in `pubspec.yaml`, you can optionally exclude `pubspec.yaml` from SchemaStore in your Zed `settings.json`:
+> ```json
+> "lsp": {
+>   "yaml-language-server": {
+>     "settings": {
+>       "yaml": {
+>         "schemas": {
+>           "https://json.schemastore.org/pubspec.json": "!pubspec.yaml"
+>         }
+>       }
+>     }
+>   }
+> }
+> ```
 
 ### `~/.config/zed/keymap.json` (VS Code-Style Shortcuts)
 
@@ -116,12 +149,18 @@ Run `flutter-debugger-server ctl print-zed-config` anytime to print these snippe
 
 ## Feature Details
 
-### LSP Editor Features
+### `pubspec.yaml` & `pubspec_overrides.yaml` Intelligence
+- **Full Pub V2 Registry & Mirror Support**: Uses Hosted Pub Repository Specification V2 (`Accept: application/vnd.pub.v2+json`) plus `/score`, respects `pubspec.pubHostedUrl` → `PUB_HOSTED_URL` → `https://pub.dev`, supports per-dependency `hosted:` URLs, HTTP/2 + gzip + system proxy, and atomic two-tier caching (`<cache>/pub_packages` & `pub_changelogs`).
+- **Accurate Dart SemVer & Lockfile Evaluation**: Understands caret (`^`), range (`>=1.0.0 <2.0.0`), exact, `any`, and empty constraints; reads sibling `pubspec.lock` (with live `workspace/didChangeWatchedFiles` sync), clears stale underlines immediately when editing to latest, checks retracted/discontinued packages, and verifies Dart `environment.sdk` compatibility.
+- **Interactive Upgrades & Version Completion**: Click any `⬆` inlay hint, trigger `Cmd+.` Quick Fixes (single compatible/major upgrade, batch compatible upgrade, or batch upgrade-all including major), or invoke autocomplete after `:` / `^` to pick from published versions.
+- **Auto `pub get` on Save**: Tracks a dependency & SDK constraint fingerprint per open `pubspec.yaml` — saving comment, description, or asset edits never triggers unnecessary `pub get`, while adding/changing a dependency runs `<flutter|dart> pub get` automatically using your project's FVM / SDK.
+- **Assets, Fonts & Local Packages**: Missing `flutter.assets`/`flutter.fonts` warnings, clickable `DocumentLink`s, and offline Hover cards showing local file size / directory file count or local `path:` package metadata.
+
+### Dart LSP Editor Features
 - **Widget Closing Labels**: Displays `// WidgetName` hints at closing parentheses of multi-line widget constructors.
 - **Flutter Color Previews**: Supports `Color(0xAARRGGBB)`, `Color.fromARGB`, `Color.fromRGBO`, `Color.from(...)`, and `Colors.*` swatches with inline color editing.
 - **`main()` & Test CodeLens**: Device switcher, Hot Reload, Hot Restart, Stop, and Web/Native DevTools directly above `main()`; single test, nested `group()`, and file-level run/debug actions in `*_test.dart` and `integration_test/`.
 - **Debounced Hot Reload on Save**: Automatically reloads non-test `.dart` saves across both DAP and `ctl run` sessions, reporting elapsed milliseconds in Zed progress.
-- **`pubspec.yaml` & `pubspec_overrides.yaml`**: Missing asset/font/local `path:` diagnostics, clickable `DocumentLink`s, and project CLI commands (`Pub Get`, `Pub Upgrade`, `Pub Outdated`, `Clean`, `Doctor`).
 
 ### DAP Debugging & Debug Console
 - **Monorepo, FVM & Test Support**: Resolves nested package roots lazily on `launch`/`attach`, honors `.fvm` and `FLUTTER_SDK_PATH`, and automatically passes `--test` to `flutter debug_adapter` for test targets.
@@ -142,7 +181,7 @@ Launch via `main()` CodeLens, `flutter-debugger-server ctl devtools-ui`, or dire
 
 ## Configuration Reference
 
-### LSP `initialization_options`
+### LSP `initialization_options` (Top-Level)
 
 | Key | Type | Default | Description |
 |---|---|---|---|
@@ -151,12 +190,36 @@ Launch via `main()` CodeLens, `flutter-debugger-server ctl devtools-ui`, or dire
 | `closingLabels` | `bool` | `true` | Show Widget Closing Labels via `inlayHint` |
 | `closingLabelsMinLines` | `number` | `2` | Minimum line span required before showing a closing label |
 | `colorPreviews` | `bool` | `true` | Enable Flutter color previews and inline color picker |
-| `enablePubVersionHints` | `bool` | `false` | Show `pub.dev` version hints in `pubspec.yaml` (off by default to coexist with `pubgrade`) |
-| `exposeGlobalCodeActions` | `bool` | `false` | Expose project-wide Flutter commands in `Cmd+.` Code Actions |
+| `exposeGlobalCodeActions` | `bool` | `false` | Expose project-wide Flutter commands in `Cmd+.` Code Actions on `.dart` files |
 | `flutterSdkPath` | `string?` | `null` | Custom Flutter SDK root path (overrides `PATH` / FVM auto-detection) |
-| `pubDevTimeoutSecs` | `number` | `5` | Timeout for `pub.dev` version lookups when `enablePubVersionHints` is enabled |
 | `deviceCacheTtlSecs` | `number` | `60` | Disk cache TTL for device listing |
-| `pubCacheTtlSecs` | `number` | `3600` | Disk cache TTL for `pub.dev` lookups |
+| `pubspec` | `object` | `{ ... }` | Nested `pubspec.yaml` dependency checker configuration (see below) |
+
+### LSP `initialization_options.pubspec`
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | `bool` | `true` | Enable `pubspec.yaml` / `pubspec_overrides.yaml` dependency checks, hover, completions, hints, CodeLens & actions |
+| `pubHostedUrl` | `string?` | `null` | Custom pub registry URL (falls back to `PUB_HOSTED_URL` env var, then `https://pub.dev`) |
+| `maxConcurrency` | `number` | `10` | Max concurrent pub registry requests (`1..=32`) |
+| `requestTimeoutSecs` | `number` | `15` | HTTP request timeout in seconds (minimum `3`) |
+| `cacheTtlSecs` | `number` | `86400` | Package metadata disk/memory cache TTL (24h) |
+| `changelogCacheTtlSecs` | `number` | `86400` | Changelog HTML cache TTL (24h) |
+| `includePrerelease` | `bool` | `false` | Include prerelease versions even when current constraint is stable |
+| `inlayHints` | `bool` | `true` | Show inline version hints at end of dependency lines |
+| `showUpToDateHints` | `bool` | `true` | Show `✓ latest` hints on up-to-date dependencies |
+| `codeLens` | `bool` | `true` | Show CodeLens bar at top of `pubspec.yaml` |
+| `codeLensRefresh` | `bool` | `true` | Show `Refresh (N updates)` CodeLens |
+| `codeLensPubGet` | `bool` | `true` | Show `<flutter\|dart> pub get` CodeLens |
+| `codeLensPubUpgrade` | `bool` | `true` | Show `<flutter\|dart> pub upgrade` CodeLens |
+| `codeLensPubOutdated` | `bool` | `true` | Show `<flutter\|dart> pub outdated` CodeLens |
+| `checkDevDependencies` | `bool` | `true` | Check `dev_dependencies` |
+| `checkDependencyOverrides` | `bool` | `true` | Check `dependency_overrides` |
+| `autoPubGetOnSave` | `bool` | `true` | Automatically run `<flutter\|dart> pub get` on save when dependencies or SDK constraints changed |
+| `maxChangelogVersions` | `number` | `3` | Maximum changelog release entries rendered in Hover |
+| `majorSeverity` | `"error" \| "warning" \| "info" \| "hint" \| "off"` | `"warning"` | Diagnostic severity for major version updates |
+| `minorPatchSeverity` | `"error" \| "warning" \| "info" \| "hint" \| "off"` | `"info"` | Diagnostic severity for minor/patch/prerelease updates |
+| `ignorePackages` | `string[]` | `[]` | Package names excluded from registry checks & diagnostics |
 
 ### DAP `.zed/debug.json` Options (`adapter: "Flutter"`)
 
@@ -202,7 +265,7 @@ flutter-debugger-server ctl launch-emulator [emulator_id]
 # Run & Project Workflow
 flutter-debugger-server ctl run [--mode debug|profile|release] [--target lib/main.dart] [--device <id>] [--flavor <f>] [--dart-define-from-file <file>]
 flutter-debugger-server ctl build-runner <build|watch>
-flutter-debugger-server ctl pub-get | clean | doctor | create
+flutter-debugger-server ctl pub-get | pub-upgrade | pub-outdated | clean | doctor | create
 flutter-debugger-server init-zed
 flutter-debugger-server ctl print-zed-config
 ```
